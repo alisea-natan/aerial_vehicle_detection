@@ -1,0 +1,53 @@
+# --- Python / IDE ---
+__pycache__/
+.pytest_cache/
+.idea/
+*.swp
+*.swo
+
+# --- Secrets / local env ---
+.env
+.env.*
+.venv/
+venv/
+env/
+
+# --- macOS ---
+.DS_Store
+
+# --- Extracted frames only (large; run extract_frames.py) ---
+data/frames/**
+
+# --- Pseudo-labels (regenerate: autolabel_yworld.py) ---
+labels/
+
+# --- Probe / label debug artifacts (regenerate: probe_clips.py, autolabel) ---
+debug/
+
+# --- Training & evaluation outputs (regenerate: train.py, evaluate.py) ---
+outputs/*
+!outputs/eval_metrics.json
+!outputs/metrics_table.md
+!outputs/eval_videos/
+outputs/eval_videos/*
+!outputs/eval_videos/*_predictions.mp4
+
+# --- Model weights ---
+weights/                          # CLIP etc. (large, download locally)
+yolov8x-worldv2.pt                # 140 MB pseudo-labeler (download)
+*.pt
+*.pth
+*.onnx
+*.engine
+# Fine-tuned deliverable (~6 MB) — copy after train:
+#   cp outputs/runs/yolov8n_vehicle/weights/best.pt checkpoints/yolov8n_vehicle_best.pt
+!checkpoints/
+checkpoints/*
+!checkpoints/yolov8n_vehicle_best.pt
+
+# Ultralytics run folders (if created outside outputs/)
+runs/
+
+# --- Matplotlib / cache dirs ---
+.matplotlib/
+**/.matplotlib_cache/

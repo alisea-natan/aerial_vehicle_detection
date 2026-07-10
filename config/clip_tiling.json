@@ -1,0 +1,100 @@
+{
+  "source": "probe_clips.py",
+  "updated_at": "2026-07-09T17:04:04+00:00",
+  "clips": {
+    "13722965_2160_3840_30fps": {
+      "target_tiles": 1,
+      "overlap_ratio": 0.0,
+      "label_confidence_threshold": 0.5,
+      "detection_class": "car",
+      "distance_band": "<200m",
+      "distance_m": 117.7,
+      "split": "eval",
+      "note": "probed frame 000458; distance from largest_car"
+    },
+    "266987": {
+      "target_tiles": 2,
+      "overlap_ratio": 0.1,
+      "label_confidence_threshold": 0.25,
+      "detection_class": "car",
+      "distance_band": ">200m",
+      "distance_m": 378.6,
+      "split": "eval",
+      "note": "probed frame 000455; distance from largest_car"
+    },
+    "8968356-hd_1920_1080_30fps": {
+      "target_tiles": 2,
+      "overlap_ratio": 0.1,
+      "label_confidence_threshold": 0.25,
+      "detection_class": "car",
+      "distance_band": ">200m",
+      "distance_m": 370.5,
+      "split": "train",
+      "note": "probed frame 000290; distance from largest_car"
+    },
+    "3405804-uhd_3840_2160_30fps": {
+      "target_tiles": 1,
+      "overlap_ratio": 0.0,
+      "label_confidence_threshold": 0.5,
+      "detection_class": "car",
+      "distance_band": "<200m",
+      "distance_m": 133.7,
+      "split": "train",
+      "note": "probed frame 000370; distance from largest_car"
+    },
+    "5382494-uhd_3840_2160_24fps": {
+      "target_tiles": 2,
+      "overlap_ratio": 0.1,
+      "label_confidence_threshold": 0.25,
+      "detection_class": "car",
+      "distance_band": ">400m",
+      "distance_m": 729.4,
+      "split": "train",
+      "note": "probed frame 000374; distance from largest_car"
+    },
+    "8457857-uhd_3840_2160_24fps": {
+      "target_tiles": 1,
+      "overlap_ratio": 0.0,
+      "label_confidence_threshold": 0.5,
+      "detection_class": "car",
+      "distance_band": ">200m",
+      "distance_m": 203.0,
+      "split": "train",
+      "note": "probed frame 000201; distance from largest_car"
+    },
+    "76472-559159393": {
+      "target_tiles": 12,
+      "overlap_ratio": 0.05,
+      "label_confidence_threshold": 0.1,
+      "distance_band": ">400m",
+      "distance_m": null,
+      "split": null,
+      "note": "probe found no cars; fallback 12 tiles @ 0.1"
+    }
+  },
+  "model_name": "yolov8x-worldv2.pt",
+  "raw_confidence_threshold": 0.05,
+  "probe_max_label_threshold": 0.5,
+  "fallback_tiles": 12,
+  "fallback_label_threshold": 0.1,
+  "adaptive_label_threshold": "probe_max / target_tiles, floor=raw_confidence",
+  "detection_class": "car",
+  "probe_class_aliases": {
+    "person": "car"
+  },
+  "probe_model_classes": [
+    "car",
+    "person"
+  ],
+  "tile_candidates": [
+    1,
+    2,
+    3,
+    4,
+    6,
+    8,
+    12
+  ],
+  "frames_per_clip": 5,
+  "last_probe_elapsed_sec": 14.95
+}

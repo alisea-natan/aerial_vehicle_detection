@@ -1,0 +1,92 @@
+{
+  "generated_at": "2026-07-09T23:05:55+00:00",
+  "weights": "/Users/alisa/Cursor/vehicle_detection/outputs/runs/yolov8n_vehicle/weights/best.pt",
+  "iou": 0.5,
+  "clips": [
+    "13722965_2160_3840_30fps",
+    "266987"
+  ],
+  "eval_mode": {
+    "slice_size": 512,
+    "overlap_ratio": 0.2,
+    "tile_nms_iou": 0.5,
+    "predict_batch_size": 16
+  },
+  "prediction_videos": [],
+  "assumptions": {
+    "gt_source": "labels/eval pseudo-labels",
+    "band_assignment": "whole clip from probe distance_band in clip_tiling.json",
+    "eval_clips_by_band": {
+      "0-200m": "13722965_2160_3840_30fps",
+      "200-400m": "266987"
+    },
+    "false_alarms_formula": "FP / (N_frames / fps / 60)",
+    "inference": "512x512 train-matched tiles, merged to full frame"
+  },
+  "bands": {
+    "0-200m": {
+      "tp": 262,
+      "fp": 3130,
+      "fn": 1903,
+      "n_frames": 918,
+      "fps": 30.0,
+      "detection_rate": 0.1210161662817552,
+      "precision": 0.07724056603773585,
+      "false_alarms_per_min": 6137.254901960784,
+      "time_to_first_detection_s": 0.03333333333333333,
+      "map50": 0.03334342060958405
+    },
+    "200-400m": {
+      "tp": 153,
+      "fp": 108,
+      "fn": 634,
+      "n_frames": 624,
+      "fps": 29.99901319035558,
+      "detection_rate": 0.19440914866581957,
+      "precision": 0.5862068965517241,
+      "false_alarms_per_min": 311.5282138998464,
+      "time_to_first_detection_s": 2.200072368421053,
+      "map50": 0.1274660299050543
+    }
+  },
+  "clips_detail": [
+    {
+      "clip": "13722965_2160_3840_30fps",
+      "eval_band": "0-200m",
+      "probe_distance_m": 117.7,
+      "probe_distance_band": "<200m",
+      "frames": 918,
+      "video_frames": 918,
+      "conf": 0.5,
+      "eval_mode": {
+        "slice_size": 512,
+        "overlap_ratio": 0.2,
+        "tile_nms_iou": 0.5,
+        "predict_batch_size": 16
+      },
+      "tp": 262,
+      "fp": 3130,
+      "fn": 1903,
+      "prediction_video": null
+    },
+    {
+      "clip": "266987",
+      "eval_band": "200-400m",
+      "probe_distance_m": 378.6,
+      "probe_distance_band": ">200m",
+      "frames": 912,
+      "video_frames": 912,
+      "conf": 0.25,
+      "eval_mode": {
+        "slice_size": 512,
+        "overlap_ratio": 0.2,
+        "tile_nms_iou": 0.5,
+        "predict_batch_size": 16
+      },
+      "tp": 153,
+      "fp": 108,
+      "fn": 634,
+      "prediction_video": null
+    }
+  ]
+}
