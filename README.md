@@ -10,7 +10,7 @@ vehicle_detection/
 ├── .gitattributes                  # Git LFS rules for videos
 ├── yolov8x-worldv2.pt              # gitignored — download locally (probe + autolabel)
 ├── config/
-│   └── clip_tiling.json            # per-clip tiles, overlap, threshold (from probe)
+│   └── clip_tiling.json            # label tiles (probe) + scale_coeff (label_box_stats)
 ├── checkpoints/
 │   └── yolov8n_vehicle_best.pt     # git-tracked (~23 MB, copied by train.py)
 ├── data/
@@ -82,11 +82,13 @@ flowchart TB
     F(data/frames/):::data
 
     S2[probe_clips.py]:::script
-    CFG(config/clip_tiling.json):::data
+    CFG(config/clip_tiling.json<br/>label tiles · scale_coeff):::data
 
     S3[autolabel_yworld.py]:::script
     LAB(labels/):::data
     DBG(debug/):::data
+
+    S3b[label_box_stats.py]:::script
 
     S4[train.py]:::script
     WT(outputs/runs/best.pt):::output
@@ -96,17 +98,19 @@ flowchart TB
 
     V --> S1 --> F
     F --> S2 --> CFG
-    CFG --> S3
+    CFG -->|target_tiles · threshold| S3
     S3 --> LAB
     S3 --> DBG
-    LAB --> S4 --> WT
+    LAB --> S3b -->|scale_coeff| CFG
+    LAB --> S4
+    CFG -->|slice ≈ imgsz / scale_coeff| S4
+    S4 --> WT
     WT --> S5
+    CFG --> S5
     S5 --> MET
 ```
 
-
-
-Probe decides tiles + confidence per clip. Autolabel uses that config. Train fits YOLOv8n on pseudo-labels. Evaluate reports metrics and writes prediction videos.
+**Tile sizing has two layers:** probe sets **label** resolution (`target_tiles` + headroom); after labels exist, `label_box_stats.py` sets **train/eval** crop scale (`scale_coeff`). Both live in `clip_tiling.json`. Autolabel uses tiles/threshold; train and evaluate use `scale_coeff` → slice size at imgsz=1280.
 
 ### How to run (defaults vs options)
 
