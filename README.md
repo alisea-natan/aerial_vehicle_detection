@@ -463,7 +463,7 @@ Full report: `outputs/metrics_table.md`, `outputs/eval_metrics.json`. Prediction
 
 ## 9. Ideas for improvement
 
-- **Cut close-band false alarms** — Stronger tile NMS, slightly higher conf on `<200m`, or suppress duplicate boxes across overlap.
-- **Confirmed-only train tiles** — Keep empty tiles (negatives) and tiles where every label is confirmed via cache confidence + stable track; drop borderline / slice-boundary boxes.
-- **Confidence-weighted training** — Keep uncertain tiles but down-weight loss by confidence / track metadata instead of dropping them.
-
+- **Staged backbone fine-tuning** — Freeze `yolov8n.pt` backbone for a few warmup epochs, then unfreeze and fine-tune full network at lower LR, instead of full-network fine-tune from epoch 1 on a small pseudo-labeled set.
+- **Tuned data augmentation for small objects** — Review/adjust Ultralytics default augmentation policy (scale, mosaic, color, blur) to preserve small top-down vehicle signal.
+- **Threshold from PR curve** — Replace the `0.5/tiles` heuristic with a confidence threshold fit on a held-out precision/recall curve.
+- **Human-verified eval set** — Current GT is YOLO-World pseudo-labels; eval metrics measure agreement with the labeler, not real accuracy.
