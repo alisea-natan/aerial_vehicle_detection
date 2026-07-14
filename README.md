@@ -12,7 +12,7 @@ vehicle_detection/
 ├── config/
 │   └── clip_tiling.json            # label tiles (probe) + scale_coeff (label_box_stats)
 ├── checkpoints/
-│   └── yolov8n_vehicle_best.pt     # git-tracked (~23 MB, copied by train.py)
+│   └── yolov8n_vehicle_best.pt     # git-tracked (≈23 MB, copied by train.py)
 ├── data/
 │   ├── train/*.mp4                 # Git LFS
 │   ├── eval/*.mp4                  # Git LFS
@@ -132,9 +132,9 @@ Run from the repo root. For clip-scoped scripts, `NAME` is the video stem (e.g. 
 
 | Stage | Typical wall time | Notes |
 | ----- | ----------------- | ----- |
-| Label (`autolabel_yworld.py`, 6 clips) | **1 h 2 m 44 s** | From `debug/label_stats.json` (2026-07-13); earlier pass without tile headroom was ~51.5 min |
-| Train (`train.py`, 15 epochs) | **~12.3 h** training loop (**~13 h** wall) | imgsz=1280, batch=12, MPS; Ultralytics `results.csv` epoch-15 cumulative time ≈ 44390 s |
-| Eval (`evaluate.py`, 2 clips + videos) | **~7 m 17 s** | Measured 2026-07-14: ~6.1 frame/s infer on MPS; video encode ~1–1.5 min/clip. `--no-video` ≈ infer only (~5 min). |
+| Label (`autolabel_yworld.py`, 6 clips) | **1 h 2 m 44 s** | From `debug/label_stats.json` (2026-07-13) |
+| Train (`train.py`, 15 epochs) | **≈12.3 h** training loop (**≈13 h** wall) | imgsz=1280, batch=12, MPS; Ultralytics `results.csv` epoch-15 cumulative time ≈ 44390 s |
+| Eval (`evaluate.py`, 2 clips + videos) | **≈7 m 17 s** | Measured 2026-07-14: ≈6.1 frame/s infer on MPS; video encode ≈1–1.5 min/clip. `--no-video` ≈ infer only (≈5 min). |
 
 Probe and frame extraction are short (minutes). End-to-end is dominated by **train**, then **label**.
 
@@ -225,12 +225,12 @@ YOLO-World often tags top-down cars as `person` (known COCO quirk). During **pro
 
 | Split | Clip                          | Probe min | Label tiles | Threshold | Est. distance (probe) | Band   |
 | ----- | ----------------------------- | --------- | ----------- | --------- | --------------------- | ------ |
-| eval  | `13722965_2160_3840_30fps`    | 1         | 2           | 0.25      | ~118 m                | <200 m |
-| eval  | `266987` *                    | 2         | 3           | 0.1667    | ~379 m                | >200 m |
-| train | `3405804-uhd_3840_2160_30fps` | 1         | 2           | 0.25      | ~134 m                | <200 m |
-| train | `8457857-uhd_3840_2160_24fps` | 1         | 2           | 0.25      | ~203 m                | >200 m |
-| train | `8968356-hd_1920_1080_30fps`  | 2         | 3           | 0.1667    | ~371 m                | >200 m |
-| train | `5382494-uhd_3840_2160_24fps` | 2         | 3           | 0.1667    | ~729 m                | >400 m |
+| eval  | `13722965_2160_3840_30fps`    | 1         | 2           | 0.25      | ≈118 m                | <200 m |
+| eval  | `266987` *                    | 2         | 3           | 0.1667    | ≈379 m                | >200 m |
+| train | `3405804-uhd_3840_2160_30fps` | 1         | 2           | 0.25      | ≈134 m                | <200 m |
+| train | `8457857-uhd_3840_2160_24fps` | 1         | 2           | 0.25      | ≈203 m                | >200 m |
+| train | `8968356-hd_1920_1080_30fps`  | 2         | 3           | 0.1667    | ≈371 m                | >200 m |
+| train | `5382494-uhd_3840_2160_24fps` | 2         | 3           | 0.1667    | ≈729 m                | >400 m |
 
 
  `266987.mp4` added to eval manually — original spec had only one eval clip at <200 m.
@@ -275,7 +275,7 @@ Vehicle classes queried at label time: `car`, `truck`, `pickup`, `bus`, `van`, `
 
 `autolabel_yworld.py` reads `config/clip_tiling.json` and processes every frame in the clip.
 
-**Runtime:** full labeling pass on all 6 clips — **1 h 2 m 44 s** wall time (MPS, 2026-07-13, with +1 tile headroom; see `debug/label_stats.json`). An earlier pass was ~**51 min 30 sec**.
+**Runtime:** full labeling pass on all 6 clips — **1 h 2 m 44 s** wall time (MPS, 2026-07-13; see `debug/label_stats.json`).
 
 ### Detection mode (from probe)
 
@@ -328,8 +328,8 @@ After running `autolabel_yworld.py`:
 
 | Split | Clips | Labeled frames |
 | ----- | ----- | -------------- |
-| train | 4     | ~2465          |
-| eval  | 2     | ~1830          |
+| train | 4     | ≈2465          |
+| eval  | 2     | ≈1830          |
 
 
 ---
@@ -369,12 +369,12 @@ python src/label_box_stats.py --no-write-scale-coeff   # report only
 3. `slice_size = floor32(min(imgsz / scale_coeff, frame_short_side))` (`imgsz=1280`).
 4. Writes `scale_coeff` + `scale_coeff_note` into `config/clip_tiling.json` (and top-level `train_imgsz` / formula metadata). Re-probe keeps these fields.
 
-| Clip | scale_coeff | slice @1280 | ~p50 after imgsz |
+| Clip | scale_coeff | slice @1280 | ≈p50 after imgsz |
 | ---- | ----------: | ----------: | ---------------: |
-| `8968356` (train, small) | 3.0 | 416 | ~52 |
-| `5382494` (train, far) | 1.2 | 1056 | ~64 |
-| `8457857` / `3405804` / `266987` | 0.47–0.59 | 2144 | ~64–82 |
-| `13722965` (eval, close) | 0.4 | 2144 | ~220 (frame-capped) |
+| `8968356` (train, small) | 3.0 | 416 | ≈52 |
+| `5382494` (train, far) | 1.2 | 1056 | ≈64 |
+| `8457857` / `3405804` / `266987` | 0.47–0.59 | 2144 | ≈64–82 |
+| `13722965` (eval, close) | 0.4 | 2144 | ≈220 (frame-capped) |
 
 **Train / val / eval alignment**
 
@@ -396,7 +396,7 @@ python src/train.py --prepare-only        # dataset only
 
 On Apple Silicon, `train.py` applies an MPS `unique()` workaround, uses `cache=disk`, modest dataloader workers, and auto batch (e.g. 8 @1280 on 16GB). If MPS OOMs it halves batch and retries.
 
-**Observed train time (this PoC):** **~12.3 h** for 15 epochs at imgsz=1280 / batch=12 on MPS (~**13 h** wall including dataset prepare / overhead). See §2 wall-time table.
+**Observed train time (this PoC):** **≈12.3 h** for 15 epochs at imgsz=1280 / batch=12 on MPS (≈**13 h** wall including dataset prepare / overhead). See §2 wall-time table.
 
 ---
 
@@ -429,15 +429,15 @@ python src/evaluate.py              # metrics + videos (default clips & weights)
 python src/evaluate.py --no-video   # metrics only, faster
 ```
 
-**Runtime:** measured **7 m 17 s** wall for the two default clips with prediction videos (MPS, 2026-07-14): ~**6.1 frame/s** infer each; video writing ~53 s / ~85 s. Without videos (`--no-video`) expect roughly the infer total (~5 min). Timer output is also in `outputs/eval_metrics.json` → `timing`.
+**Runtime:** measured **7 m 17 s** wall for the two default clips with prediction videos (MPS, 2026-07-14): ≈**6.1 frame/s** infer each; video writing ≈53 s / ≈85 s. Without videos (`--no-video`) expect roughly the infer total (≈5 min). Timer output is also in `outputs/eval_metrics.json` → `timing`.
 
-Offline PoC eval staying in the **minutes** range is fine vs ~13 h train. For a **live drone**, ~6 frame/s tiled @1280 is **not** real-time 30 fps — you’d need smaller imgsz, fewer tiles, or a faster device/model.
+Offline PoC eval staying in the **minutes** range is fine vs ≈13 h train. For a **live drone**, ≈6 frame/s tiled @1280 is **not** real-time 30 fps — you’d need smaller imgsz, fewer tiles, or a faster device/model.
 
 
 
 ### Results
 
-Fine-tuned `yolov8n_vehicle` on Apple Silicon (MPS), **2026-07-14**. Train/eval use per-clip `scale_coeff` crops → **imgsz=1280** (see §7). Compared to the early PoC (fixed 512 tiles, 2026-07-09), quality jumped sharply.
+Fine-tuned `yolov8n_vehicle` on Apple Silicon (MPS), **2026-07-14**. Train/eval use per-clip `scale_coeff` crops → **imgsz=1280** (see §7).
 
 
 | Metric                      | 0–200 m | 200–400 m |
@@ -451,10 +451,10 @@ Fine-tuned `yolov8n_vehicle` on Apple Silicon (MPS), **2026-07-14**. Train/eval 
 
 **How to read this**
 
-- **Detection rate (recall):** share of pseudo-label cars we find. Close band (~118 m) is strongest — cars are large on screen. Mid band (~379 m) is harder; ~42% recall is solid for small aerial objects with a nano model.
-- **Precision:** share of predictions that match a GT box. Mid band is cleaner (84%); close band has more FPs (duplicates on overlapping tiles + busy scene) but is no longer “precision collapse” like the 512 run.
-- **mAP@0.5:** ranking quality over confidence thresholds — ~50% / ~43% means the model ranks true cars well, not only at one conf cutoff.
-- **False alarms/min:** still high on 0–200 m in absolute terms (dense traffic + tile overlap). Much better than before; further NMS / conf tuning can cut this without killing recall.
+- **Detection rate (recall):** share of pseudo-label cars we find. Close band (≈118 m) is strongest - cars are large on screen. Mid band (≈379 m) is harder; ≈42% recall is solid for small aerial objects with a nano model.
+- **Precision:** share of predictions that match a GT box. Mid band is cleaner (84%); close band has more FPs (duplicates on overlapping tiles + busy scene).
+- **mAP@0.5:** ranking quality over confidence thresholds — ≈50% / ≈43% means the model ranks true cars well, not only at one conf cutoff.
+- **False alarms/min:** high on 0–200 m in absolute terms (dense traffic + tile overlap); further NMS / conf tuning can cut this without killing recall.
 - **Time to first det:** first TP almost immediately on both clips — useful for “alert as soon as a vehicle appears” demos.
 
 **Caveat:** GT = YOLO-World pseudo-labels, not human labels. Metrics measure agreement with the labeling pipeline. Absolute numbers will shift if GT is cleaned by hand.
