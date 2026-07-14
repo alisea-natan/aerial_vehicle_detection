@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Probe minimum SAHI tiles on middle frames; write config/clip_tiling.json."""
+"""Probe minimum SAHI tiles on middle frames; write config/clip_tiling.json.
+
+Stops at the first tile level that finds a car (largest/nearest case), then
+writes target_tiles one ladder step higher for labeling headroom on smaller cars.
+"""
 
 from __future__ import annotations
 
@@ -16,15 +20,19 @@ from config import (
     PROBE_MAX_LABEL_THRESHOLD,
     RAW_CONFIDENCE_THRESHOLD,
     DEBUG_DIR,
+    TILE_CANDIDATES,
+    TILE_HEADROOM_STEPS,
     build_split_map,
     iter_frame_clip_dirs,
     label_threshold_for_tiles,
     load_clip_tile_config,
     load_tiling_payload,
     merge_probe_results,
+    next_tile_candidate,
     overlap_for_tiles,
     probe_detection_class,
     probe_model_classes,
+    probe_result_to_config_entry,
     save_clip_tile_config,
 )
 from detect import (
@@ -39,12 +47,14 @@ from detect import (
 )
 
 PROBE_FRAMES = 5
-TILE_CANDIDATES = (1, 2, 3, 4, 6, 8, 12)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Find minimum tiles for car detection; estimate distance; update clip config.",
+        description=(
+            "Find minimum tiles for car detection, bump +1 ladder step for labeling headroom, "
+            "estimate distance, update clip config."
+        ),
     )
     parser.add_argument("--clip", default=None, help="Probe a single clip (video stem).")
     parser.add_argument("--frames", type=int, default=PROBE_FRAMES, help="Middle frames to probe per clip.")
@@ -167,9 +177,11 @@ def probe_clip(
             best_hit = max(frame_hits, key=lambda hit: hit["car_count"])
             hit_summary = best_hit
             hit_frame = best_hit["frame"]
+            target_with_headroom = next_tile_candidate(target_tiles)
             print(
                 f"  tiles={target_tiles}: car HIT on {len(frame_hits)}/{len(frame_paths)} frames "
-                f"in {elapsed_sec}s — stopping"
+                f"in {elapsed_sec}s — stopping "
+                f"(label target_tiles={target_with_headroom}, +{TILE_HEADROOM_STEPS} headroom)"
             )
             break
 
@@ -180,6 +192,7 @@ def probe_clip(
     distance_source = "largest_car" if primary_car else None
     if min_tiles is not None and hit_label_threshold is None:
         hit_label_threshold = label_threshold_for_tiles(min_tiles)
+    target_tiles = next_tile_candidate(min_tiles) if min_tiles is not None else None
 
     total_elapsed = round(sum(item["elapsed_sec"] for item in attempts), 2)
     return {
@@ -191,6 +204,7 @@ def probe_clip(
         "frames_probed": [path.stem for path in frame_paths],
         "camera": camera,
         "min_tiles": min_tiles,
+        "target_tiles": target_tiles,
         "hit_frame": hit_frame,
         "distance_m": distance_m,
         "distance_source": distance_source,
@@ -244,6 +258,7 @@ def main() -> None:
             "probe_class_aliases": PROBE_CLASS_ALIASES,
             "probe_model_classes": probe_classes,
             "tile_candidates": list(TILE_CANDIDATES),
+            "tile_headroom_steps": TILE_HEADROOM_STEPS,
             "frames_per_clip": args.frames,
             "last_probe_elapsed_sec": run_elapsed,
         },
@@ -261,9 +276,10 @@ def main() -> None:
                 "fallback_label_threshold": FALLBACK_LABEL_THRESHOLD,
                 "adaptive_label_threshold": "probe_max / target_tiles, floor=raw_confidence",
                 "detection_class": detection_class,
-            "probe_class_aliases": PROBE_CLASS_ALIASES,
-            "probe_model_classes": probe_classes,
+                "probe_class_aliases": PROBE_CLASS_ALIASES,
+                "probe_model_classes": probe_classes,
                 "tile_candidates": list(TILE_CANDIDATES),
+                "tile_headroom_steps": TILE_HEADROOM_STEPS,
                 "frames_per_clip": args.frames,
                 "run_elapsed_sec": run_elapsed,
                 "clips": results,
@@ -273,14 +289,18 @@ def main() -> None:
         encoding="utf-8",
     )
 
-    print(f"\n{'clip':<40} {'tiles':>5} {'dist_m':>8} {'band':>8} {'probe_s':>8}")
-    print("-" * 75)
+    print(
+        f"\n{'clip':<40} {'probe':>5} {'label':>5} {'dist_m':>8} {'band':>8} {'probe_s':>8}"
+    )
+    print("-" * 82)
     for item in results:
         dist = f"{item['distance_m']:.0f}" if item["distance_m"] is not None else "-"
-        tiles = str(item["min_tiles"]) if item["min_tiles"] is not None else "-"
+        probe_tiles = str(item["min_tiles"]) if item["min_tiles"] is not None else "-"
+        entry = probe_result_to_config_entry(item)
+        label_tiles = str(entry["target_tiles"])
         band = item["distance_band"] or "-"
         print(
-            f"{item['clip']:<40} {tiles:>5} {dist:>8} {band:>8} "
+            f"{item['clip']:<40} {probe_tiles:>5} {label_tiles:>5} {dist:>8} {band:>8} "
             f"{item['total_probe_sec']:>7.1f}s"
         )
     print(f"\nConfig: {config_path}")

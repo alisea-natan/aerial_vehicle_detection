@@ -22,6 +22,7 @@ vehicle_detection/
 │   └── eval/{clip}/*.txt
 ├── debug/                          # gitignored — probe_clips.py, autolabel
 │   ├── tile_probe.json
+│   ├── train_tile_samples/         # sample_train_tiles.py
 │   ├── label_stats.json
 │   └── {clip}/                     # cache/, labels_debug.mp4, confidence_hist.png
 ├── outputs/                        # mostly gitignored
@@ -31,7 +32,9 @@ vehicle_detection/
 │   └── metrics_table.md            # evaluate.py metrics (table)
 └── src/
     ├── extract_frames.py           # 1. video → frames
-    ├── probe_clips.py              # 2. probe tiles → clip_tiling.json
+    ├── probe_clips.py              # 2. probe tiles → clip_tiling.json (+1 headroom)
+    ├── sample_train_tiles.py       # optional: sample car tiles at label slice size
+    ├── label_box_stats.py          # bbox size stats + write scale_coeff
     ├── autolabel_yworld.py         # 3. pseudo-labels + debug outputs
     ├── train.py                    # 4. fine-tune YOLOv8n
     ├── evaluate.py                 # 5. metrics + prediction videos
@@ -110,14 +113,26 @@ Probe decides tiles + confidence per clip. Autolabel uses that config. Train fit
 Run from the repo root. For clip-scoped scripts, `NAME` is the video stem (e.g. `266987`) or a `.mp4` filename.
 
 
-| Script                | No extra args                                                                                                     | `--clip NAME` | Other useful flags                                                                                                       |
-| --------------------- | ----------------------------------------------------------------------------------------------------------------- | ------------- | ------------------------------------------------------------------------------------------------------------------------ |
-| `extract_frames.py`   | All `.mp4` in `data/train/` and `data/eval/` → `data/frames/{clip}/`                                              | One clip only | —                                                                                                                        |
-| `probe_clips.py`      | All frame folders under `data/frames/` → updates `config/clip_tiling.json`                                        | One clip only | `--frames N` (default 5 middle frames)                                                                                   |
-| `autolabel_yworld.py` | All clips with frames **and** a matching `.mp4` in `data/train` or `data/eval`                                    | One clip only | —                                                                                                                        |
-| `train.py`            | Build dataset if missing, train 15 epochs, full-frame val, copy `best.pt` → `checkpoints/yolov8n_vehicle_best.pt` | —             | `--prepare-only` (dataset only, no training); `--recreate-dataset` (force rebuild `outputs/dataset/`)                    |
-| `evaluate.py`         | Default eval clips per band (`13722965…`, `266987`), default weights, metrics + prediction videos                 | —             | `--no-video` (metrics only); `--weights PATH`; `--clips A B`; `--conf FLOAT` (else per-clip threshold from probe config) |
+| Script                  | No extra args                                                                                                     | `--clip NAME` | Other useful flags                                                                                                       |
+| ----------------------- | ----------------------------------------------------------------------------------------------------------------- | ------------- | ------------------------------------------------------------------------------------------------------------------------ |
+| `extract_frames.py`     | All `.mp4` in `data/train/` and `data/eval/` → `data/frames/{clip}/`                                              | One clip only | —                                                                                                                        |
+| `probe_clips.py`        | All frame folders under `data/frames/` → updates `config/clip_tiling.json`                                        | One clip only | `--frames N` (default 5 middle frames)                                                                                   |
+| `sample_train_tiles.py` | Sample car tiles at label slice size → `debug/train_tile_samples/` + size summary                                 | One clip only | `--per-clip N` (default 2); needs existing `labels/`                                                                     |
+| `label_box_stats.py`    | Per-clip bbox stats + **writes `scale_coeff`** → `clip_tiling.json` + `debug/label_box_stats.json` | One clip only | `--no-write-scale-coeff`; `--imgsz N` (default 1280); `--target-px 64` |
+| `autolabel_yworld.py`   | All clips with frames **and** a matching `.mp4` in `data/train` or `data/eval`                                    | One clip only | —                                                                                                                        |
+| `train.py`              | Build dataset if missing, train 15 epochs (`val=False`), copy `best.pt` → `checkpoints/` | —             | `--prepare-only`; `--recreate-dataset`; `--batch N`                                                                      |
+| `evaluate.py`           | Default eval clips per band (`13722965…`, `266987`), default weights, metrics + prediction videos                 | —             | `--no-video` (metrics only); `--weights PATH`; `--clips A B`; `--conf FLOAT` (else per-clip threshold from probe config) |
 
+
+### Wall time (Apple Silicon MPS, this PoC)
+
+| Stage | Typical wall time | Notes |
+| ----- | ----------------- | ----- |
+| Label (`autolabel_yworld.py`, 6 clips) | **1 h 2 m 44 s** | From `debug/label_stats.json` (2026-07-13); earlier pass without tile headroom was ~51.5 min |
+| Train (`train.py`, 15 epochs) | **~12.3 h** training loop (**~13 h** wall) | imgsz=1280, batch=12, MPS; Ultralytics `results.csv` epoch-15 cumulative time ≈ 44390 s |
+| Eval (`evaluate.py`, 2 clips + videos) | **~7 m 17 s** | Measured 2026-07-14: ~6.1 frame/s infer on MPS; video encode ~1–1.5 min/clip. `--no-video` ≈ infer only (~5 min). |
+
+Probe and frame extraction are short (minutes). End-to-end is dominated by **train**, then **label**.
 
 **Typical full run** (all clips, end to end):
 
@@ -143,16 +158,19 @@ python src/autolabel_yworld.py --clip NAME
 
 ## 3. Probe: distance, tiles & confidence
 
-`probe_clips.py` runs after frame extraction and before labeling. For each clip it finds the **minimum SAHI tile count** that detects a car, estimates **distance**, and sets the **label confidence threshold**. Output: `config/clip_tiling.json`.
+`probe_clips.py` runs after frame extraction and before labeling. For each clip it finds the **minimum SAHI tile count** that detects a car (largest/nearest case), then writes **one ladder step higher** as `target_tiles` for labeling headroom on smaller/farther cars. Also estimates **distance** and sets the **label confidence threshold**. Output: `config/clip_tiling.json`.
 
 ### How it works
 
 1. Take 5 middle frames from the clip.
-2. Try tile candidates: `1 → 2 → 3 → 4 → 6 → 8 → 12`. Stop at the **first** level with a `car` hit (`person` counts as `car` during probe only).
-3. On the hit frame, take the **largest** `car`/`person` detection and estimate distance from it.
-4. Write per-clip config (tiles, overlap, threshold, `distance_m`, band).
+2. Try tile candidates: `1 → 2 → 3 → 4 → 6 → 8 → 12`. Stop at the **first** level with a `car` hit (`person` counts as `car` during probe only). That hit is `probe_min_tiles`.
+3. Set `target_tiles` to the **next** candidate (+1 headroom). Threshold and overlap follow `target_tiles`, not the raw probe hit. Example: probe hit at 2 → label with 3 tiles.
+4. On the hit frame, take the **largest** `car`/`person` detection and estimate distance from it.
+5. Write per-clip config (`target_tiles`, `probe_min_tiles`, overlap, threshold, `distance_m`, band).
 
-If no tile level finds a car: **fallback** to 12 tiles @ threshold 0.1. Detailed log: `debug/tile_probe.json`.
+If no tile level finds a car: **fallback** to 12 tiles @ threshold 0.1 (no further bump). Detailed log: `debug/tile_probe.json`.
+
+Why headroom: the probe stops when the **largest** car is visible. Smaller cars in the same frame often need the next tile step to be large enough for the detector.
 
 ### Distance
 
@@ -192,7 +210,7 @@ tiles = 1   →  0.50
 tiles > 1   →  max(0.05, 0.50 / tiles)
 ```
 
-Examples: 2 tiles → 0.25, 4 → 0.125, 12 → 0.05 (floor).
+Examples: 2 tiles → 0.25, 3 → 0.1667, 4 → 0.125, 12 → 0.05 (floor). Applied to `target_tiles` (after headroom).
 
 ### Probe-only alias
 
@@ -201,17 +219,27 @@ YOLO-World often tags top-down cars as `person` (known COCO quirk). During **pro
 ### Probe results per clip
 
 
-| Split | Clip                          | Tiles | Threshold | Est. distance (probe) | Band   |
-| ----- | ----------------------------- | ----- | --------- | --------------------- | ------ |
-| eval  | `13722965_2160_3840_30fps`    | 1     | 0.50      | ~118 m                | <200 m |
-| eval  | `266987` *                    | 2     | 0.25      | ~379 m                | >200 m |
-| train | `3405804-uhd_3840_2160_30fps` | 1     | 0.50      | ~134 m                | <200 m |
-| train | `8457857-uhd_3840_2160_24fps` | 1     | 0.50      | ~203 m                | >200 m |
-| train | `8968356-hd_1920_1080_30fps`  | 2     | 0.25      | ~371 m                | >200 m |
-| train | `5382494-uhd_3840_2160_24fps` | 2     | 0.25      | ~729 m                | >400 m |
+| Split | Clip                          | Probe min | Label tiles | Threshold | Est. distance (probe) | Band   |
+| ----- | ----------------------------- | --------- | ----------- | --------- | --------------------- | ------ |
+| eval  | `13722965_2160_3840_30fps`    | 1         | 2           | 0.25      | ~118 m                | <200 m |
+| eval  | `266987` *                    | 2         | 3           | 0.1667    | ~379 m                | >200 m |
+| train | `3405804-uhd_3840_2160_30fps` | 1         | 2           | 0.25      | ~134 m                | <200 m |
+| train | `8457857-uhd_3840_2160_24fps` | 1         | 2           | 0.25      | ~203 m                | >200 m |
+| train | `8968356-hd_1920_1080_30fps`  | 2         | 3           | 0.1667    | ~371 m                | >200 m |
+| train | `5382494-uhd_3840_2160_24fps` | 2         | 3           | 0.1667    | ~729 m                | >400 m |
 
 
  `266987.mp4` added to eval manually — original spec had only one eval clip at <200 m.
+
+### Sample tiles at label size
+
+After probe (and once labels exist), inspect what cars look like at the labeling slice size:
+
+```bash
+python src/sample_train_tiles.py
+```
+
+Writes a few car tiles per clip under `debug/train_tile_samples/` and a `manifest.json` with per-clip `slice_size` plus mean / suggested shared tile side — useful when deciding whether 1080p-far and 4K-mid tiles are close enough to share one train `imgsz`.
 
 ---
 
@@ -243,7 +271,7 @@ Vehicle classes queried at label time: `car`, `truck`, `pickup`, `bus`, `van`, `
 
 `autolabel_yworld.py` reads `config/clip_tiling.json` and processes every frame in the clip.
 
-**Runtime:** full labeling pass on all 6 clips — **51 min 30 sec** (wall time, MPS).
+**Runtime:** full labeling pass on all 6 clips — **1 h 2 m 44 s** wall time (MPS, 2026-07-13, with +1 tile headroom; see `debug/label_stats.json`). An earlier pass was ~**51 min 30 sec**.
 
 ### Detection mode (from probe)
 
@@ -313,30 +341,58 @@ After running `autolabel_yworld.py`:
 | ----------- | ---------------------------------------------------------------------------------- |
 | Base model  | `yolov8n.pt`                                                                       |
 | Epochs      | 15 (PoC)                                                                           |
-| Train input | SAHI slices 512×512, overlap 0.2                                                   |
-| Val input   | Same 512×512 tiles (dataset only; `val=False` during train)                        |
+| YOLO imgsz  | **1280** (global)                                                                  |
+| Train crop  | **Per-clip** from `scale_coeff` in `clip_tiling.json` (`slice ≈ imgsz / coeff`)    |
+| Overlap     | 0.2                                                                                |
 | Negatives   | Train: up to 2 empty tiles/frame; val: labeled tiles only                          |
 | Class       | `vehicle` (single class)                                                           |
 | Weights     | `outputs/runs/.../best.pt` → copied to `checkpoints/yolov8n_vehicle_best.pt` (git) |
 
 
-**Known limitation — fixed 512×512 tiles:** train and eval use one grid size for all clips. Autolabel did **not** use this: `target_tiles=1` clips were labeled **full-frame**; `target_tiles=2` used **~1018×1018** (1080p) or **~2036×2036** (4K). We kept 512 for **speed**, uniform YOLO `imgsz`, and disk — a deliberate shortcut, not matched to probe tiling. Better follow-up: per-clip `compute_slice_size` or a single size closer to labeling (~1024).
+**Per-clip `scale_coeff`:** object long-side after resize ≈ `fullframe_long × scale_coeff`. Far/small clips get high coeff (small crops, e.g. 416); close/large clips get low coeff (large crops, capped to frame short side ≈2144). Re-probe **keeps** existing `scale_coeff`. Same coeffs drive **train dataset**, **val tiles**, and **`evaluate.py` inference**.
 
-**Observed run (M1 Pro, MPS, 512 tiles):** 15 epochs in **~1 h 34 min** (1.56 h wall time). Fused model: **73 layers**, **~3.0M parameters**, **8.1 GFLOPs**.
+#### How `scale_coeff` is set
+
+Automated by `label_box_stats.py` (needs existing `labels/`):
+
+```bash
+python src/label_box_stats.py              # stats + write scale_coeff
+python src/label_box_stats.py --no-write-scale-coeff   # report only
+```
+
+1. Per-clip median box long-side in **full-frame pixels** (`ff_p50`).
+2. `scale_coeff = clamp(target_px / ff_p50, 0.4, 3.0)` with `target_px=64` (middle of YOLO 32–96 sweet spot).
+3. `slice_size = floor32(min(imgsz / scale_coeff, frame_short_side))` (`imgsz=1280`).
+4. Writes `scale_coeff` + `scale_coeff_note` into `config/clip_tiling.json` (and top-level `train_imgsz` / formula metadata). Re-probe keeps these fields.
+
+| Clip | scale_coeff | slice @1280 | ~p50 after imgsz |
+| ---- | ----------: | ----------: | ---------------: |
+| `8968356` (train, small) | 3.0 | 416 | ~52 |
+| `5382494` (train, far) | 1.2 | 1056 | ~64 |
+| `8457857` / `3405804` / `266987` | 0.47–0.59 | 2144 | ~64–82 |
+| `13722965` (eval, close) | 0.4 | 2144 | ~220 (frame-capped) |
 
 **Train / val / eval alignment**
 
 
-| Stage                            | Input                                                      |
-| -------------------------------- | ---------------------------------------------------------- |
-| Train (`train.py`)               | fixed 512×512 tiles                                        |
-| Val (`train.py`)                 | tiled val set on disk; **per-epoch val off** (`val=False`) |
-| Reported metrics (`evaluate.py`) | 512×512 tiles → merged to full frame                       |
+| Stage                            | Input                                                                 |
+| -------------------------------- | --------------------------------------------------------------------- |
+| Train (`train.py`)               | per-clip slice → letterbox to imgsz 1280                              |
+| Val (`train.py`)                 | same per-clip scale; **per-epoch val off** (`val=False`)              |
+| Reported metrics (`evaluate.py`) | same per-clip slice + imgsz 1280 → merge to full frame                |
 
 
 `best.pt` is the last epoch checkpoint when `val=False`. Use `evaluate.py` for reported band metrics.
 
-See **§2** for `train.py` flags (`--prepare-only`, `--recreate-dataset`).
+```bash
+python -u src/train.py                    # reuse dataset; auto batch/cache for MPS
+python -u src/train.py --recreate-dataset # rebuild tiles + train
+python src/train.py --prepare-only        # dataset only
+```
+
+On Apple Silicon, `train.py` applies an MPS `unique()` workaround, uses `cache=disk`, modest dataloader workers, and auto batch (e.g. 8 @1280 on 16GB). If MPS OOMs it halves batch and retries.
+
+**Observed train time (this PoC):** **~12.3 h** for 15 epochs at imgsz=1280 / batch=12 on MPS (~**13 h** wall including dataset prepare / overhead). See §2 wall-time table.
 
 ---
 
@@ -346,7 +402,8 @@ See **§2** for `train.py` flags (`--prepare-only`, `--recreate-dataset`).
 
 `evaluate.py` compares the fine-tuned detector against pseudo-labels in `labels/eval/`, **one clip per distance band**.
 
-**Inference:** each frame is sliced into **512×512 tiles with 0.2 overlap** (same as `train.py`), detections mapped back to full-frame coordinates, NMS-merged, matched at IoU 0.5. Same **512 mismatch vs autolabel** as training (see §7).
+**Inference:** each frame is sliced with the clip’s **`scale_coeff` → slice size**, run at **imgsz=1280** (same as train), detections mapped to full-frame coordinates, NMS-merged, matched at IoU 0.5.
+
 
 Each eval video is treated as a **single fixed band** from probe (`clip_tiling.json`) — e.g. the whole `13722965…` clip is 0–200 m, the whole `266987` clip is 200–400 m. Metrics do **not** recompute distance per frame or per car.
 
@@ -368,29 +425,41 @@ python src/evaluate.py              # metrics + videos (default clips & weights)
 python src/evaluate.py --no-video   # metrics only, faster
 ```
 
+**Runtime:** measured **7 m 17 s** wall for the two default clips with prediction videos (MPS, 2026-07-14): ~**6.1 frame/s** infer each; video writing ~53 s / ~85 s. Without videos (`--no-video`) expect roughly the infer total (~5 min). Timer output is also in `outputs/eval_metrics.json` → `timing`.
+
+Offline PoC eval staying in the **minutes** range is fine vs ~13 h train. For a **live drone**, ~6 frame/s tiled @1280 is **not** real-time 30 fps — you’d need smaller imgsz, fewer tiles, or a faster device/model.
+
 
 
 ### Results
 
-Fine-tuned `yolov8n_vehicle` on M1 Pro (MPS). **512×512** tiled train + eval (`evaluate.py`, 2026-07-09). Known tile-size mismatch vs autolabel (§7).
+Fine-tuned `yolov8n_vehicle` on Apple Silicon (MPS), **2026-07-14**. Train/eval use per-clip `scale_coeff` crops → **imgsz=1280** (see §7). Compared to the early PoC (fixed 512 tiles, 2026-07-09), quality jumped sharply.
 
 
 | Metric                      | 0–200 m | 200–400 m |
 | --------------------------- | ------- | --------- |
-| Detection rate TP/(TP+FN)   | 12.1%   | 19.4%     |
-| Precision TP/(TP+FP)        | 7.7%    | 58.6%     |
-| False alarms / min          | 6137.25 | 311.53    |
-| Time to first detection (s) | 0.03    | 2.20      |
-| [mAP@0.5](mailto:mAP@0.5)   | 3.3%    | 12.7%     |
+| Detection rate TP/(TP+FN)   | **65.6%** | **42.4%** |
+| Precision TP/(TP+FP)        | **64.5%** | **84.3%** |
+| False alarms / min          | 2119.61 | 202.31    |
+| Time to first detection (s) | 0.03    | 0.03      |
+| mAP@0.5                     | **51.3%** | **42.5%** |
 
 
-0–200 m band: higher recall than full-frame eval (~2.6%) but very low precision (many duplicate FPs across overlapping 512 tiles). 200–400 m band: more balanced. GT = pseudo-labels only.
+**How to read this**
 
-Full report: `outputs/metrics_table.md`, `outputs/eval_metrics.json`.
+- **Detection rate (recall):** share of pseudo-label cars we find. Close band (~118 m) is strongest — cars are large on screen. Mid band (~379 m) is harder; ~42% recall is solid for small aerial objects with a nano model.
+- **Precision:** share of predictions that match a GT box. Mid band is cleaner (84%); close band has more FPs (duplicates on overlapping tiles + busy scene) but is no longer “precision collapse” like the 512 run.
+- **mAP@0.5:** ranking quality over confidence thresholds — ~50% / ~43% means the model ranks true cars well, not only at one conf cutoff.
+- **False alarms/min:** still high on 0–200 m in absolute terms (dense traffic + tile overlap). Much better than before; further NMS / conf tuning can cut this without killing recall.
+- **Time to first det:** first TP almost immediately on both clips — useful for “alert as soon as a vehicle appears” demos.
+
+**Caveat:** GT = YOLO-World pseudo-labels, not human labels. Metrics measure agreement with the labeling pipeline. Absolute numbers will shift if GT is cleaned by hand.
+
+Full report: `outputs/metrics_table.md`, `outputs/eval_metrics.json`. Prediction overlays: `outputs/eval_videos/`.
 
 ## 9. Ideas for improvement
 
-- **Probe-aligned tile size** — Replace fixed 512×512 with  common size ~1024 so train/eval match autolabel SAHI/grid. Or improve validation as validation videos are bigger on pixels-per-car than our train videos.
-- **Confirmed-only train tiles** — Keep empty tiles (negatives) and tiles where every label is confirmed via cache confidence + stable track; drop tiles with borderline or slice-boundary boxes.
-- **Confidence-weighted training** — Keep uncertain tiles but down-weight their loss by confidence and track metadata instead of dropping them outright.
+- **Cut close-band false alarms** — Stronger tile NMS, slightly higher conf on `<200m`, or suppress duplicate boxes across overlap.
+- **Confirmed-only train tiles** — Keep empty tiles (negatives) and tiles where every label is confirmed via cache confidence + stable track; drop borderline / slice-boundary boxes.
+- **Confidence-weighted training** — Keep uncertain tiles but down-weight loss by confidence / track metadata instead of dropping them.
 

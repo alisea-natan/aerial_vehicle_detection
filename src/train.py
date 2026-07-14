@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Fine-tune YOLOv8n on SAHI-sliced train pseudo-labels; validate on matching eval tiles."""
+"""Fine-tune YOLOv8n on SAHI-sliced train pseudo-labels; validate on matching eval tiles.
+
+Per-clip scale_coeff in config/clip_tiling.json sets crop size so objects land near
+~64 px after resize to TRAIN_IMGSZ (see config.slice_size_from_scale).
+"""
 
 from __future__ import annotations
 
@@ -15,23 +19,115 @@ from sahi.slicing import slice_image
 from sahi.utils.coco import CocoAnnotation
 from ultralytics import YOLO
 
-from config import FRAMES_DIR, LABELS_DIR, PROJECT_ROOT, build_split_map
+from config import (
+    FRAMES_DIR,
+    LABELS_DIR,
+    PROJECT_ROOT,
+    TRAIN_IMGSZ,
+    TRAIN_OVERLAP_RATIO,
+    build_split_map,
+    load_clip_tile_config,
+    resolve_scale_coeff,
+    slice_size_from_scale,
+)
 
 DATASET_DIR = PROJECT_ROOT / "outputs" / "dataset"
 RUNS_DIR = PROJECT_ROOT / "outputs" / "runs"
 
-# --- training config ---
+# --- training config (tuned for Apple Silicon MPS) ---
 MODEL_NAME = "yolov8n.pt"
 EPOCHS = 15  # PoC; increase for production runs
-SLICE_SIZE = 512  # fixed train/eval tile size (see README — known mismatch vs autolabel)
-OVERLAP_RATIO = 0.2
 SLICE_OUT_EXT = ".jpg"  # SAHI defaults to PNG — huge on 4K; JPEG saves ~5–10× disk
 MAX_EMPTY_SLICES_PER_FRAME = 2  # keep a few hard-negative tiles per frame
 MIN_AREA_RATIO = 0.1  # SAHI: keep box if >=10% of original area visible in tile
-BATCH_SIZE = 16
-WORKERS = 4
 CLASS_NAME = "vehicle"
 DEVICE = "mps" if torch.backends.mps.is_available() else "cpu"
+
+# MPS: few dataloader workers avoid fork/hang; disk cache cuts JPEG decode cost.
+# Batch is chosen from unified memory when --batch is omitted.
+DEFAULT_WORKERS_MPS = 2
+DEFAULT_WORKERS_CPU = 4
+
+
+def system_ram_gb() -> float:
+    try:
+        import os
+
+        return os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE") / (1024**3)
+    except Exception:
+        return 16.0
+
+
+def default_batch_size(imgsz: int) -> int:
+    """Pick a stable MPS-friendly batch for yolov8n at the given imgsz."""
+    ram = system_ram_gb()
+    if imgsz >= 1280:
+        if ram >= 32:
+            return 12
+        if ram >= 16:
+            return 8
+        return 4
+    if imgsz >= 960:
+        return 16 if ram >= 16 else 8
+    return 32 if ram >= 16 else 16
+
+
+def default_workers() -> int:
+    return DEFAULT_WORKERS_MPS if DEVICE == "mps" else DEFAULT_WORKERS_CPU
+
+
+def configure_mps_runtime() -> None:
+    """Env + allocator knobs that reduce MPS crashes / stalls."""
+    import os
+
+    os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+    if DEVICE != "mps":
+        return
+    # Leave headroom for macOS + dataloader; avoids sudden process kills.
+    try:
+        torch.mps.set_per_process_memory_fraction(0.85)
+    except Exception:
+        pass
+    try:
+        torch.set_float32_matmul_precision("high")
+    except Exception:
+        pass
+
+
+def patch_ultralytics_mps_unique() -> None:
+    """Avoid MPS bug: unique(return_counts=True) can overflow → negative dim in loss.
+
+    https://github.com/ultralytics/ultralytics/issues/12999
+    """
+    if DEVICE != "mps":
+        return
+
+    import ultralytics.utils.loss as yolo_loss
+    from ultralytics.utils.tal import xywh2xyxy
+
+    def preprocess(self, targets: torch.Tensor, batch_size: int, scale_tensor: torch.Tensor) -> torch.Tensor:
+        nl, ne = targets.shape
+        if nl == 0:
+            return torch.zeros(batch_size, 0, ne - 1, device=self.device)
+        batch_idx = targets[:, 0].long()
+        # Critical: run unique on CPU — MPS return_counts is unreliable.
+        _, counts = batch_idx.detach().cpu().unique(return_counts=True)
+        counts = counts.to(device=self.device, dtype=torch.int32)
+        max_count = int(counts.max().item())
+        if max_count < 0:
+            # Defensive: should not happen after CPU unique; keep training alive.
+            max_count = int(batch_idx.detach().cpu().bincount().max().item())
+        out = torch.zeros(batch_size, max_count, ne - 1, device=self.device)
+        offsets = torch.zeros(batch_size + 1, dtype=torch.long, device=self.device)
+        offsets.scatter_add_(0, batch_idx + 1, torch.ones_like(batch_idx))
+        offsets = offsets.cumsum(0)
+        within_idx = torch.arange(nl, device=self.device) - offsets[batch_idx]
+        out[batch_idx, within_idx] = targets[:, 1:]
+        out[..., 1:5] = xywh2xyxy(out[..., 1:5].mul_(scale_tensor))
+        return out
+
+    yolo_loss.v8DetectionLoss.preprocess = preprocess
+    print("Applied MPS unique() workaround for Ultralytics detection loss")
 
 
 def parse_args() -> argparse.Namespace:
@@ -47,6 +143,36 @@ def parse_args() -> argparse.Namespace:
         "--recreate-dataset",
         action="store_true",
         help="Force rebuild dataset even if outputs/dataset already exists.",
+    )
+    parser.add_argument(
+        "--imgsz",
+        type=int,
+        default=TRAIN_IMGSZ,
+        help=f"YOLO imgsz (default {TRAIN_IMGSZ} from config).",
+    )
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=EPOCHS,
+        help=f"Training epochs (default {EPOCHS}).",
+    )
+    parser.add_argument(
+        "--batch",
+        type=int,
+        default=None,
+        help="Batch size (default: auto from RAM / imgsz, e.g. 8 on 16GB M1 @1280).",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help=f"Dataloader workers (default: {DEFAULT_WORKERS_MPS} on MPS, {DEFAULT_WORKERS_CPU} else).",
+    )
+    parser.add_argument(
+        "--cache",
+        choices=("disk", "ram", "false"),
+        default="disk" if DEVICE == "mps" else "false",
+        help="Ultralytics image cache: disk (fast+safe on Mac), ram, or false.",
     )
     return parser.parse_args()
 
@@ -148,10 +274,12 @@ def slice_frames_to_dataset(
     images_dir: Path,
     labels_dir: Path,
     *,
+    clip_scales: dict[str, float],
+    imgsz: int,
     max_empty_slices_per_frame: int,
     progress_label: str,
 ) -> dict:
-    """Slice labeled frames into fixed tiles; write YOLO images + labels."""
+    """Slice labeled frames with per-clip scale_coeff → slice size; write YOLO images + labels."""
     clear_dir(images_dir)
     clear_dir(labels_dir)
 
@@ -160,10 +288,15 @@ def slice_frames_to_dataset(
     slices_kept = 0
     slices_dropped = 0
     source_frames = 0
+    clip_slice_sizes: dict[str, int] = {}
 
     for clip_name, image_path, label_path in frames:
         source_frames += 1
         img_w, img_h = load_image_size(image_path)
+        scale = clip_scales.get(clip_name, 1.0)
+        slice_size = slice_size_from_scale(scale, img_w, img_h, imgsz=imgsz)
+        clip_slice_sizes[clip_name] = slice_size
+
         coco_annotations = yolo_boxes_to_coco(parse_yolo_labels(label_path, img_w, img_h))
         output_stem = f"{clip_name}__{image_path.stem}"
         empty_kept_for_frame = 0
@@ -173,10 +306,10 @@ def slice_frames_to_dataset(
             coco_annotation_list=coco_annotations or None,
             output_file_name=output_stem,
             output_dir=str(images_dir),
-            slice_height=SLICE_SIZE,
-            slice_width=SLICE_SIZE,
-            overlap_height_ratio=OVERLAP_RATIO,
-            overlap_width_ratio=OVERLAP_RATIO,
+            slice_height=slice_size,
+            slice_width=slice_size,
+            overlap_height_ratio=TRAIN_OVERLAP_RATIO,
+            overlap_width_ratio=TRAIN_OVERLAP_RATIO,
             auto_slice_resolution=False,
             min_area_ratio=MIN_AREA_RATIO,
             out_ext=SLICE_OUT_EXT,
@@ -231,22 +364,49 @@ def slice_frames_to_dataset(
         "slices_kept": slices_kept,
         "slices_dropped": slices_dropped,
         "slices_with_labels": slices_with_labels,
-        "slice_size": SLICE_SIZE,
+        "imgsz": imgsz,
+        "overlap_ratio": TRAIN_OVERLAP_RATIO,
         "slice_out_ext": SLICE_OUT_EXT,
-        "overlap_ratio": OVERLAP_RATIO,
         "max_empty_slices_per_frame": max_empty_slices_per_frame,
+        "clip_scale_coeff": {k: clip_scales[k] for k in sorted(clip_slice_sizes)},
+        "clip_slice_size": clip_slice_sizes,
     }
 
 
-def prepare_sliced_train(split_map: dict[str, str]) -> dict:
+def build_clip_scales(split_map: dict[str, str]) -> dict[str, float]:
+    tile_config = load_clip_tile_config()
+    scales: dict[str, float] = {}
+    for clip_name, split in split_map.items():
+        if split not in ("train", "eval"):
+            continue
+        scales[clip_name] = resolve_scale_coeff(tile_config.get(clip_name))
+    return scales
+
+
+def prepare_sliced_train(split_map: dict[str, str], *, imgsz: int) -> dict:
     frames = iter_labeled_frames("train", split_map)
     if not frames:
         raise SystemExit("No train pseudo-labels found under labels/train/.")
+
+    clip_scales = build_clip_scales(split_map)
+    print("Per-clip train slice sizes (from scale_coeff):")
+    seen = set()
+    for clip_name, _, _ in frames:
+        if clip_name in seen:
+            continue
+        seen.add(clip_name)
+        meta = json.loads((FRAMES_DIR / clip_name / "metadata.json").read_text(encoding="utf-8"))
+        w, h = int(meta["width"]), int(meta["height"])
+        scale = clip_scales[clip_name]
+        sl = slice_size_from_scale(scale, w, h, imgsz=imgsz)
+        print(f"  {clip_name}: scale_coeff={scale:.2f} → slice={sl} (frame {w}x{h})")
 
     stats = slice_frames_to_dataset(
         frames,
         DATASET_DIR / "train" / "images",
         DATASET_DIR / "train" / "labels",
+        clip_scales=clip_scales,
+        imgsz=imgsz,
         max_empty_slices_per_frame=MAX_EMPTY_SLICES_PER_FRAME,
         progress_label="train",
     )
@@ -258,16 +418,19 @@ def prepare_sliced_train(split_map: dict[str, str]) -> dict:
     return stats
 
 
-def prepare_sliced_val(split_map: dict[str, str]) -> dict:
-    """Val on the same 512×512 tiles as train (labeled tiles only)."""
+def prepare_sliced_val(split_map: dict[str, str], *, imgsz: int) -> dict:
+    """Val tiles use the same per-clip scale_coeff as train/eval inference."""
     frames = iter_labeled_frames("eval", split_map)
     if not frames:
         raise SystemExit("No eval pseudo-labels found under labels/eval/.")
 
+    clip_scales = build_clip_scales(split_map)
     stats = slice_frames_to_dataset(
         frames,
         DATASET_DIR / "val" / "images",
         DATASET_DIR / "val" / "labels",
+        clip_scales=clip_scales,
+        imgsz=imgsz,
         max_empty_slices_per_frame=0,
         progress_label="val",
     )
@@ -278,7 +441,7 @@ def prepare_sliced_val(split_map: dict[str, str]) -> dict:
     return stats
 
 
-def write_dataset_yaml() -> Path:
+def write_dataset_yaml(imgsz: int, train_stats: dict, val_stats: dict) -> Path:
     DATASET_DIR.mkdir(parents=True, exist_ok=True)
     yaml_path = DATASET_DIR / "data.yaml"
     payload = {
@@ -287,21 +450,31 @@ def write_dataset_yaml() -> Path:
         "val": "val/images",
         "names": {0: CLASS_NAME},
         "nc": 1,
-        "slice_size": SLICE_SIZE,
-        "overlap_ratio": OVERLAP_RATIO,
+        "imgsz": imgsz,
+        "overlap_ratio": TRAIN_OVERLAP_RATIO,
+        "clip_scale_coeff": {
+            **train_stats.get("clip_scale_coeff", {}),
+            **val_stats.get("clip_scale_coeff", {}),
+        },
+        "clip_slice_size": {
+            **train_stats.get("clip_slice_size", {}),
+            **val_stats.get("clip_slice_size", {}),
+        },
     }
     yaml_path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
     return yaml_path
 
 
-def prepare_dataset(split_map: dict[str, str], *, recreate: bool) -> Path:
+def prepare_dataset(split_map: dict[str, str], *, recreate: bool, imgsz: int) -> Path:
     if recreate or not (DATASET_DIR / "train" / "images").exists():
-        print("Preparing SAHI-sliced train set...")
-        train_stats = prepare_sliced_train(split_map)
-        print("Preparing SAHI-sliced val set (same tile size as train)...")
-        val_stats = prepare_sliced_val(split_map)
-        yaml_path = write_dataset_yaml()
+        print(f"Preparing SAHI-sliced train set (imgsz={imgsz}, per-clip scale_coeff)...")
+        train_stats = prepare_sliced_train(split_map, imgsz=imgsz)
+        print("Preparing SAHI-sliced val set (same per-clip scale as eval)...")
+        val_stats = prepare_sliced_val(split_map, imgsz=imgsz)
+        yaml_path = write_dataset_yaml(imgsz, train_stats, val_stats)
         manifest = {
+            "imgsz": imgsz,
+            "overlap_ratio": TRAIN_OVERLAP_RATIO,
             "train": train_stats,
             "val": val_stats,
         }
@@ -314,32 +487,97 @@ def prepare_dataset(split_map: dict[str, str], *, recreate: bool) -> Path:
 
     yaml_path = DATASET_DIR / "data.yaml"
     if not yaml_path.exists():
-        write_dataset_yaml()
+        raise SystemExit(
+            f"Dataset images exist but {yaml_path} is missing. "
+            "Rebuild with: python src/train.py --recreate-dataset"
+        )
     print(f"Using existing dataset at {DATASET_DIR}")
     return yaml_path
 
 
-def train_model(yaml_path: Path) -> Path:
+def train_model(
+    yaml_path: Path,
+    *,
+    imgsz: int,
+    epochs: int,
+    batch: int,
+    workers: int,
+    cache: str | bool,
+) -> Path:
     RUNS_DIR.mkdir(parents=True, exist_ok=True)
-    model = YOLO(MODEL_NAME)
+    configure_mps_runtime()
+    patch_ultralytics_mps_unique()
 
-    print(
-        f"Training {MODEL_NAME} on {DEVICE}: "
-        f"{EPOCHS} epochs, imgsz={SLICE_SIZE} (tiled, no per-epoch val)"
-    )
-    model.train(
-        data=str(yaml_path),
-        epochs=EPOCHS,
-        imgsz=SLICE_SIZE,
-        batch=BATCH_SIZE,
-        workers=WORKERS,
-        device=DEVICE,
-        project=str(RUNS_DIR),
-        name="yolov8n_vehicle",
-        exist_ok=True,
-        pretrained=True,
-        val=False,  # skip per-epoch val for speed; use evaluate.py for metrics
-    )
+    cache_arg: str | bool
+    if cache == "false":
+        cache_arg = False
+    elif cache == "ram":
+        cache_arg = True
+    else:
+        cache_arg = "disk"
+
+    batch_try = max(1, int(batch))
+    last_error: Exception | None = None
+
+    for attempt in range(4):
+        if DEVICE == "mps":
+            try:
+                torch.mps.empty_cache()
+            except Exception:
+                pass
+
+        model = YOLO(MODEL_NAME)
+        print(
+            f"Training {MODEL_NAME} on {DEVICE}: "
+            f"{epochs} epochs, imgsz={imgsz}, batch={batch_try}, workers={workers}, "
+            f"cache={cache_arg} (attempt {attempt + 1}/4, no per-epoch val)"
+        )
+        try:
+            model.train(
+                data=str(yaml_path),
+                epochs=epochs,
+                imgsz=imgsz,
+                batch=batch_try,
+                workers=workers,
+                device=DEVICE,
+                project=str(RUNS_DIR),
+                name="yolov8n_vehicle",
+                exist_ok=True,
+                pretrained=True,
+                val=False,  # metrics via evaluate.py
+                amp=True,
+                cache=cache_arg,
+                plots=False,
+                save_period=-1,
+                # Slightly lighter aug → fewer MPS edge cases + faster steps
+                close_mosaic=5,
+                mixup=0.0,
+                copy_paste=0.0,
+            )
+            last_error = None
+            break
+        except RuntimeError as exc:
+            last_error = exc
+            msg = str(exc).lower()
+            oom = (
+                "out of memory" in msg
+                or "oom" in msg
+                or "memory" in msg
+                or "mps backend out of memory" in msg
+            )
+            unique_bug = "non-negative" in msg or "negative dimension" in msg
+            if (oom or unique_bug) and batch_try > 1:
+                new_batch = max(1, batch_try // 2)
+                print(
+                    f"MPS/train fault at batch={batch_try} ({exc}); "
+                    f"retrying with batch={new_batch}"
+                )
+                batch_try = new_batch
+                continue
+            raise
+
+    if last_error is not None:
+        raise last_error
 
     best_weights = RUNS_DIR / "yolov8n_vehicle" / "weights" / "best.pt"
     if not best_weights.exists():
@@ -364,13 +602,31 @@ def main() -> None:
     if not train_frames:
         raise SystemExit("No train labels. Run autolabel_yworld.py on train clips first.")
 
-    yaml_path = prepare_dataset(split_map, recreate=args.recreate_dataset)
+    batch = args.batch if args.batch is not None else default_batch_size(args.imgsz)
+    workers = args.workers if args.workers is not None else default_workers()
+    print(
+        f"Device={DEVICE}, RAM≈{system_ram_gb():.0f}GB → "
+        f"batch={batch}, workers={workers}, cache={args.cache}, imgsz={args.imgsz}"
+    )
+
+    yaml_path = prepare_dataset(
+        split_map,
+        recreate=args.recreate_dataset,
+        imgsz=args.imgsz,
+    )
 
     if args.prepare_only:
         print("Dataset prepared. Run without --prepare-only to train.")
         return
 
-    weights = train_model(yaml_path)
+    weights = train_model(
+        yaml_path,
+        imgsz=args.imgsz,
+        epochs=args.epochs,
+        batch=batch,
+        workers=workers,
+        cache=args.cache,
+    )
     print(f"Done. Best weights: {weights}")
 
 

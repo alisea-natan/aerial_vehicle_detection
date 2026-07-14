@@ -1,66 +1,87 @@
 {
   "source": "probe_clips.py",
-  "updated_at": "2026-07-09T17:04:04+00:00",
+  "updated_at": "2026-07-13T11:40:00+00:00",
+  "train_imgsz": 1280,
+  "target_object_long_px": 64.0,
+  "scale_coeff_note": "at_imgsz \u2248 fullframe_long \u00d7 scale_coeff; slice \u2248 train_imgsz / scale_coeff (capped to frame). Tuned from label_box_stats p50 \u2192 ~64 px.",
   "clips": {
     "13722965_2160_3840_30fps": {
-      "target_tiles": 1,
-      "overlap_ratio": 0.0,
-      "label_confidence_threshold": 0.5,
+      "target_tiles": 2,
+      "probe_min_tiles": 1,
+      "scale_coeff": 0.4,
+      "scale_coeff_note": "ff_p50=368.8 \u2192 64/368.8=0.17; clamp[0.4,3] \u2192 0.4; slice=2144 @ imgsz=1280 (clamped); frame-capped effective_scale\u22480.60",
+      "overlap_ratio": 0.1,
+      "label_confidence_threshold": 0.25,
       "detection_class": "car",
       "distance_band": "<200m",
       "distance_m": 117.7,
       "split": "eval",
-      "note": "probed frame 000458; distance from largest_car"
+      "note": "probed frame 000458; distance from largest_car; probe_min_tiles=1 \u2192 target_tiles=2 (+1 headroom)"
     },
     "266987": {
-      "target_tiles": 2,
+      "target_tiles": 3,
+      "probe_min_tiles": 2,
+      "scale_coeff": 0.48,
+      "scale_coeff_note": "ff_p50=133.2 \u2192 64/133.2=0.48; clamp[0.4,3] \u2192 0.48; slice=2144 @ imgsz=1280; frame-capped effective_scale\u22480.60",
       "overlap_ratio": 0.1,
-      "label_confidence_threshold": 0.25,
+      "label_confidence_threshold": 0.1667,
       "detection_class": "car",
       "distance_band": ">200m",
       "distance_m": 378.6,
       "split": "eval",
-      "note": "probed frame 000455; distance from largest_car"
+      "note": "probed frame 000455; distance from largest_car; probe_min_tiles=2 \u2192 target_tiles=3 (+1 headroom)"
     },
     "8968356-hd_1920_1080_30fps": {
-      "target_tiles": 2,
+      "target_tiles": 3,
+      "probe_min_tiles": 2,
+      "scale_coeff": 3.0,
+      "scale_coeff_note": "ff_p50=17.2 \u2192 64/17.2=3.72; clamp[0.4,3] \u2192 3.0; slice=416 @ imgsz=1280 (clamped); frame-capped effective_scale\u22483.08",
       "overlap_ratio": 0.1,
-      "label_confidence_threshold": 0.25,
+      "label_confidence_threshold": 0.1667,
       "detection_class": "car",
       "distance_band": ">200m",
       "distance_m": 370.5,
       "split": "train",
-      "note": "probed frame 000290; distance from largest_car"
+      "note": "probed frame 000290; distance from largest_car; probe_min_tiles=2 \u2192 target_tiles=3 (+1 headroom)"
     },
     "3405804-uhd_3840_2160_30fps": {
-      "target_tiles": 1,
-      "overlap_ratio": 0.0,
-      "label_confidence_threshold": 0.5,
+      "target_tiles": 2,
+      "probe_min_tiles": 1,
+      "scale_coeff": 0.47,
+      "scale_coeff_note": "ff_p50=137.2 \u2192 64/137.2=0.47; clamp[0.4,3] \u2192 0.47; slice=2144 @ imgsz=1280; frame-capped effective_scale\u22480.60",
+      "overlap_ratio": 0.1,
+      "label_confidence_threshold": 0.25,
       "detection_class": "car",
       "distance_band": "<200m",
       "distance_m": 133.7,
       "split": "train",
-      "note": "probed frame 000370; distance from largest_car"
+      "note": "probed frame 000370; distance from largest_car; probe_min_tiles=1 \u2192 target_tiles=2 (+1 headroom)"
     },
     "5382494-uhd_3840_2160_24fps": {
-      "target_tiles": 2,
+      "target_tiles": 3,
+      "probe_min_tiles": 2,
+      "scale_coeff": 1.21,
+      "scale_coeff_note": "ff_p50=53.1 \u2192 64/53.1=1.21; clamp[0.4,3] \u2192 1.21; slice=1056 @ imgsz=1280",
       "overlap_ratio": 0.1,
-      "label_confidence_threshold": 0.25,
+      "label_confidence_threshold": 0.1667,
       "detection_class": "car",
       "distance_band": ">400m",
       "distance_m": 729.4,
       "split": "train",
-      "note": "probed frame 000374; distance from largest_car"
+      "note": "probed frame 000374; distance from largest_car; probe_min_tiles=2 \u2192 target_tiles=3 (+1 headroom)"
     },
     "8457857-uhd_3840_2160_24fps": {
-      "target_tiles": 1,
-      "overlap_ratio": 0.0,
-      "label_confidence_threshold": 0.5,
+      "target_tiles": 2,
+      "probe_min_tiles": 1,
+      "scale_coeff": 0.59,
+      "scale_coeff_note": "ff_p50=107.6 \u2192 64/107.6=0.59; clamp[0.4,3] \u2192 0.59; slice=2144 @ imgsz=1280",
+      "overlap_ratio": 0.1,
+      "label_confidence_threshold": 0.25,
       "detection_class": "car",
       "distance_band": ">200m",
       "distance_m": 203.0,
       "split": "train",
-      "note": "probed frame 000201; distance from largest_car"
+      "note": "probed frame 000201; distance from largest_car; probe_min_tiles=1 \u2192 target_tiles=2 (+1 headroom)"
     },
     "76472-559159393": {
       "target_tiles": 12,
@@ -95,6 +116,10 @@
     8,
     12
   ],
+  "tile_headroom_steps": 1,
   "frames_per_clip": 5,
-  "last_probe_elapsed_sec": 14.95
+  "last_probe_elapsed_sec": 14.75,
+  "scale_coeff_source": "label_box_stats.py",
+  "scale_coeff_updated_at": "2026-07-13T12:05:12+00:00",
+  "scale_coeff_formula": "clamp(64 / ff_p50, 0.4, 3); slice = floor32(min(imgsz / scale_coeff, frame_short_side))"
 }

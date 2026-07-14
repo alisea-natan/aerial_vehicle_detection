@@ -23,6 +23,20 @@ DEFAULT_OVERLAP = 0.10
 FAR_OVERLAP = 0.05
 FALLBACK_TILES = 12
 FALLBACK_LABEL_THRESHOLD = 0.1
+# Probe tries these in order; first hit = min tiles for the largest/nearest car.
+TILE_CANDIDATES = (1, 2, 3, 4, 6, 8, 12)
+# Final labeling uses one step above that hit so smaller/farther cars get more resolution.
+TILE_HEADROOM_STEPS = 1
+
+# Train/eval: global YOLO imgsz; per-clip scale_coeff sets crop so
+# at_imgsz ≈ fullframe_long × scale_coeff  (target ~64 px median).
+TRAIN_IMGSZ = 1280
+TRAIN_OVERLAP_RATIO = 0.2
+TARGET_OBJECT_LONG_PX = 64.0
+DEFAULT_SCALE_COEFF = 1.0
+SCALE_COEFF_MIN = 0.4
+SCALE_COEFF_MAX = 3.0
+MIN_TRAIN_SLICE_PX = 256
 
 
 def build_split_map(root: Path | None = None) -> dict[str, str]:
@@ -128,6 +142,65 @@ def overlap_for_tiles(target_tiles: int) -> float:
     return FAR_OVERLAP if target_tiles >= 8 else DEFAULT_OVERLAP
 
 
+def next_tile_candidate(tiles: int, steps: int = TILE_HEADROOM_STEPS) -> int:
+    """Move `steps` levels up the TILE_CANDIDATES ladder (clamped at the last)."""
+    if steps <= 0:
+        return int(tiles)
+    try:
+        idx = TILE_CANDIDATES.index(int(tiles))
+    except ValueError:
+        greater = [t for t in TILE_CANDIDATES if t > tiles]
+        return greater[0] if greater else TILE_CANDIDATES[-1]
+    return TILE_CANDIDATES[min(idx + steps, len(TILE_CANDIDATES) - 1)]
+
+
+def clamp_scale_coeff(scale: float) -> float:
+    return float(min(SCALE_COEFF_MAX, max(SCALE_COEFF_MIN, scale)))
+
+
+def scale_coeff_from_median(
+    ff_p50: float,
+    *,
+    target_px: float = TARGET_OBJECT_LONG_PX,
+) -> float:
+    """Choose scale so median full-frame long-side ≈ target_px after imgsz resize."""
+    if ff_p50 is None or ff_p50 <= 0:
+        return DEFAULT_SCALE_COEFF
+    return round(clamp_scale_coeff(float(target_px) / float(ff_p50)), 2)
+
+
+def align_slice_size(size: int, multiple: int = 32, *, max_size: int | None = None) -> int:
+    """Floor to multiple of `multiple`, capped by frame short side."""
+    size = int(size)
+    if max_size is not None:
+        size = min(size, int(max_size))
+    size = max(MIN_TRAIN_SLICE_PX, size)
+    aligned = (size // multiple) * multiple
+    return max(multiple, aligned)
+
+
+def slice_size_from_scale(
+    scale_coeff: float,
+    frame_w: int,
+    frame_h: int,
+    *,
+    imgsz: int = TRAIN_IMGSZ,
+) -> int:
+    """Train/eval crop side: slice ≈ imgsz / scale_coeff (capped to frame).
+
+    After YOLO resizes the crop to imgsz, object long-side scales by ≈ scale_coeff.
+    """
+    coeff = clamp_scale_coeff(float(scale_coeff))
+    raw = imgsz / coeff
+    return align_slice_size(int(round(raw)), max_size=min(frame_w, frame_h))
+
+
+def resolve_scale_coeff(clip_cfg: dict | None, default: float = DEFAULT_SCALE_COEFF) -> float:
+    if not clip_cfg or "scale_coeff" not in clip_cfg:
+        return float(default)
+    return clamp_scale_coeff(float(clip_cfg["scale_coeff"]))
+
+
 def save_clip_tile_config(
     clips: dict[str, dict],
     path: Path | None = None,
@@ -152,27 +225,41 @@ def save_clip_tile_config(
 
 def probe_result_to_config_entry(result: dict) -> dict:
     no_hit = result.get("min_tiles") is None
-    min_tiles = result.get("min_tiles")
-    if min_tiles is None:
-        min_tiles = FALLBACK_TILES
+    probe_min_tiles = result.get("min_tiles")
+    if probe_min_tiles is None:
+        target_tiles = FALLBACK_TILES
         note = f"probe found no cars; fallback {FALLBACK_TILES} tiles @ {FALLBACK_LABEL_THRESHOLD}"
     else:
+        probe_min_tiles = int(probe_min_tiles)
+        target_tiles = next_tile_candidate(probe_min_tiles)
         hit_frame = result.get("hit_frame") or "?"
         distance_source = result.get("distance_source") or "unknown"
-        note = f"probed frame {hit_frame}; distance from {distance_source}"
+        if target_tiles == probe_min_tiles:
+            note = (
+                f"probed frame {hit_frame}; distance from {distance_source}; "
+                f"probe_min_tiles={probe_min_tiles} (already max ladder step)"
+            )
+        else:
+            note = (
+                f"probed frame {hit_frame}; distance from {distance_source}; "
+                f"probe_min_tiles={probe_min_tiles} → target_tiles={target_tiles} "
+                f"(+{TILE_HEADROOM_STEPS} headroom)"
+            )
 
-    min_tiles = int(min_tiles)
-    label_threshold = result.get("label_threshold")
-    if label_threshold is None:
-        label_threshold = FALLBACK_LABEL_THRESHOLD if no_hit else label_threshold_for_tiles(min_tiles)
+    target_tiles = int(target_tiles)
+    # Threshold/overlap follow the final labeling tile count, not the raw probe hit.
+    if no_hit:
+        label_threshold = FALLBACK_LABEL_THRESHOLD
+    else:
+        label_threshold = label_threshold_for_tiles(target_tiles)
 
     distance_band = result.get("distance_band")
     if not distance_band:
-        distance_band = ">400m" if min_tiles >= 8 else ">200m"
+        distance_band = ">400m" if target_tiles >= 8 else ">200m"
 
-    return {
-        "target_tiles": min_tiles,
-        "overlap_ratio": overlap_for_tiles(min_tiles),
+    entry = {
+        "target_tiles": target_tiles,
+        "overlap_ratio": overlap_for_tiles(target_tiles),
         "label_confidence_threshold": label_threshold,
         "detection_class": result.get("detection_class", DEFAULT_DETECTION_CLASS),
         "distance_band": distance_band,
@@ -180,6 +267,9 @@ def probe_result_to_config_entry(result: dict) -> dict:
         "split": result.get("split"),
         "note": note,
     }
+    if probe_min_tiles is not None:
+        entry["probe_min_tiles"] = int(probe_min_tiles)
+    return entry
 
 
 def merge_probe_results(
@@ -189,7 +279,14 @@ def merge_probe_results(
     merged = dict(existing)
     for result in probe_results:
         clip_name = result["clip"]
-        merged[clip_name] = probe_result_to_config_entry(result)
+        entry = probe_result_to_config_entry(result)
+        # Preserve scale_coeff from label_box_stats.py across re-probes.
+        old = existing.get(clip_name, {})
+        if "scale_coeff" in old:
+            entry["scale_coeff"] = old["scale_coeff"]
+            if "scale_coeff_note" in old:
+                entry["scale_coeff_note"] = old["scale_coeff_note"]
+        merged[clip_name] = entry
     return merged
 
 
@@ -223,4 +320,5 @@ def resolve_clip_tile_config(
         "distance_m": cfg.get("distance_m"),
         "note": str(cfg.get("note", "")),
         "uses_sahi": target_tiles > 1,
+        "scale_coeff": resolve_scale_coeff(cfg),
     }

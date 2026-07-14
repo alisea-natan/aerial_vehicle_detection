@@ -5,12 +5,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
 import cv2
 import numpy as np
+import yaml
 from sahi.slicing import slice_image
 from ultralytics import YOLO
 
@@ -18,22 +20,26 @@ from config import (
     FRAMES_DIR,
     LABELS_DIR,
     PROJECT_ROOT,
+    TRAIN_IMGSZ,
+    TRAIN_OVERLAP_RATIO,
     build_split_map,
     load_clip_tile_config,
     resolve_clip_tile_config,
+    resolve_scale_coeff,
+    slice_size_from_scale,
 )
 from detect import device
 
 OUTPUTS_DIR = PROJECT_ROOT / "outputs"
+DATASET_DIR = OUTPUTS_DIR / "dataset"
+DATASET_YAML = DATASET_DIR / "data.yaml"
+PREPARE_STATS = DATASET_DIR / "prepare_stats.json"
 DEFAULT_WEIGHTS = PROJECT_ROOT / "outputs" / "runs" / "yolov8n_vehicle" / "weights" / "best.pt"
 VEHICLE_CLASS = "vehicle"
 PRED_COLOR = (0, 200, 0)  # BGR green
 
-# Match train.py slicing — eval on same tile distribution as training.
-SLICE_SIZE = 512  # fixed train/eval tile size (see README — known mismatch vs autolabel)
-OVERLAP_RATIO = 0.2
 TILE_NMS_IOU = 0.5
-PREDICT_BATCH_SIZE = 16
+PREDICT_BATCH_SIZE = 8
 
 # One eval clip per band; whole clip inherits probe distance band (no per-frame distance).
 DEFAULT_BAND_CLIPS = {
@@ -44,6 +50,106 @@ DEFAULT_BAND_CLIPS = {
 CLIP_EVAL_BAND = {clip: band for band, clip in DEFAULT_BAND_CLIPS.items()}
 
 IOU_MATCH = 0.5
+
+
+@dataclass(frozen=True)
+class TrainSliceConfig:
+    """Global imgsz + overlap; per-clip crop from scale_coeff."""
+
+    imgsz: int
+    overlap_ratio: float
+    clip_slice_size: dict[str, int]
+    clip_scale_coeff: dict[str, float]
+    source: str
+
+    def slice_size_for(self, clip_name: str, frame_w: int, frame_h: int) -> int:
+        if clip_name in self.clip_slice_size:
+            return int(self.clip_slice_size[clip_name])
+        scale = self.clip_scale_coeff.get(clip_name)
+        if scale is None:
+            tile_cfg = load_clip_tile_config().get(clip_name)
+            scale = resolve_scale_coeff(tile_cfg)
+        return slice_size_from_scale(scale, frame_w, frame_h, imgsz=self.imgsz)
+
+
+def load_train_slice_config() -> TrainSliceConfig:
+    """Read imgsz / per-clip slices written by train.py (data.yaml or prepare_stats.json)."""
+    if DATASET_YAML.exists():
+        payload = yaml.safe_load(DATASET_YAML.read_text(encoding="utf-8")) or {}
+        imgsz = payload.get("imgsz", payload.get("slice_size", TRAIN_IMGSZ))
+        overlap_ratio = payload.get("overlap_ratio", TRAIN_OVERLAP_RATIO)
+        clip_slice_size = payload.get("clip_slice_size") or {}
+        clip_scale_coeff = payload.get("clip_scale_coeff") or {}
+        # Legacy single-slice datasets: treat global slice_size as default for all clips.
+        if not clip_slice_size and payload.get("slice_size") is not None:
+            return TrainSliceConfig(
+                imgsz=int(imgsz),
+                overlap_ratio=float(overlap_ratio),
+                clip_slice_size={},
+                clip_scale_coeff=dict(clip_scale_coeff),
+                source=str(DATASET_YAML),
+            )
+        return TrainSliceConfig(
+            imgsz=int(imgsz),
+            overlap_ratio=float(overlap_ratio),
+            clip_slice_size={str(k): int(v) for k, v in clip_slice_size.items()},
+            clip_scale_coeff={str(k): float(v) for k, v in clip_scale_coeff.items()},
+            source=str(DATASET_YAML),
+        )
+
+    if PREPARE_STATS.exists():
+        stats = json.loads(PREPARE_STATS.read_text(encoding="utf-8"))
+        train = stats.get("train", {})
+        val = stats.get("val", {})
+        imgsz = stats.get("imgsz", train.get("imgsz", train.get("slice_size", TRAIN_IMGSZ)))
+        overlap_ratio = stats.get("overlap_ratio", train.get("overlap_ratio", TRAIN_OVERLAP_RATIO))
+        clip_slice_size = {
+            **(train.get("clip_slice_size") or {}),
+            **(val.get("clip_slice_size") or {}),
+        }
+        clip_scale_coeff = {
+            **(train.get("clip_scale_coeff") or {}),
+            **(val.get("clip_scale_coeff") or {}),
+        }
+        return TrainSliceConfig(
+            imgsz=int(imgsz),
+            overlap_ratio=float(overlap_ratio),
+            clip_slice_size={str(k): int(v) for k, v in clip_slice_size.items()},
+            clip_scale_coeff={str(k): float(v) for k, v in clip_scale_coeff.items()},
+            source=str(PREPARE_STATS),
+        )
+
+    raise SystemExit(
+        f"Train dataset metadata not found ({DATASET_YAML} or {PREPARE_STATS}).\n"
+        "Run train.py first so eval can match training tiles:\n"
+        "  python src/train.py --prepare-only\n"
+        "  python src/train.py --recreate-dataset"
+    )
+
+
+def verify_materialized_tile_size(slice_cfg: TrainSliceConfig) -> None:
+    """Sanity-check on-disk train tiles match per-clip slice metadata when available."""
+    images_dir = DATASET_DIR / "train" / "images"
+    if not images_dir.is_dir() or not slice_cfg.clip_slice_size:
+        return
+    for clip_name, expected in slice_cfg.clip_slice_size.items():
+        sample = next(images_dir.glob(f"{clip_name}__*.jpg"), None)
+        if sample is None:
+            continue
+        image = cv2.imread(str(sample))
+        if image is None:
+            continue
+        height, width = image.shape[:2]
+        # Edge tiles can be smaller than slice_size near frame borders.
+        if width > expected or height > expected:
+            raise SystemExit(
+                f"Dataset tile size mismatch: {sample.name} is {width}×{height}, "
+                f"but metadata says slice≤{expected}×{expected} for {clip_name} "
+                f"({slice_cfg.source}).\n"
+                "Rebuild dataset: python src/train.py --recreate-dataset"
+            )
+        # One successful check is enough.
+        return
 
 
 @dataclass
@@ -222,19 +328,23 @@ def nms_boxes(boxes: list[Box], iou_thresh: float) -> list[Box]:
 def predict_frame_tiled(
     yolo_model: YOLO,
     image_path: Path,
+    slice_cfg: TrainSliceConfig,
     *,
+    clip_name: str,
     img_w: int,
     img_h: int,
     conf: float,
     dev: str,
 ) -> list[Box]:
-    """Slice frame like train.py, infer per tile, map boxes back to full-frame coords."""
+    """Slice frame with per-clip crop from scale_coeff; infer at global imgsz; map to full frame."""
+    slice_size = slice_cfg.slice_size_for(clip_name, img_w, img_h)
+    overlap = slice_cfg.overlap_ratio
     slice_result = slice_image(
         str(image_path),
-        slice_height=SLICE_SIZE,
-        slice_width=SLICE_SIZE,
-        overlap_height_ratio=OVERLAP_RATIO,
-        overlap_width_ratio=OVERLAP_RATIO,
+        slice_height=slice_size,
+        slice_width=slice_size,
+        overlap_height_ratio=overlap,
+        overlap_width_ratio=overlap,
         auto_slice_resolution=False,
         verbose=False,
     )
@@ -248,7 +358,7 @@ def predict_frame_tiled(
             images,
             conf=conf,
             device=dev,
-            imgsz=SLICE_SIZE,
+            imgsz=slice_cfg.imgsz,
             verbose=False,
         )
         for sliced, result in zip(batch_slices, results):
@@ -395,8 +505,9 @@ def save_prediction_video(
 def evaluate_clip(
     clip_name: str,
     tile_config: dict[str, dict],
+    slice_cfg: TrainSliceConfig,
     *,
-    weights: Path,
+    yolo_model: YOLO,
     conf_override: float | None,
     iou_thresh: float,
     band_stats: dict[str, BandStats],
@@ -420,7 +531,12 @@ def evaluate_clip(
     if probe_distance_m is not None:
         probe_distance_m = float(probe_distance_m)
 
-    yolo_model = YOLO(str(weights))
+    slice_size = slice_cfg.slice_size_for(clip_name, img_w, img_h)
+    scale_coeff = tile_cfg.get("scale_coeff", slice_cfg.clip_scale_coeff.get(clip_name))
+    print(
+        f"  tiles: slice={slice_size}, imgsz={slice_cfg.imgsz}, "
+        f"scale_coeff={scale_coeff}, overlap={slice_cfg.overlap_ratio}"
+    )
 
     labeled_frames = labeled_frame_paths(clip_name)
     all_frames = iter_all_frames(clip_name)
@@ -433,10 +549,13 @@ def evaluate_clip(
     stats = band_stats[clip_band]
     total_frames = len(all_frames)
 
+    t_infer0 = time.perf_counter()
     for frame_no, (image_path, frame_idx) in enumerate(all_frames, start=1):
         preds = predict_frame_tiled(
             yolo_model,
             image_path,
+            slice_cfg,
+            clip_name=clip_name,
             img_w=img_w,
             img_h=img_h,
             conf=conf,
@@ -471,8 +590,13 @@ def evaluate_clip(
         if tp > 0 and stats.first_tp_frame is None:
             stats.first_tp_frame = frame_idx
 
+    infer_sec = time.perf_counter() - t_infer0
+    frames_per_sec = (total_frames / infer_sec) if infer_sec > 0 else None
+
     video_path: Path | None = None
+    video_sec = 0.0
     if video_dir is not None:
+        t_vid0 = time.perf_counter()
         video_path = video_dir / f"{clip_name}_predictions.mp4"
         save_prediction_video(
             preds_by_frame,
@@ -482,6 +606,12 @@ def evaluate_clip(
             clip_band=clip_band,
             probe_distance_m=probe_distance_m,
         )
+        video_sec = time.perf_counter() - t_vid0
+
+    clip_elapsed_sec = round(infer_sec + video_sec, 2)
+    fps_bit = f", {frames_per_sec:.2f} frame/s" if frames_per_sec is not None else ""
+    vid_bit = f", video {video_sec:.1f}s" if video_dir is not None else ""
+    print(f"  timing: {clip_elapsed_sec:.1f}s total (infer {infer_sec:.1f}s{fps_bit}{vid_bit})")
 
     return {
         "clip": clip_name,
@@ -491,11 +621,20 @@ def evaluate_clip(
         "frames": metrics_frames,
         "video_frames": len(all_frames),
         "conf": conf,
+        "timing": {
+            "elapsed_sec": clip_elapsed_sec,
+            "infer_sec": round(infer_sec, 2),
+            "video_sec": round(video_sec, 2),
+            "frames_per_sec": round(frames_per_sec, 3) if frames_per_sec is not None else None,
+        },
         "eval_mode": {
-            "slice_size": SLICE_SIZE,
-            "overlap_ratio": OVERLAP_RATIO,
+            "slice_size": slice_size,
+            "imgsz": slice_cfg.imgsz,
+            "scale_coeff": scale_coeff,
+            "overlap_ratio": slice_cfg.overlap_ratio,
             "tile_nms_iou": TILE_NMS_IOU,
             "predict_batch_size": PREDICT_BATCH_SIZE,
+            "train_metadata": slice_cfg.source,
         },
         "tp": clip_tp,
         "fp": clip_fp,
@@ -523,8 +662,8 @@ def build_markdown_table(band_stats: dict[str, BandStats], meta: dict) -> str:
         "## Assumptions",
         "",
         f"- GT: pseudo-labels from `labels/eval/` (class 0 = vehicle).",
-        f"- Inference: {eval_mode.get('slice_size', SLICE_SIZE)}×{eval_mode.get('slice_size', SLICE_SIZE)} tiles, "
-        f"overlap {eval_mode.get('overlap_ratio', OVERLAP_RATIO)} (same as train), "
+        f"- Inference: per-clip slice from `scale_coeff` → imgsz={eval_mode.get('imgsz')}, "
+        f"overlap {eval_mode.get('overlap_ratio')} (from `{eval_mode.get('train_metadata', 'train dataset')}`), "
         f"tile NMS IoU {eval_mode.get('tile_nms_iou', TILE_NMS_IOU)}, boxes mapped to full frame.",
         f"- Bands: one eval clip per band; distance band is fixed per whole video from probe "
         f"(`clip_tiling.json`), not recomputed per frame or per car.",
@@ -533,24 +672,53 @@ def build_markdown_table(band_stats: dict[str, BandStats], meta: dict) -> str:
         f"- Time to first detection: first TP frame index / fps (seconds from clip start).",
         f"- Eval clips: {', '.join(meta['clips'])}",
         "",
-        "| Metric | 0-200 m | 200-400 m |",
-        "|--------|---------|-----------|",
-        f"| Detection rate TP/(TP+FN) | {format_metric(band_stats['0-200m'].detection_rate())} | "
-        f"{format_metric(band_stats['200-400m'].detection_rate())} |",
-        f"| Precision TP/(TP+FP) | {format_metric(band_stats['0-200m'].precision())} | "
-        f"{format_metric(band_stats['200-400m'].precision())} |",
-        f"| False alarms / min | "
-        f"{format_metric(band_stats['0-200m'].false_alarms_per_min(), pct=False)} | "
-        f"{format_metric(band_stats['200-400m'].false_alarms_per_min(), pct=False)} |",
-        f"| Time to first detection (s) | "
-        f"{format_metric(band_stats['0-200m'].time_to_first_detection_s(), pct=False)} | "
-        f"{format_metric(band_stats['200-400m'].time_to_first_detection_s(), pct=False)} |",
-        f"| mAP@0.5 (bonus) | {format_metric(band_stats['0-200m'].map50())} | "
-        f"{format_metric(band_stats['200-400m'].map50())} |",
-        "",
-        "## Per-band counts",
-        "",
     ]
+    timing = meta.get("timing") or {}
+    if timing:
+        lines.extend(
+            [
+                "## Timing",
+                "",
+                f"- Wall time: **{timing.get('elapsed_human', timing.get('elapsed_sec'))}** "
+                f"({timing.get('elapsed_sec')}s).",
+            ]
+        )
+        for item in timing.get("clips", []):
+            fps = item.get("frames_per_sec")
+            fps_s = f", {fps:.2f} frame/s" if fps is not None else ""
+            vid = item.get("video_sec") or 0
+            vid_s = f", video {vid}s" if vid else ""
+            lines.append(
+                f"- `{item.get('clip')}`: {item.get('elapsed_sec')}s "
+                f"(infer {item.get('infer_sec')}s{fps_s}{vid_s})"
+            )
+        lines.extend(["", "| Metric | 0-200 m | 200-400 m |"])
+    else:
+        lines.extend(
+            [
+                "| Metric | 0-200 m | 200-400 m |",
+            ]
+        )
+    lines.extend(
+        [
+            "|--------|---------|-----------|",
+            f"| Detection rate TP/(TP+FN) | {format_metric(band_stats['0-200m'].detection_rate())} | "
+            f"{format_metric(band_stats['200-400m'].detection_rate())} |",
+            f"| Precision TP/(TP+FP) | {format_metric(band_stats['0-200m'].precision())} | "
+            f"{format_metric(band_stats['200-400m'].precision())} |",
+            f"| False alarms / min | "
+            f"{format_metric(band_stats['0-200m'].false_alarms_per_min(), pct=False)} | "
+            f"{format_metric(band_stats['200-400m'].false_alarms_per_min(), pct=False)} |",
+            f"| Time to first detection (s) | "
+            f"{format_metric(band_stats['0-200m'].time_to_first_detection_s(), pct=False)} | "
+            f"{format_metric(band_stats['200-400m'].time_to_first_detection_s(), pct=False)} |",
+            f"| mAP@0.5 (bonus) | {format_metric(band_stats['0-200m'].map50())} | "
+            f"{format_metric(band_stats['200-400m'].map50())} |",
+            "",
+            "## Per-band counts",
+            "",
+        ]
+    )
     for band, stats in band_stats.items():
         lines.append(
             f"**{band}**: TP={stats.tp}, FP={stats.fp}, FN={stats.fn}, "
@@ -570,6 +738,16 @@ def main() -> None:
 
     split_map = build_split_map()
     tile_config = load_clip_tile_config()
+    slice_cfg = load_train_slice_config()
+    verify_materialized_tile_size(slice_cfg)
+    print(
+        f"Eval: imgsz={slice_cfg.imgsz}, overlap={slice_cfg.overlap_ratio}, "
+        f"per-clip scale_coeff/slice (from {slice_cfg.source})"
+    )
+    if slice_cfg.clip_slice_size:
+        for name, size in sorted(slice_cfg.clip_slice_size.items()):
+            coeff = slice_cfg.clip_scale_coeff.get(name, "?")
+            print(f"  {name}: scale_coeff={coeff} → slice={size}")
 
     if args.clips:
         clip_names = args.clips
@@ -584,23 +762,24 @@ def main() -> None:
 
     band_stats = {band: BandStats() for band in DEFAULT_BAND_CLIPS}
     video_dir = None if args.no_video else Path(args.video_dir)
+    yolo_model = YOLO(str(weights))
     clip_results = []
+    run_t0 = time.perf_counter()
     for clip_name in clip_names:
-        print(
-            f"Evaluating {clip_name} "
-            f"(tiles {SLICE_SIZE}×{SLICE_SIZE}, overlap {OVERLAP_RATIO})..."
-        )
+        print(f"Evaluating {clip_name}...")
         clip_results.append(
             evaluate_clip(
                 clip_name,
                 tile_config,
-                weights=weights,
+                slice_cfg,
+                yolo_model=yolo_model,
                 conf_override=args.conf,
                 iou_thresh=args.iou,
                 band_stats=band_stats,
                 video_dir=video_dir,
             )
         )
+    run_elapsed_sec = round(time.perf_counter() - run_t0, 2)
 
     generated_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
     payload = {
@@ -608,11 +787,29 @@ def main() -> None:
         "weights": str(weights),
         "iou": args.iou,
         "clips": clip_names,
+        "timing": {
+            "elapsed_sec": run_elapsed_sec,
+            "elapsed_human": (
+                f"{int(run_elapsed_sec // 60)}m {run_elapsed_sec % 60:.1f}s"
+                if run_elapsed_sec >= 60
+                else f"{run_elapsed_sec:.1f}s"
+            ),
+            "clips": [
+                {
+                    "clip": r["clip"],
+                    **(r.get("timing") or {}),
+                }
+                for r in clip_results
+            ],
+        },
         "eval_mode": {
-            "slice_size": SLICE_SIZE,
-            "overlap_ratio": OVERLAP_RATIO,
+            "imgsz": slice_cfg.imgsz,
+            "overlap_ratio": slice_cfg.overlap_ratio,
+            "clip_slice_size": slice_cfg.clip_slice_size,
+            "clip_scale_coeff": slice_cfg.clip_scale_coeff,
             "tile_nms_iou": TILE_NMS_IOU,
             "predict_batch_size": PREDICT_BATCH_SIZE,
+            "train_metadata": slice_cfg.source,
         },
         "prediction_videos": [
             r["prediction_video"] for r in clip_results if r.get("prediction_video")
@@ -622,7 +819,10 @@ def main() -> None:
             "band_assignment": "whole clip from probe distance_band in clip_tiling.json",
             "eval_clips_by_band": DEFAULT_BAND_CLIPS,
             "false_alarms_formula": "FP / (N_frames / fps / 60)",
-            "inference": "512x512 train-matched tiles, merged to full frame",
+            "inference": (
+                f"per-clip slice from scale_coeff, YOLO imgsz={slice_cfg.imgsz}, "
+                "merged to full frame"
+            ),
         },
         "bands": {
             band: {
@@ -669,6 +869,17 @@ def main() -> None:
         }[key]
         a, b = getter(band_stats["0-200m"]), getter(band_stats["200-400m"])
         print(f"{label:<32} {format_metric(a, pct):>10} {format_metric(b, pct):>10}")
+
+    print(f"\nEval wall time: {payload['timing']['elapsed_human']} ({run_elapsed_sec:.1f}s)")
+    for item in payload["timing"]["clips"]:
+        fps = item.get("frames_per_sec")
+        fps_s = f", {fps:.2f} frame/s" if fps is not None else ""
+        vid = item.get("video_sec") or 0
+        vid_s = f", video {vid:.1f}s" if vid else ""
+        print(
+            f"  {item['clip']}: {item.get('elapsed_sec', 0):.1f}s "
+            f"(infer {item.get('infer_sec', 0):.1f}s{fps_s}{vid_s})"
+        )
 
     print(f"\nSaved: {json_path}")
     print(f"Saved: {md_path}")
