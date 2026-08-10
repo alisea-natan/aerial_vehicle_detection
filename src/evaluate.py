@@ -17,16 +17,18 @@ from sahi.slicing import slice_image
 from ultralytics import YOLO
 
 from config import (
+    CLIP_TILING_CONFIG_PATH,
     FRAMES_DIR,
     LABELS_DIR,
     PROJECT_ROOT,
     TRAIN_IMGSZ,
     TRAIN_OVERLAP_RATIO,
     build_split_map,
+    effective_slice_size,
     load_clip_tile_config,
+    load_tiling_payload,
     resolve_clip_tile_config,
-    resolve_scale_coeff,
-    slice_size_from_scale,
+    resolve_train_group_tiling,
 )
 from detect import device
 
@@ -34,7 +36,7 @@ OUTPUTS_DIR = PROJECT_ROOT / "outputs"
 DATASET_DIR = OUTPUTS_DIR / "dataset"
 DATASET_YAML = DATASET_DIR / "data.yaml"
 PREPARE_STATS = DATASET_DIR / "prepare_stats.json"
-DEFAULT_WEIGHTS = PROJECT_ROOT / "outputs" / "runs" / "yolov8n_vehicle" / "weights" / "best.pt"
+DEFAULT_WEIGHTS = PROJECT_ROOT / "outputs" / "runs" / "yolo11s_vehicle" / "weights" / "best.pt"
 VEHICLE_CLASS = "vehicle"
 PRED_COLOR = (0, 200, 0)  # BGR green
 
@@ -54,69 +56,73 @@ IOU_MATCH = 0.5
 
 @dataclass(frozen=True)
 class TrainSliceConfig:
-    """Global imgsz + overlap; per-clip crop from scale_coeff."""
+    """Model imgsz + per-clip crop from train_groups (tile_size / full-frame)."""
 
     imgsz: int
     overlap_ratio: float
     clip_slice_size: dict[str, int]
-    clip_scale_coeff: dict[str, float]
+    clip_overlap: dict[str, float]
+    clip_train_imgsz: dict[str, int]
+    clip_uses_tiling: dict[str, bool]
+    clip_group: dict[str, str]
     source: str
 
-    def slice_size_for(self, clip_name: str, frame_w: int, frame_h: int) -> int:
-        if clip_name in self.clip_slice_size:
-            return int(self.clip_slice_size[clip_name])
-        scale = self.clip_scale_coeff.get(clip_name)
-        if scale is None:
-            tile_cfg = load_clip_tile_config().get(clip_name)
-            scale = resolve_scale_coeff(tile_cfg)
-        return slice_size_from_scale(scale, frame_w, frame_h, imgsz=self.imgsz)
+    def tiling_for(self, clip_name: str, frame_w: int, frame_h: int) -> tuple[int, float, int, bool]:
+        """Return (slice_size, overlap, predict_imgsz, uses_tiling) from train_groups."""
+        group = resolve_train_group_tiling(clip_name)
+        slice_size = effective_slice_size(group, frame_w, frame_h)
+        return slice_size, group.overlap, group.train_imgsz, group.uses_tiling
 
 
 def load_train_slice_config() -> TrainSliceConfig:
     """Read imgsz / per-clip slices written by train.py (data.yaml or prepare_stats.json)."""
     if DATASET_YAML.exists():
         payload = yaml.safe_load(DATASET_YAML.read_text(encoding="utf-8")) or {}
-        imgsz = payload.get("imgsz", payload.get("slice_size", TRAIN_IMGSZ))
-        overlap_ratio = payload.get("overlap_ratio", TRAIN_OVERLAP_RATIO)
-        clip_slice_size = payload.get("clip_slice_size") or {}
-        clip_scale_coeff = payload.get("clip_scale_coeff") or {}
-        # Legacy single-slice datasets: treat global slice_size as default for all clips.
-        if not clip_slice_size and payload.get("slice_size") is not None:
-            return TrainSliceConfig(
-                imgsz=int(imgsz),
-                overlap_ratio=float(overlap_ratio),
-                clip_slice_size={},
-                clip_scale_coeff=dict(clip_scale_coeff),
-                source=str(DATASET_YAML),
-            )
-        return TrainSliceConfig(
-            imgsz=int(imgsz),
-            overlap_ratio=float(overlap_ratio),
-            clip_slice_size={str(k): int(v) for k, v in clip_slice_size.items()},
-            clip_scale_coeff={str(k): float(v) for k, v in clip_scale_coeff.items()},
-            source=str(DATASET_YAML),
-        )
+        return _slice_config_from_payload(payload, source=str(DATASET_YAML))
 
     if PREPARE_STATS.exists():
         stats = json.loads(PREPARE_STATS.read_text(encoding="utf-8"))
         train = stats.get("train", {})
         val = stats.get("val", {})
-        imgsz = stats.get("imgsz", train.get("imgsz", train.get("slice_size", TRAIN_IMGSZ)))
-        overlap_ratio = stats.get("overlap_ratio", train.get("overlap_ratio", TRAIN_OVERLAP_RATIO))
-        clip_slice_size = {
-            **(train.get("clip_slice_size") or {}),
-            **(val.get("clip_slice_size") or {}),
+        payload = {
+            "imgsz": stats.get("imgsz", train.get("imgsz", TRAIN_IMGSZ)),
+            "overlap_ratio": stats.get("overlap_ratio", TRAIN_OVERLAP_RATIO),
+            "clip_slice_size": {
+                **(train.get("clip_slice_size") or {}),
+                **(val.get("clip_slice_size") or {}),
+            },
+            "clip_overlap": {
+                **(train.get("clip_overlap") or {}),
+                **(val.get("clip_overlap") or {}),
+            },
+            "clip_train_imgsz": {
+                **(train.get("clip_train_imgsz") or {}),
+                **(val.get("clip_train_imgsz") or {}),
+            },
+            "clip_uses_tiling": {
+                **(train.get("clip_uses_tiling") or {}),
+                **(val.get("clip_uses_tiling") or {}),
+            },
+            "clip_group": {
+                **(train.get("clip_group") or {}),
+                **(val.get("clip_group") or {}),
+            },
         }
-        clip_scale_coeff = {
-            **(train.get("clip_scale_coeff") or {}),
-            **(val.get("clip_scale_coeff") or {}),
-        }
+        return _slice_config_from_payload(payload, source=str(PREPARE_STATS))
+
+    # Fall back to train_groups directly (before dataset prepare).
+    payload = load_tiling_payload()
+    groups = payload.get("train_groups") or {}
+    if groups:
         return TrainSliceConfig(
-            imgsz=int(imgsz),
-            overlap_ratio=float(overlap_ratio),
-            clip_slice_size={str(k): int(v) for k, v in clip_slice_size.items()},
-            clip_scale_coeff={str(k): float(v) for k, v in clip_scale_coeff.items()},
-            source=str(PREPARE_STATS),
+            imgsz=int(payload.get("train_imgsz", TRAIN_IMGSZ)),
+            overlap_ratio=float(TRAIN_OVERLAP_RATIO),
+            clip_slice_size={},
+            clip_overlap={},
+            clip_train_imgsz={},
+            clip_uses_tiling={},
+            clip_group={},
+            source=str(CLIP_TILING_CONFIG_PATH),
         )
 
     raise SystemExit(
@@ -127,12 +133,41 @@ def load_train_slice_config() -> TrainSliceConfig:
     )
 
 
+def _slice_config_from_payload(payload: dict, *, source: str) -> TrainSliceConfig:
+    imgsz = payload.get("imgsz", payload.get("slice_size", TRAIN_IMGSZ))
+    overlap_ratio = payload.get("overlap_ratio", TRAIN_OVERLAP_RATIO)
+    clip_slice_size = payload.get("clip_slice_size") or {}
+    clip_overlap = payload.get("clip_overlap") or {}
+    clip_train_imgsz = payload.get("clip_train_imgsz") or {}
+    clip_uses_tiling = payload.get("clip_uses_tiling") or {}
+    clip_group = payload.get("clip_group") or {}
+
+    # Legacy scale_coeff datasets: synthesize uses_tiling=True for known slice sizes.
+    if not clip_uses_tiling and clip_slice_size:
+        clip_uses_tiling = {k: True for k in clip_slice_size}
+    if not clip_overlap and payload.get("clip_scale_coeff"):
+        clip_overlap = {k: float(overlap_ratio) for k in clip_slice_size}
+
+    return TrainSliceConfig(
+        imgsz=int(imgsz),
+        overlap_ratio=float(overlap_ratio),
+        clip_slice_size={str(k): int(v) for k, v in clip_slice_size.items()},
+        clip_overlap={str(k): float(v) for k, v in clip_overlap.items()},
+        clip_train_imgsz={str(k): int(v) for k, v in clip_train_imgsz.items()},
+        clip_uses_tiling={str(k): bool(v) for k, v in clip_uses_tiling.items()},
+        clip_group={str(k): str(v) for k, v in clip_group.items()},
+        source=source,
+    )
+
+
 def verify_materialized_tile_size(slice_cfg: TrainSliceConfig) -> None:
     """Sanity-check on-disk train tiles match per-clip slice metadata when available."""
     images_dir = DATASET_DIR / "train" / "images"
     if not images_dir.is_dir() or not slice_cfg.clip_slice_size:
         return
     for clip_name, expected in slice_cfg.clip_slice_size.items():
+        if slice_cfg.clip_uses_tiling and not slice_cfg.clip_uses_tiling.get(clip_name, True):
+            continue  # full-frame samples are larger than short-side metadata
         sample = next(images_dir.glob(f"{clip_name}__*.jpg"), None)
         if sample is None:
             continue
@@ -336,9 +371,34 @@ def predict_frame_tiled(
     conf: float,
     dev: str,
 ) -> list[Box]:
-    """Slice frame with per-clip crop from scale_coeff; infer at global imgsz; map to full frame."""
-    slice_size = slice_cfg.slice_size_for(clip_name, img_w, img_h)
-    overlap = slice_cfg.overlap_ratio
+    """Infer with train_groups tiling (or full-frame); map boxes to full frame."""
+    slice_size, overlap, predict_imgsz, uses_tiling = slice_cfg.tiling_for(
+        clip_name, img_w, img_h
+    )
+
+    if not uses_tiling:
+        results = yolo_model.predict(
+            str(image_path),
+            conf=conf,
+            device=dev,
+            imgsz=predict_imgsz,
+            verbose=False,
+        )
+        merged: list[Box] = []
+        result = results[0]
+        if result.boxes is not None and len(result.boxes) > 0:
+            for i in range(len(result.boxes)):
+                xyxy = result.boxes.xyxy[i].cpu().tolist()
+                score = float(result.boxes.conf[i].cpu().item())
+                x1, y1, x2, y2 = xyxy
+                x1 = float(max(0, min(img_w, x1)))
+                y1 = float(max(0, min(img_h, y1)))
+                x2 = float(max(0, min(img_w, x2)))
+                y2 = float(max(0, min(img_h, y2)))
+                if x2 - x1 > 1 and y2 - y1 > 1:
+                    merged.append(Box(xyxy=[x1, y1, x2, y2], confidence=score))
+        return nms_boxes(merged, TILE_NMS_IOU)
+
     slice_result = slice_image(
         str(image_path),
         slice_height=slice_size,
@@ -349,7 +409,7 @@ def predict_frame_tiled(
         verbose=False,
     )
     slices = slice_result.sliced_image_list
-    merged: list[Box] = []
+    merged = []
 
     for start in range(0, len(slices), PREDICT_BATCH_SIZE):
         batch_slices = slices[start : start + PREDICT_BATCH_SIZE]
@@ -358,7 +418,7 @@ def predict_frame_tiled(
             images,
             conf=conf,
             device=dev,
-            imgsz=slice_cfg.imgsz,
+            imgsz=predict_imgsz,
             verbose=False,
         )
         for sliced, result in zip(batch_slices, results):
@@ -531,11 +591,14 @@ def evaluate_clip(
     if probe_distance_m is not None:
         probe_distance_m = float(probe_distance_m)
 
-    slice_size = slice_cfg.slice_size_for(clip_name, img_w, img_h)
-    scale_coeff = tile_cfg.get("scale_coeff", slice_cfg.clip_scale_coeff.get(clip_name))
+    slice_size, overlap, predict_imgsz, uses_tiling = slice_cfg.tiling_for(
+        clip_name, img_w, img_h
+    )
+    group = slice_cfg.clip_group.get(clip_name) or resolve_train_group_tiling(clip_name).group
+    tile_desc = "full-frame" if not uses_tiling else f"tile={slice_size}"
     print(
-        f"  tiles: slice={slice_size}, imgsz={slice_cfg.imgsz}, "
-        f"scale_coeff={scale_coeff}, overlap={slice_cfg.overlap_ratio}"
+        f"  tiles: group={group}, {tile_desc}, predict_imgsz={predict_imgsz}, "
+        f"overlap={overlap}"
     )
 
     labeled_frames = labeled_frame_paths(clip_name)
@@ -628,10 +691,12 @@ def evaluate_clip(
             "frames_per_sec": round(frames_per_sec, 3) if frames_per_sec is not None else None,
         },
         "eval_mode": {
-            "slice_size": slice_size,
+            "group": group,
+            "slice_size": slice_size if uses_tiling else None,
+            "full_frame": not uses_tiling,
+            "predict_imgsz": predict_imgsz,
             "imgsz": slice_cfg.imgsz,
-            "scale_coeff": scale_coeff,
-            "overlap_ratio": slice_cfg.overlap_ratio,
+            "overlap_ratio": overlap,
             "tile_nms_iou": TILE_NMS_IOU,
             "predict_batch_size": PREDICT_BATCH_SIZE,
             "train_metadata": slice_cfg.source,
@@ -662,8 +727,8 @@ def build_markdown_table(band_stats: dict[str, BandStats], meta: dict) -> str:
         "## Assumptions",
         "",
         f"- GT: pseudo-labels from `labels/eval/` (class 0 = vehicle).",
-        f"- Inference: per-clip slice from `scale_coeff` → imgsz={eval_mode.get('imgsz')}, "
-        f"overlap {eval_mode.get('overlap_ratio')} (from `{eval_mode.get('train_metadata', 'train dataset')}`), "
+        f"- Inference: per-clip `train_groups` tiling (or full-frame) → "
+        f"model imgsz={eval_mode.get('imgsz')} (from `{eval_mode.get('train_metadata', 'train dataset')}`), "
         f"tile NMS IoU {eval_mode.get('tile_nms_iou', TILE_NMS_IOU)}, boxes mapped to full frame.",
         f"- Bands: one eval clip per band; distance band is fixed per whole video from probe "
         f"(`clip_tiling.json`), not recomputed per frame or per car.",
@@ -741,13 +806,18 @@ def main() -> None:
     slice_cfg = load_train_slice_config()
     verify_materialized_tile_size(slice_cfg)
     print(
-        f"Eval: imgsz={slice_cfg.imgsz}, overlap={slice_cfg.overlap_ratio}, "
-        f"per-clip scale_coeff/slice (from {slice_cfg.source})"
+        f"Eval: default_imgsz={slice_cfg.imgsz}, "
+        f"per-clip train_groups tiling (from {slice_cfg.source})"
     )
-    if slice_cfg.clip_slice_size:
-        for name, size in sorted(slice_cfg.clip_slice_size.items()):
-            coeff = slice_cfg.clip_scale_coeff.get(name, "?")
-            print(f"  {name}: scale_coeff={coeff} → slice={size}")
+    if slice_cfg.clip_group:
+        for name in sorted(slice_cfg.clip_group):
+            group = slice_cfg.clip_group[name]
+            uses = slice_cfg.clip_uses_tiling.get(name, True)
+            size = slice_cfg.clip_slice_size.get(name, "?")
+            ov = slice_cfg.clip_overlap.get(name, "?")
+            p_imgsz = slice_cfg.clip_train_imgsz.get(name, slice_cfg.imgsz)
+            tile_desc = "full-frame" if not uses else f"tile={size}"
+            print(f"  {name}: group={group}, {tile_desc}, overlap={ov}, predict_imgsz={p_imgsz}")
 
     if args.clips:
         clip_names = args.clips
@@ -806,7 +876,10 @@ def main() -> None:
             "imgsz": slice_cfg.imgsz,
             "overlap_ratio": slice_cfg.overlap_ratio,
             "clip_slice_size": slice_cfg.clip_slice_size,
-            "clip_scale_coeff": slice_cfg.clip_scale_coeff,
+            "clip_overlap": slice_cfg.clip_overlap,
+            "clip_train_imgsz": slice_cfg.clip_train_imgsz,
+            "clip_uses_tiling": slice_cfg.clip_uses_tiling,
+            "clip_group": slice_cfg.clip_group,
             "tile_nms_iou": TILE_NMS_IOU,
             "predict_batch_size": PREDICT_BATCH_SIZE,
             "train_metadata": slice_cfg.source,
@@ -820,7 +893,8 @@ def main() -> None:
             "eval_clips_by_band": DEFAULT_BAND_CLIPS,
             "false_alarms_formula": "FP / (N_frames / fps / 60)",
             "inference": (
-                f"per-clip slice from scale_coeff, YOLO imgsz={slice_cfg.imgsz}, "
+                f"per-clip train_groups tile_size (or full-frame), "
+                f"YOLO predict_imgsz from group (default {slice_cfg.imgsz}), "
                 "merged to full frame"
             ),
         },

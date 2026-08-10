@@ -57,6 +57,11 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Process a single clip (video stem / folder name under data/frames).",
     )
+    parser.add_argument(
+        "--enhance",
+        action="store_true",
+        help="Experimental: CLAHE contrast boost before YOLO-World (see image_enhance.py).",
+    )
     return parser.parse_args()
 
 
@@ -451,14 +456,18 @@ def run_eval_fullframe_track(
     ultra_model,
     frame_paths: list[Path],
     t0: float,
+    *,
+    enhance: bool = False,
 ) -> tuple[dict[str, list[dict]], list[float]]:
+    from image_enhance import inference_source
+
     reset_ultralytics_tracker(ultra_model)
     raw_detections_by_frame = {}
     all_confidences = []
 
     for i, frame_path in enumerate(frame_paths):
         result = ultra_model.track(
-            str(frame_path),
+            inference_source(frame_path, enhance=enhance),
             persist=True,
             conf=RAW_CONFIDENCE_THRESHOLD,
             verbose=False,
@@ -483,6 +492,8 @@ def run_fixed_sahi_detect(
     height: int,
     tile_cfg: dict,
     t0: float,
+    *,
+    enhance: bool = False,
 ) -> tuple[dict[str, list[dict]], list[float], dict]:
     target_tiles = tile_cfg["target_tiles"]
     overlap_ratio = tile_cfg["overlap_ratio"]
@@ -491,7 +502,9 @@ def run_fixed_sahi_detect(
     all_confidences = []
 
     for i, frame_path in enumerate(frame_paths):
-        detections = detect_frame_sahi(model, frame_path, slice_h, slice_w, overlap_ratio)
+        detections = detect_frame_sahi(
+            model, frame_path, slice_h, slice_w, overlap_ratio, enhance=enhance
+        )
         raw_detections_by_frame[frame_path.stem] = detections
         all_confidences.extend(det["confidence"] for det in detections)
 
@@ -620,6 +633,8 @@ def process_clip(
     clip_dir: Path,
     root: Path,
     tile_config: dict[str, dict],
+    *,
+    enhance: bool = False,
 ) -> dict:
     clip_name = clip_dir.name
     metadata = json.loads((clip_dir / "metadata.json").read_text(encoding="utf-8"))
@@ -631,6 +646,7 @@ def process_clip(
 
     tile_cfg = resolve_clip_tile_config(clip_name, tile_config)
     label_threshold = tile_cfg["label_confidence_threshold"]
+    enhance_note = ", CLAHE enhance ON" if enhance else ""
 
     if tile_cfg["uses_sahi"]:
         detection_mode = "sahi"
@@ -639,7 +655,7 @@ def process_clip(
             f"\n{split}/{clip_name}: {width}x{height}, "
             f"SAHI {tile_cfg['target_tiles']} tiles (overlap={tile_cfg['overlap_ratio']}, "
             f"band={tile_cfg['distance_band']}, label_conf>={label_threshold}) + IoU track, "
-            f"{len(frame_paths)} frames"
+            f"{len(frame_paths)} frames{enhance_note}"
         )
         if tile_cfg["note"]:
             print(f"  note: {tile_cfg['note']}")
@@ -650,7 +666,7 @@ def process_clip(
             f"\n{split}/{clip_name}: {width}x{height}, "
             f"full-frame model.track + ByteTrack (band={tile_cfg['distance_band']}, "
             f"label_conf>={label_threshold}), "
-            f"{len(frame_paths)} frames"
+            f"{len(frame_paths)} frames{enhance_note}"
         )
         if tile_cfg["note"]:
             print(f"  note: {tile_cfg['note']}")
@@ -660,7 +676,7 @@ def process_clip(
 
     if tile_cfg["uses_sahi"]:
         raw_detections_by_frame, all_confidences, tiling_stats = run_fixed_sahi_detect(
-            model, frame_paths, width, height, tile_cfg, t0
+            model, frame_paths, width, height, tile_cfg, t0, enhance=enhance
         )
         print(
             f"  tiling: {tiling_stats['target_tiles']} tiles, "
@@ -674,7 +690,7 @@ def process_clip(
             "slice_size": None,
         }
         raw_detections_by_frame, all_confidences = run_eval_fullframe_track(
-            model.model, frame_paths, t0
+            model.model, frame_paths, t0, enhance=enhance
         )
 
     frame_order = [frame_path.stem for frame_path in frame_paths]
@@ -750,6 +766,7 @@ def process_clip(
         "elapsed_seconds": round(elapsed_sec, 2),
         "elapsed_human": format_duration(elapsed_sec),
         "seconds_per_frame": round(elapsed_sec / len(frame_paths), 3) if frame_paths else 0.0,
+        "enhance_clahe": bool(enhance),
         **track_stats,
     })
     print(f"  kept={stats['kept']}/{stats['total_detections']} ({stats['pct_dropped']}% dropped)")
@@ -793,7 +810,9 @@ def main() -> None:
     clip_stats = {}
     for split, clip_dir in clips:
         key = f"{split}/{clip_dir.name}"
-        clip_stats[key] = process_clip(model, split, clip_dir, root, tile_config)
+        clip_stats[key] = process_clip(
+            model, split, clip_dir, root, tile_config, enhance=args.enhance
+        )
 
     run_elapsed_sec = time.perf_counter() - run_t0
     run_finished_at = datetime.now().isoformat(timespec="seconds")

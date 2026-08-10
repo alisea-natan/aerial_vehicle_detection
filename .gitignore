@@ -1,3 +1,9 @@
+# --- Guides (local docs / PDF export) ---
+guides/
+
+# --- Node (guide PDF export) ---
+node_modules/
+
 # --- Python / IDE ---
 __pycache__/
 .pytest_cache/
@@ -12,6 +18,9 @@ __pycache__/
 venv/
 env/
 
+# --- PDFs in repo root ---
+/*.pdf
+
 # --- macOS ---
 .DS_Store
 
@@ -24,6 +33,15 @@ labels/
 # --- Probe / label debug artifacts (regenerate: probe_clips.py, autolabel) ---
 debug/
 
+# --- Manual labeling packs (large / regenerable; keep scripts + README) ---
+labelling/Vehicle.v1i.yolov8/
+labelling/cvat/coco_export/
+labelling/cvat/label_man/
+labelling/roboflow/roboflow/
+labelling/roboflow/roboflow_upload/
+labelling/roboflow/roboflow_ui_upload_8457857/
+labelling/roboflow/Vehicle_roboflow/
+
 # --- Training & evaluation outputs (regenerate: train.py, evaluate.py) ---
 outputs/*
 !outputs/eval_metrics.json
@@ -35,18 +53,31 @@ outputs/eval_videos/*
 # --- Model weights ---
 weights/                          # CLIP etc. (large, download locally)
 yolov8x-worldv2.pt                # 140 MB pseudo-labeler (download)
+yolo11s.pt                        # pretrained base (download via Ultralytics)
 *.pt
 *.pth
 *.onnx
 *.engine
-# Fine-tuned deliverable (~6 MB) — copy after train:
-#   cp outputs/runs/yolov8n_vehicle/weights/best.pt checkpoints/yolov8n_vehicle_best.pt
+# Fine-tuned deliverable — copy after train:
+#   cp outputs/runs/yolo11s_vehicle/weights/best.pt checkpoints/yolo11s_vehicle_best.pt
 !checkpoints/
 checkpoints/*
-!checkpoints/yolov8n_vehicle_best.pt
+!checkpoints/yolo11s_vehicle_best.pt
 
 # Ultralytics run folders (if created outside outputs/)
 runs/
+
+# --- Local-only experiment scripts (not committed) ---
+experiments/
+
+# --- MLflow / DVC (coming next; keep remotes/pointers in git later) ---
+mlruns/
+mlflow.db
+.mlflow/
+.dvc/cache/
+.dvc/tmp/
+.dvc/tmp/**
+*.dvc.bak
 
 # --- Matplotlib / cache dirs ---
 .matplotlib/

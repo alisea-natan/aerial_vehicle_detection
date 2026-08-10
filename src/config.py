@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -28,15 +29,26 @@ TILE_CANDIDATES = (1, 2, 3, 4, 6, 8, 12)
 # Final labeling uses one step above that hit so smaller/farther cars get more resolution.
 TILE_HEADROOM_STEPS = 1
 
-# Train/eval: global YOLO imgsz; per-clip scale_coeff sets crop so
-# at_imgsz ≈ fullframe_long × scale_coeff  (target ~64 px median).
-TRAIN_IMGSZ = 1280
+# Train/eval model input. Per-clip crop comes from train_groups in clip_tiling.json
+# (explicit tile_size from object-size bands), not from scale_coeff.
+TRAIN_IMGSZ = 640
 TRAIN_OVERLAP_RATIO = 0.2
 TARGET_OBJECT_LONG_PX = 64.0
 DEFAULT_SCALE_COEFF = 1.0
 SCALE_COEFF_MIN = 0.4
 SCALE_COEFF_MAX = 3.0
 MIN_TRAIN_SLICE_PX = 256
+
+
+@dataclass(frozen=True)
+class TrainGroupTiling:
+    """Per-clip train/eval crop settings from distance/object-size groups."""
+
+    group: str
+    tile_size: int | None  # None = full frame, no SAHI tiling
+    overlap: float  # 0 when full frame
+    train_imgsz: int
+    uses_tiling: bool
 
 
 def build_split_map(root: Path | None = None) -> dict[str, str]:
@@ -129,6 +141,77 @@ def load_clip_tile_config(path: Path | None = None) -> dict[str, dict]:
     return load_tiling_payload(path).get("clips", {})
 
 
+def load_train_groups(path: Path | None = None) -> dict[str, dict]:
+    return load_tiling_payload(path).get("train_groups", {}) or {}
+
+
+def _clip_matches_video_id(clip_name: str, video_id: str) -> bool:
+    """Match short ids like '8968356' to stems like '8968356-hd_1920_1080_30fps'."""
+    vid = str(video_id).strip()
+    if not vid:
+        return False
+    if clip_name == vid:
+        return True
+    return clip_name.startswith(f"{vid}-") or clip_name.startswith(f"{vid}_")
+
+
+def resolve_train_group_tiling(
+    clip_name: str,
+    *,
+    payload: dict | None = None,
+) -> TrainGroupTiling:
+    """Resolve explicit train/eval tile_size from train_groups (object-size bands)."""
+    data = payload if payload is not None else load_tiling_payload()
+    groups = data.get("train_groups") or {}
+    if not groups:
+        raise SystemExit(
+            f"No train_groups in {CLIP_TILING_CONFIG_PATH}. "
+            "Add A_close / B_medium / C_far groups with tile_size and train_imgsz."
+        )
+
+    for group_name, group in groups.items():
+        videos = group.get("videos") or []
+        if not any(_clip_matches_video_id(clip_name, vid) for vid in videos):
+            continue
+        raw_tile = group.get("tile_size", None)
+        tile_size = None if raw_tile is None else int(raw_tile)
+        raw_overlap = group.get("overlap", None)
+        if tile_size is None:
+            overlap = 0.0
+        elif raw_overlap is None:
+            overlap = float(TRAIN_OVERLAP_RATIO)
+        else:
+            overlap = float(raw_overlap)
+        train_imgsz = int(group.get("train_imgsz", TRAIN_IMGSZ))
+        return TrainGroupTiling(
+            group=str(group_name),
+            tile_size=tile_size,
+            overlap=overlap,
+            train_imgsz=train_imgsz,
+            uses_tiling=tile_size is not None,
+        )
+
+    known = []
+    for gname, group in groups.items():
+        for vid in group.get("videos") or []:
+            known.append(f"{vid} ({gname})")
+    raise SystemExit(
+        f"Clip {clip_name!r} is not listed in train_groups.\n"
+        f"Known video ids: {', '.join(known) or '(none)'}"
+    )
+
+
+def effective_slice_size(
+    tiling: TrainGroupTiling,
+    frame_w: int,
+    frame_h: int,
+) -> int:
+    """Crop side for SAHI; full-frame clips use the frame short side (single tile)."""
+    if tiling.tile_size is None:
+        return int(min(frame_w, frame_h))
+    return int(min(tiling.tile_size, frame_w, frame_h))
+
+
 def label_threshold_for_tiles(target_tiles: int) -> float:
     if target_tiles <= 1:
         return PROBE_MAX_LABEL_THRESHOLD
@@ -186,10 +269,7 @@ def slice_size_from_scale(
     *,
     imgsz: int = TRAIN_IMGSZ,
 ) -> int:
-    """Train/eval crop side: slice ≈ imgsz / scale_coeff (capped to frame).
-
-    After YOLO resizes the crop to imgsz, object long-side scales by ≈ scale_coeff.
-    """
+    """Legacy helper: slice ≈ imgsz / scale_coeff (capped to frame)."""
     coeff = clamp_scale_coeff(float(scale_coeff))
     raw = imgsz / coeff
     return align_slice_size(int(round(raw)), max_size=min(frame_w, frame_h))
@@ -211,11 +291,39 @@ def save_clip_tile_config(
     config_path = path or CLIP_TILING_CONFIG_PATH
     config_path.parent.mkdir(parents=True, exist_ok=True)
 
+    # Preserve train_groups / unrelated top-level keys across probe rewrites.
+    existing = load_tiling_payload(config_path) if config_path.exists() else {}
     payload = {
         "source": source,
         "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "clips": clips,
     }
+    for key in (
+        "train_groups",
+        "train_imgsz",
+        "target_object_long_px",
+        "scale_coeff_note",
+        "model_name",
+        "raw_confidence_threshold",
+        "probe_max_label_threshold",
+        "fallback_tiles",
+        "fallback_label_threshold",
+        "adaptive_label_threshold",
+        "detection_class",
+        "probe_class_aliases",
+        "probe_model_classes",
+        "tile_candidates",
+        "tile_headroom_steps",
+        "frames_per_clip",
+        "frames_per_segment",
+        "frame_step_fraction",
+        "preprocess_note",
+        "scale_coeff_source",
+        "scale_coeff_updated_at",
+        "scale_coeff_formula",
+    ):
+        if key in existing and key not in payload:
+            payload[key] = existing[key]
     if extra_meta:
         payload.update(extra_meta)
 
@@ -234,14 +342,22 @@ def probe_result_to_config_entry(result: dict) -> dict:
         target_tiles = next_tile_candidate(probe_min_tiles)
         hit_frame = result.get("hit_frame") or "?"
         distance_source = result.get("distance_source") or "unknown"
+        size_med = result.get("object_size_px_median")
+        size_note = f"; car_size_med={size_med}px" if size_med is not None else ""
+        vary = result.get("distance_varies")
+        vary_note = "; distance_varies" if vary else ""
+        step = result.get("frame_step")
+        step_note = f"; frame_step={step}" if step is not None else ""
         if target_tiles == probe_min_tiles:
             note = (
-                f"probed frame {hit_frame}; distance from {distance_source}; "
+                f"probed start/middle/end (hit {hit_frame}); distance from {distance_source}"
+                f"{size_note}{vary_note}{step_note}; "
                 f"probe_min_tiles={probe_min_tiles} (already max ladder step)"
             )
         else:
             note = (
-                f"probed frame {hit_frame}; distance from {distance_source}; "
+                f"probed start/middle/end (hit {hit_frame}); distance from {distance_source}"
+                f"{size_note}{vary_note}{step_note}; "
                 f"probe_min_tiles={probe_min_tiles} → target_tiles={target_tiles} "
                 f"(+{TILE_HEADROOM_STEPS} headroom)"
             )
@@ -269,6 +385,20 @@ def probe_result_to_config_entry(result: dict) -> dict:
     }
     if probe_min_tiles is not None:
         entry["probe_min_tiles"] = int(probe_min_tiles)
+
+    # Always persist preprocess fields used for manual labeling / train banding
+    # (null = could not estimate — still written so the key exists in clip_tiling.json).
+    entry["object_size_px_median"] = result.get("object_size_px_median")
+    entry["object_size_px_mean"] = result.get("object_size_px_mean")
+    entry["object_size_n_boxes"] = result.get("object_size_n_boxes")
+    entry["distance_varies"] = bool(result.get("distance_varies", False))
+    entry["distance_by_segment"] = result.get("distance_by_segment")
+    entry["size_ratio_change_start_end"] = result.get("size_ratio_change_start_end")
+    entry["speed_px_per_frame_median"] = result.get("speed_px_per_frame_median")
+    entry["frame_step"] = result.get("frame_step")
+    entry["frame_step_fraction"] = result.get("frame_step_fraction")
+    entry["suggested_train_group"] = result.get("suggested_train_group")
+    entry["frames_probed_by_segment"] = result.get("frames_probed_by_segment")
     return entry
 
 
@@ -299,7 +429,7 @@ def resolve_clip_tile_config(
         known = ", ".join(sorted(clips)) or "(empty)"
         raise SystemExit(
             f"No tile config for clip {clip_name!r}. "
-            f"Run: python src/probe_clips.py --clip {clip_name}\n"
+            f"Run: python src/preprocess_clips.py --clip {clip_name}\n"
             f"Known clips in config: {known}"
         )
 
@@ -309,9 +439,14 @@ def resolve_clip_tile_config(
     if "label_confidence_threshold" not in cfg:
         raise SystemExit(
             f"Clip {clip_name!r} missing label_confidence_threshold in config. "
-            f"Run: python src/probe_clips.py --clip {clip_name}"
+            f"Run: python src/preprocess_clips.py --clip {clip_name}"
         )
-    return {
+    train_tiling = None
+    try:
+        train_tiling = resolve_train_group_tiling(clip_name)
+    except SystemExit:
+        pass
+    out = {
         "target_tiles": target_tiles,
         "overlap_ratio": overlap_ratio,
         "label_confidence_threshold": float(cfg["label_confidence_threshold"]),
@@ -321,4 +456,19 @@ def resolve_clip_tile_config(
         "note": str(cfg.get("note", "")),
         "uses_sahi": target_tiles > 1,
         "scale_coeff": resolve_scale_coeff(cfg),
+        "object_size_px_median": cfg.get("object_size_px_median"),
+        "object_size_px_mean": cfg.get("object_size_px_mean"),
+        "distance_varies": bool(cfg.get("distance_varies", False)),
+        "distance_by_segment": cfg.get("distance_by_segment"),
+        "speed_px_per_frame_median": cfg.get("speed_px_per_frame_median"),
+        "frame_step": cfg.get("frame_step"),
+        "frame_step_fraction": cfg.get("frame_step_fraction"),
+        "suggested_train_group": cfg.get("suggested_train_group"),
+        "frames_probed_by_segment": cfg.get("frames_probed_by_segment"),
     }
+    if train_tiling is not None:
+        out["train_group"] = train_tiling.group
+        out["train_tile_size"] = train_tiling.tile_size
+        out["train_overlap"] = train_tiling.overlap
+        out["train_imgsz"] = train_tiling.train_imgsz
+    return out

@@ -128,9 +128,13 @@ def detect_frame_sahi(
     overlap_ratio: float,
     *,
     default_subclass: str = "vehicle",
+    enhance: bool = False,
 ) -> list[dict]:
+    from image_enhance import inference_source
+
+    source = inference_source(image_path, enhance=enhance)
     result = get_sliced_prediction(
-        str(image_path),
+        source,
         model,
         slice_height=slice_h,
         slice_width=slice_w,
@@ -154,10 +158,15 @@ def detect_frame_probe(
     label_threshold: float,
     detection_class: str,
     device_name: str,
+    *,
+    enhance: bool = False,
 ) -> list[dict]:
+    from image_enhance import inference_source
+
+    source = inference_source(frame_path, enhance=enhance)
     if target_tiles <= 1:
         result = ultra_model.predict(
-            str(frame_path),
+            source,
             conf=RAW_CONFIDENCE_THRESHOLD,
             verbose=False,
             device=device_name,
@@ -169,7 +178,7 @@ def detect_frame_probe(
     overlap = overlap_for_tiles(target_tiles)
     slice_h, slice_w = compute_slice_size(width, height, target_tiles)
     result = get_sliced_prediction(
-        str(frame_path),
+        source,
         model,
         slice_height=slice_h,
         slice_width=slice_w,

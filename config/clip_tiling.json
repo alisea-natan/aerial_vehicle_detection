@@ -1,9 +1,41 @@
 {
   "source": "probe_clips.py",
   "updated_at": "2026-07-13T11:40:00+00:00",
-  "train_imgsz": 1280,
+  "train_imgsz": 640,
   "target_object_long_px": 64.0,
-  "scale_coeff_note": "at_imgsz \u2248 fullframe_long \u00d7 scale_coeff; slice \u2248 train_imgsz / scale_coeff (capped to frame). Tuned from label_box_stats p50 \u2192 ~64 px.",
+  "scale_coeff_note": "legacy; train/eval crops now come from train_groups (explicit tile_size from object-size bands).",
+  "train_groups": {
+    "C_far": {
+      "videos": [
+        "8968356"
+      ],
+      "tile_size": 640,
+      "overlap": 0.2,
+      "train_imgsz": 960,
+      "note": "tiny objects (~22 px mean); tile then upsample to 960"
+    },
+    "B_medium": {
+      "videos": [
+        "5382494"
+      ],
+      "tile_size": 960,
+      "overlap": 0.18,
+      "train_imgsz": 640,
+      "note": "mid-size objects (~65 px mean); tile 960 \u2192 model 640"
+    },
+    "A_close": {
+      "videos": [
+        "266987",
+        "3405804",
+        "8457857",
+        "13722965"
+      ],
+      "tile_size": null,
+      "overlap": null,
+      "train_imgsz": 640,
+      "note": "large objects; full frame letterboxed to 640, no tiling"
+    }
+  },
   "clips": {
     "13722965_2160_3840_30fps": {
       "target_tiles": 2,
