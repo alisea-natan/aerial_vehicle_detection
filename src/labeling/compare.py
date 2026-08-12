@@ -1,30 +1,36 @@
 #!/usr/bin/env python3
-"""Compare CVAT manual labels (labelling/cvat/label_man/) with autolabels (labels/).
+"""Compare CVAT manual labels (labelling/cvat/label_man/) with labels/.
 
-For each clip under label_man/, reports per-frame bbox counts and IoU matching
-(manual = GT, auto = pred). Writes the same report to console and one .txt file.
-
-Examples:
-  python labelling/cvat/compare_labels.py
-  python labelling/cvat/compare_labels.py --iou 0.5 --out debug/compare_labels_report.txt
-  python labelling/cvat/compare_labels.py --clip 266987
+  python src/labeling/compare.py
+  python src/labeling/compare.py --iou 0.5 --clip 266987
 """
-
 from __future__ import annotations
+
+import sys
+from pathlib import Path as _Path
+
+def _ensure_src_on_path() -> None:
+    """Allow `python src/<pkg>/….py` without PYTHONPATH."""
+    p = _Path(__file__).resolve().parent
+    while p != p.parent:
+        if (p / "common").is_dir() and (p / "labeling").is_dir():
+            s = str(p)
+            if s not in sys.path:
+                sys.path.insert(0, s)
+            return
+        p = p.parent
+
+_ensure_src_on_path()
 
 import argparse
 import statistics
-import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
-HERE = Path(__file__).resolve().parent
-PROJECT_ROOT = HERE.parents[1]
-sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-from config import LABELS_DIR, build_split_map  # noqa: E402
+from common.config import PROJECT_ROOT, LABELS_DIR, build_split_map
 
-LABEL_MAN_DIR = HERE / "label_man"
+LABEL_MAN_DIR = PROJECT_ROOT / "labelling" / "cvat" / "label_man"
 DEFAULT_OUT = PROJECT_ROOT / "debug" / "compare_labels_report.txt"
 DEFAULT_IOU = 0.5
 MANUAL_SUBDIRS = ("obj_Train_data", "obj_Test_data")

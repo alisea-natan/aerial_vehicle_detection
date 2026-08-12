@@ -1,0 +1,29 @@
+# Hyperparams / baseline prepare defaults.
+# Training CLI flags in src/training/train.py remain the source of truth at runtime.
+
+prepare:
+  val_fraction: 0.15
+  seed: 42
+
+# Versioned baseline prepare defaults (local data/datasets/ only — not GitLab).
+# GT:     python src/training/prepare_baseline.py
+# Pseudo: python src/training/prepare_baseline.py --from-autolabel  → baseline_v0
+baseline:
+  name: baseline_v1
+  out_dir: data/datasets/baseline_v1
+  imgsz: 1024
+  val_fraction: 0.15
+  seed: 42
+  frame_step_only: true
+  balance: false
+  empty_slices_per_frame: 0
+
+train:
+  model: yolo11s.pt
+  warmup_epochs: 5
+  epochs: 20
+  freeze: 11
+  lr0: 0.01
+  patience: 10
+  imgsz: 1024
+  seed: 42

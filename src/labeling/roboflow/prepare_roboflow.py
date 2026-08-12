@@ -1,29 +1,36 @@
 #!/usr/bin/env python3
-"""Build labelling/roboflow/roboflow/ from data/frames + CVAT label_man.
+"""Build labelling/roboflow/roboflow/ packs from frames + label_man.
 
-For every clip under data/frames/ (except EXCLUDE):
-  labelling/roboflow/roboflow/<clip>/images/*.jpg   → symlink to data/frames/...
-  labelling/roboflow/roboflow/<clip>/data.yaml
-  labelling/roboflow/roboflow/<clip>/labels/*.txt   → ONLY if label_man has that clip;
-                                   copy only existing label_man files (no empty placeholders)
-
-Examples:
-  python labelling/roboflow/prepare_roboflow.py --clean
+  python src/labeling/roboflow/prepare_roboflow.py --clean
 """
-
 from __future__ import annotations
+
+import sys
+from pathlib import Path as _Path
+
+def _ensure_src_on_path() -> None:
+    """Allow `python src/<pkg>/….py` without PYTHONPATH."""
+    p = _Path(__file__).resolve().parent
+    while p != p.parent:
+        if (p / "common").is_dir() and (p / "labeling").is_dir():
+            s = str(p)
+            if s not in sys.path:
+                sys.path.insert(0, s)
+            return
+        p = p.parent
+
+_ensure_src_on_path()
 
 import argparse
 import shutil
 from pathlib import Path
 
-HERE = Path(__file__).resolve().parent
-PROJECT_ROOT = HERE.parents[1]
+
+from common.config import PROJECT_ROOT, clip_skip_reason, is_clip_skipped
 
 FRAMES_DIR = PROJECT_ROOT / "data" / "frames"
 LABEL_MAN_DIR = PROJECT_ROOT / "labelling" / "cvat" / "label_man"
-OUT_DIR = HERE / "roboflow"
-EXCLUDE = {"8968356-hd_1920_1080_30fps"}
+OUT_DIR = PROJECT_ROOT / "labelling" / "roboflow" / "roboflow"
 MANUAL_SUBDIRS = ("obj_Train_data", "obj_Test_data")
 CLASS_NAMES = ["vehicle"]
 
@@ -71,7 +78,6 @@ def prepare_clip(
     labels_dir = clip_out / "labels"
     images_dir.mkdir(parents=True, exist_ok=True)
 
-    # Drop stale labels/ from older runs
     if labels_dir.is_dir():
         shutil.rmtree(labels_dir)
 
@@ -116,11 +122,14 @@ def main() -> None:
     if not frames_root.is_dir():
         raise SystemExit(f"Frames dir not found: {frames_root}")
 
-    clips = sorted(
-        p.name
-        for p in frames_root.iterdir()
-        if p.is_dir() and p.name not in EXCLUDE and not p.name.startswith(".")
-    )
+    clips = []
+    for p in sorted(frames_root.iterdir()):
+        if not p.is_dir() or p.name.startswith("."):
+            continue
+        if is_clip_skipped(p.name):
+            print(f"[skip] {p.name}: {clip_skip_reason(p.name)}")
+            continue
+        clips.append(p.name)
     if not clips:
         raise SystemExit(f"No clips under {frames_root}")
 
@@ -139,7 +148,7 @@ def main() -> None:
         total_frames += n_f
         total_labels += n_l
 
-    print(f"Done: {total_frames} images, {total_labels} labels (label_man only)")
+    print(f"Done: {total_frames} frames, {total_labels} labels → {out_root}")
 
 
 if __name__ == "__main__":

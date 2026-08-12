@@ -1,12 +1,25 @@
 #!/usr/bin/env python3
-"""Per-clip bbox size stats from pseudo-labels (train / eval separately).
+"""Per-clip bbox size stats from labels/ (optional scale_coeff into clip_tiling.json).
 
-Reports vehicle long-side in full-frame pixels and after the per-clip
-scale_coeff crop→imgsz path. By default also writes scale_coeff into
-config/clip_tiling.json (scale ≈ target_px / ff_p50, clamped).
+  python src/labeling/stats.py
 """
-
 from __future__ import annotations
+
+import sys
+from pathlib import Path as _Path
+
+def _ensure_src_on_path() -> None:
+    """Allow `python src/<pkg>/….py` without PYTHONPATH."""
+    p = _Path(__file__).resolve().parent
+    while p != p.parent:
+        if (p / "common").is_dir() and (p / "labeling").is_dir():
+            s = str(p)
+            if s not in sys.path:
+                sys.path.insert(0, s)
+            return
+        p = p.parent
+
+_ensure_src_on_path()
 
 import argparse
 import json
@@ -14,7 +27,8 @@ import math
 from datetime import datetime, timezone
 from pathlib import Path
 
-from config import (
+
+from common.config import (
     CLIP_TILING_CONFIG_PATH,
     DEBUG_DIR,
     FRAMES_DIR,
@@ -24,6 +38,8 @@ from config import (
     TARGET_OBJECT_LONG_PX,
     TRAIN_IMGSZ,
     build_split_map,
+    clip_skip_reason,
+    is_clip_skipped,
     load_tiling_payload,
     scale_coeff_from_median,
     slice_size_from_scale,
@@ -353,6 +369,9 @@ def main() -> None:
     all_clips: list[dict] = []
     for clip_name, split in sorted(split_map.items(), key=lambda kv: (kv[1], kv[0])):
         if clip_filter and clip_name != clip_filter:
+            continue
+        if is_clip_skipped(clip_name):
+            print(f"skip {split}/{clip_name}: {clip_skip_reason(clip_name)}")
             continue
         if split not in by_split:
             continue

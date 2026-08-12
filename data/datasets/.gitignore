@@ -1,0 +1,4 @@
+# Local dataset versions only — never commit blobs or DVC pointers to GitLab.
+*
+!.gitignore
+!README.md

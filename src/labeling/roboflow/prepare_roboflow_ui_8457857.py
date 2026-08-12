@@ -3,15 +3,30 @@
 
   python labelling/roboflow/prepare_roboflow_ui_8457857.py
 """
-
 from __future__ import annotations
+
+import sys
+from pathlib import Path as _Path
+
+def _ensure_src_on_path() -> None:
+    """Allow `python src/<pkg>/….py` without PYTHONPATH."""
+    p = _Path(__file__).resolve().parent
+    while p != p.parent:
+        if (p / "common").is_dir() and (p / "labeling").is_dir():
+            s = str(p)
+            if s not in sys.path:
+                sys.path.insert(0, s)
+            return
+        p = p.parent
+
+_ensure_src_on_path()
+
+from common.config import PROJECT_ROOT
 
 import re
 import shutil
 from pathlib import Path
 
-HERE = Path(__file__).resolve().parent
-PROJECT_ROOT = HERE.parents[1]
 
 CLIP_DIR = "8457857-uhd_3840_2160_24fps"
 VIDEO_ID = "8457857"
@@ -20,9 +35,8 @@ FRAMES_DIR = PROJECT_ROOT / "data" / "frames" / CLIP_DIR
 LABEL_MAN_DIR = (
     PROJECT_ROOT / "labelling" / "cvat" / "label_man" / CLIP_DIR / "obj_Train_data"
 )
-# Project export — keep class index order as-is
-PROJECT_YAML = HERE / "Vehicle_roboflow" / "data.yaml"
-OUT_DIR = HERE / "roboflow_ui_upload_8457857"
+PROJECT_YAML = PROJECT_ROOT / "labelling" / "roboflow" / "Vehicle_roboflow" / "data.yaml"
+OUT_DIR = PROJECT_ROOT / "labelling" / "roboflow" / "roboflow_ui_upload_8457857"
 
 
 def classes_from_yaml(path: Path) -> list[str]:

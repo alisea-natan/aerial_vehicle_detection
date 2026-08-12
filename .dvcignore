@@ -1,0 +1,11 @@
+# Keep DVC hash cache small / stable.
+**/.DS_Store
+**/__pycache__/
+**/*.pyc
+**/Thumbs.db
+data/raw_export/**/task_*/
+data/frames/**
+debug/
+outputs/
+.matplotlib/
+**/.matplotlib_cache/

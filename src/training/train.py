@@ -7,8 +7,23 @@ Stage 2 unfreezes all layers and continues from the Stage 1 weights at a lower L
 Train + in-training val both come from data/train videos (frame holdout).
 Eval clips are reserved for evaluate.py only — never written into outputs/dataset.
 """
-
 from __future__ import annotations
+
+import sys
+from pathlib import Path as _Path
+
+def _ensure_src_on_path() -> None:
+    """Allow `python src/<pkg>/….py` without PYTHONPATH."""
+    p = _Path(__file__).resolve().parent
+    while p != p.parent:
+        if (p / "common").is_dir() and (p / "labeling").is_dir():
+            s = str(p)
+            if s not in sys.path:
+                sys.path.insert(0, s)
+            return
+        p = p.parent
+
+_ensure_src_on_path()
 
 import argparse
 import json
@@ -23,19 +38,24 @@ from sahi.slicing import slice_image
 from sahi.utils.coco import CocoAnnotation
 from ultralytics import YOLO
 
-from config import (
+from common.config import (
     FRAMES_DIR,
     LABELS_DIR,
     PROJECT_ROOT,
     TRAIN_IMGSZ,
     build_split_map,
+    clip_skip_reason,
     effective_slice_size,
+    is_clip_skipped,
+    load_clip_tile_config,
     load_tiling_payload,
+    resolve_clip_tile_config,
     resolve_train_group_tiling,
 )
-from aug_config import train_aug_kwargs
+from common.aug_config import train_aug_kwargs
 
 DATASET_DIR = PROJECT_ROOT / "outputs" / "dataset"
+BASELINE_DATASET_DIR = PROJECT_ROOT / "data" / "datasets" / "baseline_v1"
 RUNS_DIR = PROJECT_ROOT / "outputs" / "runs"
 
 # --- training config (tuned for Apple Silicon MPS) ---
@@ -59,7 +79,11 @@ ROTATION_AUG_ANGLES = (90, 180, 270)  # CW degrees; aerial top-down safe
 
 MIN_AREA_RATIO = 0.1  # SAHI: keep box if >=10% of original area visible in tile
 CLASS_NAME = "vehicle"
-DEVICE = "mps" if torch.backends.mps.is_available() else "cpu"
+DEVICE = (
+    "mps"
+    if torch.backends.mps.is_built() and torch.backends.mps.is_available()
+    else "cpu"
+)
 STAGE1_RUN_NAME = "yolo11s_vehicle_stage1"
 STAGE2_RUN_NAME = "yolo11s_vehicle"
 # Hold out this fraction of *train* frames for Ultralytics val (stratified by clip).
@@ -166,12 +190,37 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--prepare-only",
         action="store_true",
-        help="Only build outputs/dataset (train + holdout-val from train videos).",
+        help="Only build the dataset (train + holdout-val from train videos).",
     )
     parser.add_argument(
         "--recreate-dataset",
         action="store_true",
-        help="Force rebuild dataset even if outputs/dataset already exists.",
+        help="Force rebuild dataset even if it already exists.",
+    )
+    parser.add_argument(
+        "--dataset-dir",
+        type=Path,
+        default=None,
+        help=f"Dataset output root (default {DATASET_DIR.relative_to(PROJECT_ROOT)}).",
+    )
+    parser.add_argument(
+        "--baseline",
+        action="store_true",
+        help=(
+            "Baseline prepare preset: frame_step frames only, no group balance/rotations, "
+            f"imgsz={TRAIN_IMGSZ}, out={BASELINE_DATASET_DIR.relative_to(PROJECT_ROOT)} "
+            "(unless --dataset-dir / --imgsz override)."
+        ),
+    )
+    parser.add_argument(
+        "--frame-step-only",
+        action="store_true",
+        help="Keep only frames on each clip's frame_step from clip_tiling.json.",
+    )
+    parser.add_argument(
+        "--no-balance",
+        action="store_true",
+        help="Skip train-group downsample / rotation oversample (no prepare-time augs).",
     )
     parser.add_argument(
         "--val-fraction",
@@ -242,12 +291,34 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def iter_labeled_frames(split: str, split_map: dict[str, str]) -> list[tuple[str, Path, Path]]:
+def _frame_index(stem: str) -> int | None:
+    """Parse leading frame index from stems like '000123'."""
+    digits = []
+    for ch in stem:
+        if ch.isdigit():
+            digits.append(ch)
+        else:
+            break
+    if not digits:
+        return None
+    return int("".join(digits))
+
+
+def iter_labeled_frames(
+    split: str,
+    split_map: dict[str, str],
+    *,
+    frame_step_only: bool = False,
+    labels_root: Path | None = None,
+) -> list[tuple[str, Path, Path]]:
     """Return (clip_name, image_path, label_path) for frames that have a label file."""
     pairs: list[tuple[str, Path, Path]] = []
-    label_root = LABELS_DIR / split
+    root = (labels_root or LABELS_DIR).resolve()
+    label_root = root / split
     if not label_root.is_dir():
         return pairs
+
+    tile_config = load_clip_tile_config() if frame_step_only else {}
 
     for clip_dir in sorted(label_root.iterdir()):
         if not clip_dir.is_dir():
@@ -255,16 +326,34 @@ def iter_labeled_frames(split: str, split_map: dict[str, str]) -> list[tuple[str
         clip_name = clip_dir.name
         if split_map.get(clip_name) != split:
             continue
+        if is_clip_skipped(clip_name):
+            print(f"  skip {clip_name}: {clip_skip_reason(clip_name)}")
+            continue
         frame_dir = FRAMES_DIR / clip_name
         if not frame_dir.is_dir():
             print(f"  skip {clip_name}: frames dir missing")
             continue
 
+        step = 1
+        if frame_step_only:
+            cfg = resolve_clip_tile_config(clip_name, tile_config)
+            raw_step = cfg.get("frame_step")
+            step = max(1, int(raw_step)) if raw_step is not None else 1
+            print(f"  {clip_name}: frame_step={step} (labels_root={root.relative_to(PROJECT_ROOT) if root.is_relative_to(PROJECT_ROOT) else root})")
+
+        kept = 0
         for label_path in sorted(clip_dir.glob("*.txt")):
+            if frame_step_only and step > 1:
+                idx = _frame_index(label_path.stem)
+                if idx is None or (idx - 1) % step != 0:
+                    continue
             image_path = frame_dir / f"{label_path.stem}.jpg"
             if not image_path.exists():
                 continue
             pairs.append((clip_name, image_path, label_path))
+            kept += 1
+        if frame_step_only:
+            print(f"    kept {kept} labeled frames on step")
     return pairs
 
 
@@ -981,10 +1070,10 @@ def balance_train_groups(
     }
 
 
-def refresh_train_stats_from_disk(train_stats: dict) -> dict:
+def refresh_train_stats_from_disk(train_stats: dict, dataset_dir: Path) -> dict:
     """Update aggregate / per-group counters after on-disk balancing."""
-    images_dir = DATASET_DIR / "train" / "images"
-    labels_dir = DATASET_DIR / "train" / "labels"
+    images_dir = dataset_dir / "train" / "images"
+    labels_dir = dataset_dir / "train" / "labels"
     clip_group = train_stats.get("clip_group") or {}
     counts = scan_split_group_counts(images_dir, labels_dir, clip_group=clip_group)
     labeled = sum(v["labeled_kept"] for v in counts.values())
@@ -1057,6 +1146,7 @@ def prepare_sliced_val_from_train_holdout(
     frames: list[tuple[str, Path, Path]],
     *,
     imgsz: int,
+    dataset_dir: Path,
 ) -> dict:
     """Build Ultralytics val set from held-out train frames (not eval clips)."""
     if not frames:
@@ -1065,8 +1155,8 @@ def prepare_sliced_val_from_train_holdout(
     print_group_tiling_plan(frames)
     stats = slice_frames_to_dataset(
         frames,
-        DATASET_DIR / "val" / "images",
-        DATASET_DIR / "val" / "labels",
+        dataset_dir / "val" / "images",
+        dataset_dir / "val" / "labels",
         imgsz=imgsz,
         max_empty_slices_per_frame=0,
         progress_label="val",
@@ -1078,11 +1168,17 @@ def prepare_sliced_val_from_train_holdout(
     return stats
 
 
-def write_dataset_yaml(imgsz: int, train_stats: dict, val_stats: dict) -> Path:
-    DATASET_DIR.mkdir(parents=True, exist_ok=True)
-    yaml_path = DATASET_DIR / "data.yaml"
+def write_dataset_yaml(
+    imgsz: int,
+    train_stats: dict,
+    val_stats: dict,
+    *,
+    dataset_dir: Path,
+) -> Path:
+    dataset_dir.mkdir(parents=True, exist_ok=True)
+    yaml_path = dataset_dir / "data.yaml"
     payload = {
-        "path": str(DATASET_DIR.resolve()),
+        "path": str(dataset_dir.resolve()),
         "train": "train/images",
         "val": "val/images",
         "names": {0: CLASS_NAME},
@@ -1114,10 +1210,10 @@ def write_dataset_yaml(imgsz: int, train_stats: dict, val_stats: dict) -> Path:
     return yaml_path
 
 
-def summarize_dataset_size(train_stats: dict, val_stats: dict) -> None:
+def summarize_dataset_size(train_stats: dict, val_stats: dict, *, dataset_dir: Path) -> None:
     """Print final train vs val counts + empty-label accounting + on-disk size."""
-    train_images = DATASET_DIR / "train" / "images"
-    val_images = DATASET_DIR / "val" / "images"
+    train_images = dataset_dir / "train" / "images"
+    val_images = dataset_dir / "val" / "images"
     n_train = len(list(train_images.glob(f"*{SLICE_OUT_EXT}"))) if train_images.is_dir() else 0
     n_val = len(list(val_images.glob(f"*{SLICE_OUT_EXT}"))) if val_images.is_dir() else 0
 
@@ -1142,9 +1238,9 @@ def summarize_dataset_size(train_stats: dict, val_stats: dict) -> None:
             f"empty_kept={empty_kept}, empty_removed={empty_removed}"
         )
 
-    train_mb = _dir_mb(DATASET_DIR / "train")
-    val_mb = _dir_mb(DATASET_DIR / "val")
-    total_mb = _dir_mb(DATASET_DIR)
+    train_mb = _dir_mb(dataset_dir / "train")
+    val_mb = _dir_mb(dataset_dir / "val")
+    total_mb = _dir_mb(dataset_dir)
 
     print("\n=== Dataset size (train videos only; eval clips excluded) ===")
     print(
@@ -1157,7 +1253,7 @@ def summarize_dataset_size(train_stats: dict, val_stats: dict) -> None:
         f"(from {val_stats.get('source_frames', '?')} held-out train frames) — {val_mb:.1f} MB"
     )
     print(f"  {_empty_line('empty labels', val_stats)}")
-    print(f"Total under outputs/dataset/: {total_mb:.1f} MB")
+    print(f"Total under dataset/: {total_mb:.1f} MB")
     print("Eval clips are not in this dataset — use evaluate.py for external metrics.")
 
     def _print_groups(label: str, stats: dict) -> None:
@@ -1210,12 +1306,45 @@ def prepare_dataset(
     recreate: bool,
     imgsz: int,
     val_fraction: float,
+    dataset_dir: Path | None = None,
+    frame_step_only: bool = False,
+    balance: bool = True,
+    max_empty_slices_per_frame: int | None = None,
+    labels_root: Path | None = None,
 ) -> Path:
-    if recreate or not (DATASET_DIR / "train" / "images").exists():
-        all_train_frames = iter_labeled_frames("train", split_map)
+    dataset_dir = (dataset_dir or DATASET_DIR).resolve()
+    labels_root_resolved = (labels_root or LABELS_DIR).resolve()
+    empty_cap = (
+        MAX_EMPTY_SLICES_PER_FRAME
+        if max_empty_slices_per_frame is None
+        else int(max_empty_slices_per_frame)
+    )
+    train_images = dataset_dir / "train" / "images"
+    if recreate or not train_images.exists():
+        all_train_frames = iter_labeled_frames(
+            "train",
+            split_map,
+            frame_step_only=frame_step_only,
+            labels_root=labels_root_resolved,
+        )
         if not all_train_frames:
-            raise SystemExit("No train pseudo-labels found under labels/train/.")
+            raise SystemExit(
+                f"No train labels found under {labels_root_resolved / 'train'}/."
+            )
 
+        labels_disp = (
+            labels_root_resolved.relative_to(PROJECT_ROOT)
+            if labels_root_resolved.is_relative_to(PROJECT_ROOT)
+            else labels_root_resolved
+        )
+        print(
+            f"Dataset dir: {dataset_dir.relative_to(PROJECT_ROOT) if dataset_dir.is_relative_to(PROJECT_ROOT) else dataset_dir}"
+        )
+        print(f"Labels root: {labels_disp}")
+        print(
+            f"Prepare flags: frame_step_only={frame_step_only}, balance={balance}, "
+            f"imgsz={imgsz}, empty_slices_cap={empty_cap}"
+        )
         print(
             f"Splitting train videos into train/val "
             f"(val_fraction={val_fraction}, seed={VAL_SPLIT_SEED}); "
@@ -1234,58 +1363,85 @@ def prepare_dataset(
         print_group_tiling_plan(train_frames)
         train_stats = slice_frames_to_dataset(
             train_frames,
-            DATASET_DIR / "train" / "images",
-            DATASET_DIR / "train" / "labels",
+            dataset_dir / "train" / "images",
+            dataset_dir / "train" / "labels",
             imgsz=imgsz,
-            max_empty_slices_per_frame=MAX_EMPTY_SLICES_PER_FRAME,
+            max_empty_slices_per_frame=empty_cap,
             progress_label="train",
         )
         print(
-            f"Train samples (pre-balance): {train_stats['slices_kept']} kept from "
+            f"Train samples: {train_stats['slices_kept']} kept from "
             f"{train_stats['source_frames']} frames "
             f"({train_stats['slices_with_labels']} with labels, "
             f"{train_stats['slices_dropped']} empty dropped, format={SLICE_OUT_EXT})"
         )
 
-        balance_info = balance_train_groups(
-            DATASET_DIR / "train" / "images",
-            DATASET_DIR / "train" / "labels",
-            clip_group=train_stats.get("clip_group") or {},
-        )
-        train_stats = refresh_train_stats_from_disk(train_stats)
-        train_stats["balance"] = balance_info
+        if balance:
+            balance_info = balance_train_groups(
+                dataset_dir / "train" / "images",
+                dataset_dir / "train" / "labels",
+                clip_group=train_stats.get("clip_group") or {},
+            )
+            train_stats = refresh_train_stats_from_disk(train_stats, dataset_dir)
+            train_stats["balance"] = balance_info
+        else:
+            balance_info = {"skipped": True, "reason": "no_balance"}
+            train_stats["balance"] = balance_info
+            print("Skipping train-group balance / rotation oversample.")
 
         print("Preparing val set from held-out train frames (no balance/augs)...")
-        val_stats = prepare_sliced_val_from_train_holdout(val_frames, imgsz=imgsz)
-        yaml_path = write_dataset_yaml(imgsz, train_stats, val_stats)
+        val_stats = prepare_sliced_val_from_train_holdout(
+            val_frames,
+            imgsz=imgsz,
+            dataset_dir=dataset_dir,
+        )
+        yaml_path = write_dataset_yaml(
+            imgsz,
+            train_stats,
+            val_stats,
+            dataset_dir=dataset_dir,
+        )
         manifest = {
+            "dataset_dir": str(dataset_dir.relative_to(PROJECT_ROOT))
+            if dataset_dir.is_relative_to(PROJECT_ROOT)
+            else str(dataset_dir),
             "imgsz": imgsz,
             "val_fraction": val_fraction,
             "val_seed": VAL_SPLIT_SEED,
             "val_source": "holdout_from_train_videos",
+            "frame_step_only": frame_step_only,
+            "balance": balance,
+            "empty_slices_per_frame": empty_cap,
+            "labels_root": str(labels_disp),
+            "augmentation": "none_at_prepare",
+            "tiling_source": "config/clip_tiling.json train_groups",
             "train": train_stats,
             "val": val_stats,
-            "balance": balance_info,
+            "balance_info": balance_info,
         }
-        (DATASET_DIR / "prepare_stats.json").write_text(
+        (dataset_dir / "prepare_stats.json").write_text(
             json.dumps(manifest, indent=2),
             encoding="utf-8",
         )
         print(f"Dataset ready: {yaml_path}")
-        summarize_dataset_size(train_stats, val_stats)
+        summarize_dataset_size(train_stats, val_stats, dataset_dir=dataset_dir)
         return yaml_path
 
-    yaml_path = DATASET_DIR / "data.yaml"
+    yaml_path = dataset_dir / "data.yaml"
     if not yaml_path.exists():
         raise SystemExit(
             f"Dataset images exist but {yaml_path} is missing. "
-            "Rebuild with: python src/train.py --recreate-dataset"
+            "Rebuild with: python src/training/train.py --recreate-dataset"
         )
-    print(f"Using existing dataset at {DATASET_DIR}")
-    stats_path = DATASET_DIR / "prepare_stats.json"
+    print(f"Using existing dataset at {dataset_dir}")
+    stats_path = dataset_dir / "prepare_stats.json"
     if stats_path.exists():
         manifest = json.loads(stats_path.read_text(encoding="utf-8"))
-        summarize_dataset_size(manifest.get("train") or {}, manifest.get("val") or {})
+        summarize_dataset_size(
+            manifest.get("train") or {},
+            manifest.get("val") or {},
+            dataset_dir=dataset_dir,
+        )
     return yaml_path
 
 
@@ -1560,47 +1716,75 @@ def train_model(
     return best_weights
 
 
-def dataset_already_prepared() -> bool:
-    yaml_path = DATASET_DIR / "data.yaml"
-    train_images = DATASET_DIR / "train" / "images"
+def dataset_already_prepared(dataset_dir: Path | None = None) -> bool:
+    root = (dataset_dir or DATASET_DIR).resolve()
+    yaml_path = root / "data.yaml"
+    train_images = root / "train" / "images"
     return yaml_path.exists() and train_images.is_dir() and any(train_images.glob(f"*{SLICE_OUT_EXT}"))
 
 
 def main() -> None:
     args = parse_args()
     split_map = build_split_map()
-    prepared = dataset_already_prepared() and not args.recreate_dataset
+
+    dataset_dir = args.dataset_dir
+    frame_step_only = bool(args.frame_step_only)
+    balance = not bool(args.no_balance)
+    imgsz = args.imgsz
+    if args.baseline:
+        dataset_dir = dataset_dir or BASELINE_DATASET_DIR
+        frame_step_only = True
+        balance = False
+        if imgsz == TRAIN_IMGSZ or args.imgsz == TRAIN_IMGSZ:
+            imgsz = TRAIN_IMGSZ
+        print(
+            "Baseline preset: frame_step_only=True, balance=False, "
+            f"imgsz={imgsz}, dataset_dir={dataset_dir}"
+        )
+    dataset_dir = (dataset_dir or DATASET_DIR).resolve()
+
+    prepared = dataset_already_prepared(dataset_dir) and not args.recreate_dataset
 
     if prepared:
-        yaml_meta = yaml.safe_load((DATASET_DIR / "data.yaml").read_text(encoding="utf-8"))
+        yaml_meta = yaml.safe_load((dataset_dir / "data.yaml").read_text(encoding="utf-8"))
         val_source = yaml_meta.get("val_source", "unknown")
-        print(f"Using prepared dataset at {DATASET_DIR} (val_source={val_source})")
+        print(f"Using prepared dataset at {dataset_dir} (val_source={val_source})")
     else:
         if not split_map:
             raise SystemExit("No clips found in data/train or data/eval.")
 
-        train_frames = iter_labeled_frames("train", split_map)
-        eval_frames = iter_labeled_frames("eval", split_map)
+        train_frames = iter_labeled_frames(
+            "train",
+            split_map,
+            frame_step_only=frame_step_only,
+        )
+        eval_frames = iter_labeled_frames(
+            "eval",
+            split_map,
+            frame_step_only=frame_step_only,
+        )
         print(f"Labeled frames: train={len(train_frames)}, eval={len(eval_frames)}")
         if not train_frames:
             raise SystemExit(
                 "No train labels under labels/train/. "
-                "Run autolabel_yworld.py, sync manual labels, or import Roboflow: "
-                "python labelling/roboflow/import_roboflow_dataset.py"
+                "Sync CVAT: python src/labeling/cvat_pull.py --verify --sync-labels"
             )
 
-    batch = args.batch if args.batch is not None else default_batch_size(args.imgsz)
+    batch = args.batch if args.batch is not None else default_batch_size(imgsz)
     workers = args.workers if args.workers is not None else default_workers()
     print(
         f"Device={DEVICE}, RAM≈{system_ram_gb():.0f}GB → "
-        f"batch={batch}, workers={workers}, cache={args.cache}, imgsz={args.imgsz}"
+        f"batch={batch}, workers={workers}, cache={args.cache}, imgsz={imgsz}"
     )
 
     yaml_path = prepare_dataset(
         split_map,
         recreate=args.recreate_dataset,
-        imgsz=args.imgsz,
+        imgsz=imgsz,
         val_fraction=args.val_fraction,
+        dataset_dir=dataset_dir,
+        frame_step_only=frame_step_only,
+        balance=balance,
     )
 
     if args.prepare_only:
@@ -1616,7 +1800,7 @@ def main() -> None:
 
     weights = train_model(
         yaml_path,
-        imgsz=args.imgsz,
+        imgsz=imgsz,
         warmup_epochs=args.warmup_epochs,
         epochs=args.epochs,
         batch=batch,

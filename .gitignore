@@ -1,7 +1,7 @@
 # --- Guides (local docs / PDF export) ---
 guides/
 
-# --- Node (guide PDF export) ---
+# --- Legacy: local guide PDF tooling (no package.json in repo anymore) ---
 node_modules/
 
 # --- Python / IDE ---
@@ -14,6 +14,7 @@ __pycache__/
 # --- Secrets / local env ---
 .env
 .env.*
+!.env.example
 .venv/
 venv/
 env/
@@ -27,10 +28,10 @@ env/
 # --- Extracted frames only (large; run extract_frames.py) ---
 data/frames/**
 
-# --- Pseudo-labels (regenerate: autolabel_yworld.py) ---
+# --- Labels (local; replaced by new CVAT export — not pushed to git) ---
 labels/
 
-# --- Probe / label debug artifacts (regenerate: probe_clips.py, autolabel) ---
+# --- Probe / label debug artifacts (regenerate: probe_clips.py) ---
 debug/
 
 # --- Manual labeling packs (large / regenerable; keep scripts + README) ---
@@ -70,14 +71,32 @@ runs/
 # --- Local-only experiment scripts (not committed) ---
 experiments/
 
-# --- MLflow / DVC (coming next; keep remotes/pointers in git later) ---
+# --- MLflow (local tracking; not in git) ---
 mlruns/
 mlflow.db
 .mlflow/
+mlflow_server/
+
+# --- Dataset versions: local only (never push blobs / *.dvc to GitLab) ---
+data/datasets/**
+!data/datasets/README.md
+!data/datasets/.gitignore
+data/dataset/
+
+# --- DVC: local cache + remote; do not rely on GitLab for dataset pointers ---
 .dvc/cache/
 .dvc/tmp/
 .dvc/tmp/**
 *.dvc.bak
+.dvc-storage/
+data/raw_export/
+data/raw_base/
+data/cvat/
+config/cvat_tasks.json
+
+# --- Autolabel demo outputs ---
+outputs/autolabel/
+
 
 # --- Matplotlib / cache dirs ---
 .matplotlib/

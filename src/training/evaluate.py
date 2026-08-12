@@ -1,7 +1,22 @@
 #!/usr/bin/env python3
 """Evaluate fine-tuned detector on eval clips; report metrics per distance band (0-200 m, 200-400 m)."""
-
 from __future__ import annotations
+
+import sys
+from pathlib import Path as _Path
+
+def _ensure_src_on_path() -> None:
+    """Allow `python src/<pkg>/….py` without PYTHONPATH."""
+    p = _Path(__file__).resolve().parent
+    while p != p.parent:
+        if (p / "common").is_dir() and (p / "labeling").is_dir():
+            s = str(p)
+            if s not in sys.path:
+                sys.path.insert(0, s)
+            return
+        p = p.parent
+
+_ensure_src_on_path()
 
 import argparse
 import json
@@ -16,7 +31,7 @@ import yaml
 from sahi.slicing import slice_image
 from ultralytics import YOLO
 
-from config import (
+from common.config import (
     CLIP_TILING_CONFIG_PATH,
     FRAMES_DIR,
     LABELS_DIR,
@@ -25,12 +40,14 @@ from config import (
     TRAIN_OVERLAP_RATIO,
     build_split_map,
     effective_slice_size,
+    is_clip_skipped,
+    clip_skip_reason,
     load_clip_tile_config,
     load_tiling_payload,
     resolve_clip_tile_config,
     resolve_train_group_tiling,
 )
-from detect import device
+from common.detect import device
 
 OUTPUTS_DIR = PROJECT_ROOT / "outputs"
 DATASET_DIR = OUTPUTS_DIR / "dataset"
@@ -128,8 +145,8 @@ def load_train_slice_config() -> TrainSliceConfig:
     raise SystemExit(
         f"Train dataset metadata not found ({DATASET_YAML} or {PREPARE_STATS}).\n"
         "Run train.py first so eval can match training tiles:\n"
-        "  python src/train.py --prepare-only\n"
-        "  python src/train.py --recreate-dataset"
+        "  python src/training/train.py --prepare-only\n"
+        "  python src/training/train.py --recreate-dataset"
     )
 
 
@@ -181,7 +198,7 @@ def verify_materialized_tile_size(slice_cfg: TrainSliceConfig) -> None:
                 f"Dataset tile size mismatch: {sample.name} is {width}×{height}, "
                 f"but metadata says slice≤{expected}×{expected} for {clip_name} "
                 f"({slice_cfg.source}).\n"
-                "Rebuild dataset: python src/train.py --recreate-dataset"
+                "Rebuild dataset: python src/training/train.py --recreate-dataset"
             )
         # One successful check is enough.
         return
@@ -798,7 +815,7 @@ def main() -> None:
     if not weights.exists():
         raise SystemExit(
             f"Weights not found: {weights}\n"
-            "Train first: python src/train.py"
+            "Train first: python src/training/train.py"
         )
 
     split_map = build_split_map()
@@ -828,7 +845,11 @@ def main() -> None:
         if split_map.get(clip) != "eval":
             raise SystemExit(f"Clip {clip!r} is not in data/eval.")
         if clip not in tile_config:
-            raise SystemExit(f"Clip {clip!r} missing from config/clip_tiling.json. Run probe_clips.py.")
+            raise SystemExit(f"Clip {clip!r} missing from config/clip_tiling.json. Run data/preprocess_clips.py.")
+        if is_clip_skipped(clip, tile_config):
+            raise SystemExit(
+                f"Clip {clip!r} is skipped: {clip_skip_reason(clip, tile_config)}"
+            )
 
     band_stats = {band: BandStats() for band in DEFAULT_BAND_CLIPS}
     video_dir = None if args.no_video else Path(args.video_dir)

@@ -1,56 +1,55 @@
 # Aerial Vehicle Detection — PoC Pipeline
 
-End-to-end pipeline for aerial vehicle detection: preprocess (tiling/size), **manual** YOLO labels, and fine-tuning a lightweight detector. Written as a working report: what was built, why, and where the trade-offs are.
+End-to-end aerial vehicle detection: preprocess → labels → fine-tune YOLO11s → eval.
 
 ```
 vehicle_detection/
 ├── README.md
 ├── requirements.txt
-├── .gitignore
-├── .gitattributes                  # Git LFS rules for videos
-├── yolov8x-worldv2.pt              # gitignored — download locally (probe + autolabel)
-├── config/
-│   └── clip_tiling.json            # preprocess tiles/size/step + train_groups
-├── checkpoints/
-│   └── yolov8n_vehicle_best.pt     # git-tracked (≈23 MB, copied by train.py)
-├── data/
-│   ├── train/*.mp4                 # Git LFS
-│   ├── eval/*.mp4                  # Git LFS
-│   └── frames/                     # gitignored — extract_frames.py
-├── labels/                         # gitignored — autolabel_yworld.py
-│   ├── train/{clip}/*.txt
-│   └── eval/{clip}/*.txt
-├── labelling/                      # manual labeling (CVAT + Roboflow)
-│   ├── cvat/                       # label_man/, coco_export/, compare_labels.py
-│   └── roboflow/                   # scripts + Vehicle_roboflow/, upload packs
-├── debug/                          # gitignored — preprocess, autolabel
-│   ├── tile_probe.json
-│   ├── preprocess_probe.json       # preprocess_clips.py report
-│   ├── train_tile_samples/         # sample_train_tiles.py
-│   ├── label_stats.json
-│   ├── compare_labels_report.txt   # labelling/cvat/compare_labels.py
-│   └── {clip}/                     # cache/, labels_debug.mp4, confidence_hist.png
-├── outputs/                        # mostly gitignored
-│   ├── dataset/                    # gitignored — SAHI train/val slices
-│   ├── eval_videos/*_predictions.mp4  # Git LFS — evaluate.py overlays
-│   ├── eval_metrics.json           # evaluate.py metrics (JSON)
-│   └── metrics_table.md            # evaluate.py metrics (table)
-└── src/
-    ├── extract_frames.py           # 1. video → frames
-    ├── preprocess_clips.py         # 2. start/mid/end car probe → clip_tiling.json
-    ├── probe_clips.py              # alias → preprocess_clips.py
-    ├── image_enhance.py            # optional CLAHE (--enhance) for YOLO-World experiments
-    ├── sample_train_tiles.py       # optional: sample car tiles at label slice size
-    ├── label_box_stats.py          # optional post-label size QA (+ legacy scale_coeff)
-    ├── autolabel_yworld.py         # legacy optional pseudo-labels
-    ├── aug_config.py               # HSV / flip / rotate (mosaic off); experiment presets
-    ├── train.py                    # 4. fine-tune YOLO11s
-    ├── evaluate.py                 # 5. metrics + prediction videos
-    ├── config.py                   # paths, split map, tiling helpers
-    └── detect.py                   # YOLO-World, SAHI, distance
+├── params.yaml / dvc.yaml
+├── config/                 # clip_tiling.json
+├── src/
+│   ├── common/             # config, detect (YOLO-World), aug, enhance
+│   ├── data/               # extract_frames, preprocess_clips
+│   ├── labeling/           # CVAT, autolabel demo, QA, roboflow/
+│   └── training/           # train, evaluate, prepare_baseline
+├── data/train|eval|frames/ # videos (LFS) + extracted frames
+├── data/cvat/              # CVAT label pulls (gitignored)
+├── data/datasets/          # local dataset versions only (gitignored blobs)
+├── labels/                 # GT YOLO txt for training (gitignored)
+├── labelling/              # annotation artifacts only (CVAT/Roboflow packs)
+├── outputs/                # runs, autolabel/, eval
+└── checkpoints/            # tracked deliverable weights
 ```
 
-**Legend:** plain paths = committed to git · `Git LFS` = large videos · `gitignored` = local only, regenerate from scripts.
+Run from repo root: `python src/<package>/<script>.py`.
+
+### Labels from CVAT
+
+```bash
+cp .env.example .env   # once — fill CVAT_HOST / CVAT_USER / CVAT_PASS [/ CVAT_PROJECT]
+python src/labeling/cvat_pull.py --list
+python src/labeling/cvat_pull.py --verify --sync-labels   # → labels/
+```
+
+Or set `CVAT_PROJECT` in `.env`. Split comes from `data/train` vs `data/eval`.
+
+### Dataset versions (local only)
+
+Prepared packs live under `data/datasets/` — **not pushed to GitLab** (only `data/datasets/README.md` is tracked).
+
+```bash
+# Human / CVAT GT baseline (frame_step, train_groups ~1024, no prepare augs)
+python src/training/prepare_baseline.py
+# → data/datasets/baseline_v1/
+
+# Optional: pseudo baseline from YOLO-World autolabel (smoke / comparison only)
+python src/labeling/autolabel.py
+python src/training/prepare_baseline.py --from-autolabel
+# → data/datasets/baseline_v0/
+```
+
+Train against a pack: `python src/training/train.py --dataset-dir data/datasets/baseline_v1`.
 
 ---
 
@@ -68,7 +67,7 @@ vehicle_detection/
 - fine-tuned detector weights in `outputs/runs/` / `checkpoints/`
 - per-band metrics in `outputs/` (after training)
 
-**Labeling policy:** we do **not** auto-label every frame with YOLO-World anymore. GT for train/eval comes from **human labels** for the clips that matter. YOLO-World remains only as a **preprocess probe** (tiles, car size, distance drift, `frame_step`) and an optional experiment (`--enhance`).
+**Labeling policy:** training GT = **human / CVAT** in `labels/`. YOLO-World is (1) preprocess probe and (2) optional demo `python src/labeling/autolabel.py` (frame_step frames only → `outputs/autolabel/`, not GT).
 
 **What counts as `vehicle` (single class `0`):** a **self-propelled unit with an engine** (самохідна одиниця з двигуном). A trailer / other non-powered attachment is **not** a vehicle.
 
@@ -100,19 +99,19 @@ flowchart TB
 
     V(data/train · eval .mp4):::data
 
-    S1[extract_frames.py]:::script
+    S1[data/extract_frames.py]:::script
     F(data/frames/):::data
 
-    S2[preprocess_clips.py]:::script
+    S2[data/preprocess_clips.py]:::script
     CFG(config/clip_tiling.json<br/>tiles · size · step · train_groups):::data
 
     MAN[manual labels<br/>CVAT / Roboflow]:::data
     LAB(labels/):::data
 
-    S4[train.py]:::script
+    S4[training/train.py]:::script
     WT(outputs/runs/best.pt):::output
 
-    S5[evaluate.py]:::script
+    S5[training/evaluate.py]:::script
     MET(outputs/metrics · eval_videos/):::output
 
     V --> S1 --> F
@@ -127,22 +126,25 @@ flowchart TB
     S5 --> MET
 ```
 
-**Tile sizing has two layers:** `preprocess_clips.py` (YOLO-World **probe only**) sets car size / distance / `frame_step` / suggested tiles; **`train_groups`** set **train/eval** crops. GT boxes for training come from **manual** labels in `labels/`, not from `autolabel_yworld.py`.
+**Tile sizing has two layers:** `data/preprocess_clips.py` (YOLO-World probe) sets size / distance / `frame_step`; **`train_groups`** set train/eval crops. GT = `labels/`. Demo autolabel: `python src/labeling/autolabel.py` → `outputs/autolabel/`.
 
 ### How to run (defaults vs options)
 
 Run from the repo root. For clip-scoped scripts, `NAME` is the video stem (e.g. `266987`) or a `.mp4` filename.
 
 
-| Script                  | No extra args                                                                                                     | `--clip NAME` | Other useful flags                                                                                                       |
-| ----------------------- | ----------------------------------------------------------------------------------------------------------------- | ------------- | ------------------------------------------------------------------------------------------------------------------------ |
-| `extract_frames.py`     | All `.mp4` in `data/train/` and `data/eval/` → `data/frames/{clip}/`                                              | One clip only | —                                                                                                                        |
-| `preprocess_clips.py`   | Start/middle/end car probe → `clip_tiling.json` (tiles, size, distance drift, frame_step) + `debug/preprocess_probe.json` | One clip only | `--per-segment N` (default 3); `--step-fraction 0.5`; `--enhance` (CLAHE); `probe_clips.py` is an alias |
-| `sample_train_tiles.py` | Sample car tiles at label slice size → `debug/train_tile_samples/` + size summary                                 | One clip only | `--per-clip N` (default 2); needs existing `labels/`                                                                     |
-| `label_box_stats.py`    | Optional post-label bbox QA (+ legacy `scale_coeff`) → `debug/label_box_stats.json` | One clip only | `--no-write-scale-coeff`; `--imgsz N`; `--target-px 64` |
-| `autolabel_yworld.py`   | **Legacy / optional** — full pseudo-label pass (not the default GT path)                                          | One clip only | `--enhance` (experimental CLAHE)                                                                                         |
-| `compare_labels.py`     | Compare `labelling/cvat/label_man/` vs `labels/` → console + `debug/compare_labels_report.txt`                     | One clip only | run: `python labelling/cvat/compare_labels.py`; `--iou 0.5`; `--out PATH`                                               |
-| `train.py`              | Build dataset if missing, train, copy `best.pt` → `checkpoints/` | —             | `--prepare-only`; `--recreate-dataset`; `--batch N`; aug: HSV+flips+180° rotate (`aug_config.py`, mosaic off) |
+| Script | No extra args | `--clip NAME` | Other useful flags |
+| ------ | ------------- | ------------- | ------------------ |
+| `src/data/extract_frames.py` | All `.mp4` in `data/train/` and `data/eval/` → `data/frames/{clip}/` | One clip only | — |
+| `src/data/preprocess_clips.py` | Start/middle/end car probe → `clip_tiling.json` + `debug/preprocess_probe.json` | One clip only | `--per-segment N`; `--step-fraction 0.5`; `--enhance`; `probe_clips.py` alias |
+| `src/labeling/sample_tiles.py` | Sample car tiles at label slice size → `debug/train_tile_samples/` | One clip | `--per-clip N` |
+| `src/labeling/stats.py` | Bbox size QA → `debug/label_box_stats.json` | One clip | |
+| `src/labeling/autolabel.py` | Demo YOLO-World on `frame_step` frames → `outputs/autolabel/` | One clip | `--frame-step`; `--enhance` |
+| `src/labeling/compare.py` | `labelling/cvat/label_man/` vs `labels/` | One clip | `--iou 0.5` |
+| `src/labeling/cvat_pull.py` | Pull CVAT labels → `data/cvat/` + optional `labels/` | `--task` | `--with-images`; `--verify`; `--sync-labels` |
+| `src/training/prepare_baseline.py` | Versioned dataset under `data/datasets/` (frame_step, no prepare augs) | — | `--from-autolabel` → `baseline_v0`; default `baseline_v1` |
+| `src/training/train.py` | Build dataset if missing, train, copy `best.pt` → `checkpoints/` | — | `--prepare-only`; `--recreate-dataset`; `--dataset-dir`; `--baseline` |
+| `src/training/evaluate.py` | Eval clips per band, metrics + prediction videos | — | `--no-video`; `--weights PATH`; `--clips A B`; `--conf FLOAT` |
 
 
 Online aug (for sparse `frame_step` labels): `hsv_h/s/v`, `fliplr`/`flipud`, `degrees=180`. Mosaic is **off** in main train. Short mosaic A/B lives in local `experiments/train_aug_probe.py` (gitignored):
@@ -151,37 +153,35 @@ Online aug (for sparse `frame_step` labels): `hsv_h/s/v`, `fliplr`/`flipud`, `de
 python experiments/train_aug_probe.py          # 1+3 epochs, mosaic=1.0
 python experiments/train_aug_probe.py --epochs 5
 ```
-| `evaluate.py`           | Eval clips per band, metrics + prediction videos                 | —             | `--no-video`; `--weights PATH`; `--clips A B`; `--conf FLOAT` |
-
 
 ### Wall time (Apple Silicon MPS, this PoC)
 
 | Stage | Typical wall time | Notes |
 | ----- | ----------------- | ----- |
-| Legacy auto-label (`autolabel_yworld.py`, 6 clips) | **1 h 2 m 44 s** | Historical; not required when GT is manual |
+| Demo auto-label (old full-frame pass, 6 clips) | **1 h 2 m 44 s** | Historical; new demo uses `frame_step` only → much fewer frames |
 | Train (`train.py`, 15 epochs) | **≈12.3 h** training loop (**≈13 h** wall) | imgsz=1280, batch=12, MPS; Ultralytics `results.csv` epoch-15 cumulative time ≈ 44390 s |
 | Eval (`evaluate.py`, 2 clips + videos) | **≈7 m 17 s** | Measured 2026-07-14: ≈6.1 frame/s infer on MPS; video encode ≈1–1.5 min/clip. `--no-video` ≈ infer only (≈5 min). |
 
 Frame extraction + preprocess are short (minutes). With **manual** labels, end-to-end is dominated by **train** (and labeling time outside this repo).
 
-**Typical run** (manual GT):
+**Typical run** (manual GT → baseline → train):
 
 ```bash
-python src/extract_frames.py
-python src/preprocess_clips.py          # tiles / size / frame_step only
-# put human YOLO labels into labels/{train|eval}/{clip}/*.txt
-#   (from labelling/cvat/label_man or Roboflow export)
-python src/train.py --recreate-dataset
-python src/evaluate.py
+python src/data/extract_frames.py
+python src/data/preprocess_clips.py
+python src/labeling/cvat_pull.py --verify --sync-labels   # → labels/
+python src/training/prepare_baseline.py                   # → data/datasets/baseline_v1/
+python src/training/train.py --dataset-dir data/datasets/baseline_v1
+python src/training/evaluate.py
 ```
 
 **Single-clip iteration:**
 
 ```bash
-python src/extract_frames.py --clip NAME
-python src/preprocess_clips.py --clip NAME
+python src/data/extract_frames.py --clip NAME
+python src/data/preprocess_clips.py --clip NAME
 # add/update manual labels under labels/.../NAME/
-python src/train.py --recreate-dataset   # when ready to retrain
+python src/training/train.py --recreate-dataset   # when ready to retrain
 ```
 
 ---
@@ -190,7 +190,7 @@ python src/train.py --recreate-dataset   # when ready to retrain
 
 ## 3. Preprocess: tiles, car size, distance drift, frame_step
 
-`preprocess_clips.py` (alias: `probe_clips.py`) runs after frame extraction and before labeling. One pass writes everything needed for tiling / labeling density into `config/clip_tiling.json`.
+`data/preprocess_clips.py` (alias: `probe_clips.py`) runs after frame extraction and before labeling. One pass writes everything needed for tiling / labeling density into `config/clip_tiling.json`.
 
 ### How it works
 
@@ -208,7 +208,7 @@ If no tile level finds a car: **fallback** to 12 tiles @ threshold 0.1.
 
 Why headroom: the ladder stops when the **largest** car is visible. Smaller/farther cars often need the next tile step.
 
-`label_box_stats.py` remains an **optional post-label QA** (all vehicle boxes after full autolabel); it is no longer required to decide tiles / step / size for preprocess.
+`src/labeling/stats.py` remains optional post-label QA; it is not required for preprocess tiles / step / size.
 
 ### Distance
 
@@ -252,7 +252,7 @@ YOLO-World often tags top-down cars as `person` (known COCO quirk). During **pre
 
 ### Preprocess results per clip (legacy table from 2026-07-13 middle-only probe)
 
-Re-run `python src/preprocess_clips.py` to refresh sizes / `frame_step` / `distance_varies` with the start–middle–end sampler. Older values:
+Re-run `python src/data/preprocess_clips.py` to refresh sizes / `frame_step` / `distance_varies` with the start–middle–end sampler. Older values:
 
 
 | Split | Clip                          | Probe min | Label tiles | Threshold | Est. distance (probe) | Band   |
@@ -272,7 +272,7 @@ Re-run `python src/preprocess_clips.py` to refresh sizes / `frame_step` / `dista
 After preprocess (and once labels exist), inspect what cars look like at the labeling slice size:
 
 ```bash
-python src/sample_train_tiles.py
+python src/labeling/sample_tiles.py
 ```
 
 Writes a few car tiles per clip under `debug/train_tile_samples/` and a `manifest.json` with per-clip `slice_size` plus mean / suggested shared tile side — useful when deciding whether 1080p-far and 4K-mid tiles are close enough to share one train `imgsz`.
@@ -281,47 +281,80 @@ Writes a few car tiles per clip under `debug/train_tile_samples/` and a `manifes
 
 
 
-## 5. Why YOLO-World (preprocess probe only)
+## 5. Why YOLO-World (probe + demo autolabel)
 
-YOLO-World (`yolov8x-worldv2.pt`) is **not** the source of training GT anymore. It is used in `preprocess_clips.py` to estimate tiles / car size / distance / `frame_step` on a handful of frames (start–middle–end).
+YOLO-World (`yolov8x-worldv2.pt`) is **not** training GT. It is used to:
 
-`autolabel_yworld.py` (full-clip pseudo-labels) is kept as **legacy / optional** for experiments and old comparisons — default training assumes **manual** boxes in `labels/`.
+1. **Preprocess probe** (`data/preprocess_clips.py`) — tiles / car size / distance / `frame_step` on a few start–middle–end frames.
+2. **Demo autolabel** (`python src/labeling/autolabel.py`) — pseudo-label **only** `frame_step` frames with vehicle prompts → `outputs/autolabel/` (not GT).
 
-**Caveat if you still run autolabel:** quality on top-down drone footage is limited; treat outputs as noisy suggestions, not GT.
+**Caveat:** top-down drone quality is limited; treat demo boxes as noisy suggestions, then replace with CVAT.
 
 ---
 
 
 
-## 6. Labeling workflow (manual GT)
+## 6. Labeling + dataset versions
 
-**Default path:** human labels (CVAT under `labelling/cvat/label_man/`, Roboflow under `labelling/roboflow/`, etc.) exported as YOLO `class xc yc w h`, then placed at:
+### 6.1 Labels (GT)
+
+**Training GT** = human / CVAT in `labels/` (gitignored). Layout:
 
 ```
 labels/{train|eval}/{clip}/{frame_stem}.txt
 ```
 
-matching `data/frames/{clip}/{frame_stem}.jpg`. Use `frame_step` from preprocess as a guide for how densely to annotate; empty `.txt` = no vehicles on that frame.
+matching `data/frames/{clip}/{frame_stem}.jpg`. Empty `.txt` = no vehicles. Use preprocess `frame_step` as the annotation density guide.
 
-`train.py` / `evaluate.py` read **`labels/`** only — keep that tree in sync with your manual exports.
+```bash
+# Preferred: pull from CVAT
+python src/labeling/cvat_pull.py --verify --sync-labels
 
-### Legacy: `autolabel_yworld.py` (optional)
+# Or place exports manually / from labelling/cvat/label_man, Roboflow, etc.
+```
 
-Full-clip YOLO-World pass with SAHI / ByteTrack and track post-processing. Historical runtime on 6 clips: **~1 h** (MPS). Outputs under `labels/` and `debug/{clip}/`. Prefer manual GT for training; use this only for ablation or bootstrap.
+`train.py` / `evaluate.py` / `prepare_baseline.py` read the label tree you point at (default `labels/`).
 
-### Outputs (either source)
+### 6.2 Demo autolabel (not GT)
 
+YOLO-World on `frame_step` frames only → `outputs/autolabel/labels/` (never writes into `labels/`).
 
-| Path                               | Content                          |
-| ---------------------------------- | -------------------------------- |
-| `labels/{split}/{clip}/*.txt`      | YOLO format, class `0` (train/eval GT) |
-| `labelling/cvat/label_man/`        | CVAT exports (source of truth for manual) |
-| `debug/{clip}/…`                   | Only if legacy autolabel / debug video ran |
+```bash
+python src/data/preprocess_clips.py
+python src/labeling/autolabel.py --clip 266987
+```
+
+### 6.3 Prepare baseline datasets (local only)
+
+Versioned Ultralytics packs under `data/datasets/` — **local disk only; not for GitLab** (see `data/datasets/README.md`). Same rules for every version: `frame_step` frames, `train_groups` tiling (~1024), **no** prepare-time balance/rotations.
+
+| Name | Label source | Command |
+| ---- | ------------ | ------- |
+| `baseline_v1` | `labels/` (CVAT / human) | `python src/training/prepare_baseline.py` |
+| `baseline_v0` | `outputs/autolabel/labels/` (pseudo) | `python src/training/prepare_baseline.py --from-autolabel` |
+
+```bash
+python src/training/prepare_baseline.py
+# optional local DVC cache (still not GitLab):
+#   dvc add data/datasets/baseline_v1 && dvc push
+
+python src/training/train.py --dataset-dir data/datasets/baseline_v1
+```
+
+### Outputs
+
+| Path | Content |
+| ---- | ------- |
+| `labels/{split}/{clip}/*.txt` | YOLO class `0` (train/eval GT) |
+| `labelling/cvat/label_man/` | CVAT manual exports |
+| `outputs/autolabel/` | Demo YOLO-World (not GT) |
+| `data/datasets/baseline_v1/` | GT baseline pack (local) |
+| `data/datasets/baseline_v0/` | Autolabel pseudo pack (local, optional) |
 
 
 ### Historical auto-label counts (legacy)
 
-After the old full `autolabel_yworld.py` pass (not required now):
+After the old **full-frame** pass (before `frame_step` subsampling):
 
 
 | Split | Clips | Labeled frames |
@@ -347,12 +380,12 @@ From `label_box_stats.py` → `debug/label_box_stats.json` (2026-07-13 labels).
 Train aggregate mean ≈ **115 px**; eval aggregate mean ≈ **300 px**. Far/HD clip `8968356` is the smallest (~22 px); close eval `13722965` is the largest (~348 px). Recompute anytime with:
 
 ```bash
-python src/label_box_stats.py --no-write-scale-coeff
+python src/labeling/stats.py --no-write-scale-coeff
 ```
 
 ### Suggested label `frame_step` (per clip)
 
-Computed by **`preprocess_clips.py`** (car-only size + consecutive-frame speed) and stored on each clip in `clip_tiling.json` as `frame_step`:
+Computed by **`data/preprocess_clips.py`** (car-only size + consecutive-frame speed) and stored on each clip in `clip_tiling.json` as `frame_step`:
 
 \[
 \texttt{frame\_step} = \left\lfloor \frac{\texttt{object\_size\_px} \times \texttt{fraction}}{\texttt{speed\_px\_per\_frame}} \right\rfloor
@@ -373,13 +406,13 @@ Historical table (from full autolabels, before preprocess wrote `frame_step`):
 | eval | `13722965_2160_3840_30fps` | 30 | 368.7 | 9.4 | 9 | **19** | 39 |
 | eval | `266987` | 30 | 133.3 | 18.3 | 1 | **3** | 7 |
 
-Recompute with: `python src/preprocess_clips.py`. Pipeline still extracts/labels every frame by default; `frame_step` guides thinner manual labeling or future subsampled extract.
+Recompute with: `python src/data/preprocess_clips.py`. Pipeline still extracts/labels every frame by default; `frame_step` guides thinner manual labeling or future subsampled extract.
 
 ### Manual QA (CVAT + Roboflow) vs autolabel
 
 #### Unusable train video: `8968356-hd_1920_1080_30fps`
 
-This HD clip (1920×1080) is **not usable for normal full-frame YOLO training**. Cars are too small on screen: autolabel mean long-side ≈ **22 px**; after letterbox to imgsz 640 they shrink further (~5–10 px). YOLO needs roughly **≳16–32 px** at model input (comfortable **≳32–64 px**).
+Marked in `config/clip_tiling.json` as `"skip": true` (objects ~17 px). Preprocess, autolabel, train, eval, and QA scripts skip it by default (`--include-skipped` to force). Removed from `train_groups.C_far`.
 
 **Tiling does not fix missing pixels.** A crop + upsample (e.g. `C_far`: 640-tile → imgsz 960) only changes how large the blob appears at the model input (~18 px → ~27 px). It does **not** invent wheels/edges that were never resolved in the original ~15–20 px car. So tiling avoids the worst full-frame *downsampling*, but for `8968356` the native object resolution is still too low — treat the clip as **unusable**, not “saveable with tiles.”
 
@@ -424,7 +457,7 @@ Manual YOLO labels from CVAT:
 Manual = GT, auto = pred. Greedy best-IoU matching. Regenerated with:
 
 ```bash
-python labelling/cvat/compare_labels.py
+python src/labeling/compare.py
 # → debug/compare_labels_report.txt
 ```
 
@@ -465,7 +498,7 @@ python labelling/cvat/compare_labels.py
 | YOLO imgsz  | **640** default model input (`--imgsz`); C_far predict prefers **960**             |
 | Train crop  | **Per-group** `tile_size` from `train_groups` in `clip_tiling.json` (from object size) |
 | Negatives   | Train: up to 2 empty tiles/frame; val: labeled tiles only                          |
-| Augment     | HSV + fliplr/flipud + degrees=180 (`src/aug_config.py`); **mosaic off** (see `experiments/`) |
+| Augment     | HSV + fliplr/flipud + degrees=180 (`src/common/aug_config.py`); **mosaic off** (see `experiments/`) |
 | Class       | `vehicle` (single class)                                                           |
 | Weights     | `outputs/runs/yolo11s_vehicle/.../best.pt` → `checkpoints/yolo11s_vehicle_best.pt` |
 
@@ -476,17 +509,14 @@ Crops are **not** from the old `scale_coeff` formula. They come from explicit gr
 
 | Group | Videos | tile_size | overlap | train_imgsz | Why |
 | ----- | ------ | --------: | ------: | ----------: | --- |
-| `C_far` | `8968356` | **640** | 0.20 | **960** | tiny (~22 px) → tile + upsample |
-| `B_medium` | `5382494` | **960** | 0.18 | **640** | mid (~65 px) → tile then down to 640 |
-| `A_close` | `266987`, `3405804`, `8457857`, `13722965` | **null** (full frame) | — | **640** | large cars → letterbox full frame |
+| `C_far` | *(none active)* | **768** | 0.20 | **1024** | reserved for tiny objects |
+| `B_medium` | `5382494` | **1024** | 0.20 | **1024** | mid-size → tile 1024 |
+| `A_close` | `266987`, `3405804`, `8457857`, `13722965` | **null** (full frame) | — | **1024** | large cars → letterbox full frame |
 
-Approx object long-side **at model input** with this scheme: ~33 px (far), ~43 px (medium), ~40–48 px (close train), ~103 px (very close eval).
-
-One Ultralytics run uses a **single** `--imgsz` (default **640**). Group `train_imgsz` is used at **eval/predict** time (so C_far still predicts at 960). Rebuild the dataset after changing groups:
+One Ultralytics run uses a **single** `--imgsz` (baseline default **1024**). Rebuild a local pack after changing groups:
 
 ```bash
-python -u src/train.py --recreate-dataset
-python src/train.py --prepare-only
+python src/training/prepare_baseline.py
 ```
 
 **Train / val / eval alignment**
@@ -500,9 +530,9 @@ python src/train.py --prepare-only
 
 
 ```bash
-python -u src/train.py                    # reuse dataset; auto batch/cache for MPS
-python -u src/train.py --recreate-dataset # rebuild tiles + train
-python src/train.py --prepare-only        # dataset only
+python -u src/training/train.py                    # reuse dataset; auto batch/cache for MPS
+python -u src/training/train.py --recreate-dataset # rebuild tiles + train
+python src/training/train.py --prepare-only        # dataset only
 ```
 
 On Apple Silicon, `train.py` applies an MPS `unique()` workaround, uses `cache=disk`, modest dataloader workers, and auto batch (e.g. 4 @640 on 16GB for YOLO11s). If MPS OOMs it halves batch and retries.
@@ -534,8 +564,8 @@ Matching at IoU 0.5. With manual GT, metrics measure real detector quality. Hist
 **Prediction videos:** for each eval clip, `evaluate.py` writes an overlay to `outputs/eval_videos/{clip}_predictions.mp4` (**Git LFS**, committed with the repo). Metrics use only labeled frames; the video runs over all extracted frames. See **§2** for `--no-video`, `--weights`, `--clips`, `--conf`.
 
 ```bash
-python src/evaluate.py              # metrics + videos (default clips & weights)
-python src/evaluate.py --no-video   # metrics only, faster
+python src/training/evaluate.py              # metrics + videos (default clips & weights)
+python src/training/evaluate.py --no-video   # metrics only, faster
 ```
 
 **Runtime:** measured **7 m 17 s** wall for the two default clips with prediction videos (MPS, 2026-07-14): ≈**6.1 frame/s** infer each; video writing ≈53 s / ≈85 s. Without videos (`--no-video`) expect roughly the infer total (≈5 min). Timer output is also in `outputs/eval_metrics.json` → `timing`.
@@ -572,7 +602,7 @@ Full report: `outputs/metrics_table.md`, `outputs/eval_metrics.json`. Prediction
 
 ## 9. Ideas for improvement
 
-- **CLAHE A/B (`--enhance`)** — Optional contrast boost before YOLO-World (`src/image_enhance.py`). Off by default. Compare preprocess/autolabel with vs without on one clip before adopting.
+- **CLAHE A/B (`--enhance`)** — Optional contrast boost before YOLO-World (`src/common/image_enhance.py`). Off by default. Compare preprocess/autolabel with vs without on one clip before adopting.
 - **Cut close-band false alarms** — Stronger tile NMS, slightly higher conf on `<200m`, or suppress duplicate boxes across overlap.
 - **Confirmed-only train tiles** — Keep empty tiles (negatives) and tiles where every label is confirmed via cache confidence + stable track; drop borderline / slice-boundary boxes.
 - **Confidence-weighted training** — Keep uncertain tiles but down-weight loss by confidence / track metadata instead of dropping them.

@@ -8,7 +8,7 @@ import re
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from config import PROJECT_ROOT, PROBE_CLASS_ALIASES, RAW_CONFIDENCE_THRESHOLD, overlap_for_tiles
+from common.config import PROJECT_ROOT, PROBE_CLASS_ALIASES, RAW_CONFIDENCE_THRESHOLD, overlap_for_tiles
 from sahi.predict import get_sliced_prediction
 
 if TYPE_CHECKING:
@@ -28,7 +28,10 @@ DEFAULT_FOCAL_LENGTH_MM = 24.0
 def device() -> str:
     import torch
 
-    return "mps" if torch.backends.mps.is_available() else "cpu"
+    # Prefer MPS when the backend is built and usable (not deprecated torch.has_mps).
+    if torch.backends.mps.is_built() and torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
 
 
 def compute_slice_size(width: int, height: int, target_tiles: int) -> tuple[int, int]:
@@ -130,7 +133,7 @@ def detect_frame_sahi(
     default_subclass: str = "vehicle",
     enhance: bool = False,
 ) -> list[dict]:
-    from image_enhance import inference_source
+    from common.image_enhance import inference_source
 
     source = inference_source(image_path, enhance=enhance)
     result = get_sliced_prediction(
@@ -161,7 +164,7 @@ def detect_frame_probe(
     *,
     enhance: bool = False,
 ) -> list[dict]:
-    from image_enhance import inference_source
+    from common.image_enhance import inference_source
 
     source = inference_source(frame_path, enhance=enhance)
     if target_tiles <= 1:

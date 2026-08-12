@@ -1,11 +1,30 @@
 #!/usr/bin/env python3
 """Extract every frame from videos and save clip metadata (step 1 of pipeline)."""
+from __future__ import annotations
+
+import sys
+from pathlib import Path as _Path
+
+def _ensure_src_on_path() -> None:
+    """Allow `python src/<pkg>/….py` without PYTHONPATH."""
+    p = _Path(__file__).resolve().parent
+    while p != p.parent:
+        if (p / "common").is_dir() and (p / "labeling").is_dir():
+            s = str(p)
+            if s not in sys.path:
+                sys.path.insert(0, s)
+            return
+        p = p.parent
+
+_ensure_src_on_path()
 
 import argparse
 import json
 from pathlib import Path
 
 import cv2
+
+from common.config import clip_skip_reason, is_clip_skipped, reject_if_clip_skipped
 
 SOURCE_DIRS = ("data/train", "data/eval")
 FRAMES_DIR = Path("data/frames")
@@ -61,6 +80,11 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Extract a single clip (video stem). Default: all videos.",
     )
+    parser.add_argument(
+        "--include-skipped",
+        action="store_true",
+        help="Also extract clips marked skip=true in clip_tiling.json.",
+    )
     return parser.parse_args()
 
 
@@ -74,6 +98,9 @@ def main() -> None:
     frames_root = project_root / FRAMES_DIR
     found = False
 
+    if clip_filter:
+        reject_if_clip_skipped(clip_filter, allow_skipped=args.include_skipped)
+
     for source in SOURCE_DIRS:
         source_dir = project_root / source
         if not source_dir.is_dir():
@@ -83,6 +110,9 @@ def main() -> None:
         for video_path in iter_videos(source_dir):
             clip_name = video_path.stem
             if clip_filter and clip_name != clip_filter:
+                continue
+            if not args.include_skipped and is_clip_skipped(clip_name):
+                print(f"Skipping {clip_name}: {clip_skip_reason(clip_name)}")
                 continue
             found = True
             output_dir = frames_root / clip_name

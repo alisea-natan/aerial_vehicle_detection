@@ -1,23 +1,37 @@
 #!/usr/bin/env python3
 """Attach missing YOLO labels to images already in Roboflow.
 
-Skips empty .txt (API rejects them as Unrecognized annotation format).
-Uses image_id + overwrite — does not re-upload images.
-
-  python labelling/roboflow/retry_roboflow_annotations.py
+  # ROBOFLOW_API_KEY in .env (see .env.example)
+  python src/labeling/roboflow/retry_roboflow_annotations.py
 """
-
 from __future__ import annotations
 
+import sys
+from pathlib import Path as _Path
+
+def _ensure_src_on_path() -> None:
+    """Allow `python src/<pkg>/….py` without PYTHONPATH."""
+    p = _Path(__file__).resolve().parent
+    while p != p.parent:
+        if (p / "common").is_dir() and (p / "labeling").is_dir():
+            s = str(p)
+            if s not in sys.path:
+                sys.path.insert(0, s)
+            return
+        p = p.parent
+
+_ensure_src_on_path()
+
+from common.config import PROJECT_ROOT
+
+import os
 import time
-from pathlib import Path
 
 import roboflow
 
-HERE = Path(__file__).resolve().parent
-DATASET = HERE / "roboflow_upload"
+
+DATASET = PROJECT_ROOT / "labelling" / "roboflow" / "roboflow_upload"
 PROJECT = "vehicle-cige6"
-api_key = "6fDavmzCe6KEWpM0GZxg"
 LABELMAP = {0: "vehicle"}
 
 
@@ -39,6 +53,10 @@ def iter_project_images(project):
 
 
 def main() -> None:
+    api_key = os.environ.get("ROBOFLOW_API_KEY", "").strip()
+    if not api_key:
+        raise SystemExit("Set ROBOFLOW_API_KEY in .env (see .env.example)")
+
     labels_dir = DATASET / "test" / "labels"
     if not labels_dir.is_dir():
         raise SystemExit(f"Missing {labels_dir}")
@@ -46,7 +64,7 @@ def main() -> None:
     local = {}
     for txt in sorted(labels_dir.glob("*.txt")):
         if not txt.read_text(encoding="utf-8").strip():
-            continue  # null — skip; API cannot accept empty YOLO
+            continue
         local[txt.stem + ".jpg"] = txt
 
     print(f"local non-empty labels: {len(local)}")
@@ -83,13 +101,9 @@ def main() -> None:
         except Exception as e:
             fail += 1
             print(f"[FAIL] {name} ({image_id}): {e}")
-        time.sleep(0.15)  # ease rate limits / SDK races
+        time.sleep(0.15)
 
-    print(
-        f"Done: ok={ok} fail={fail} "
-        f"not_in_project={skip_missing} "
-        f"empty_txt_skipped={sum(1 for p in labels_dir.glob('*.txt') if not p.read_text().strip())}"
-    )
+    print(f"Done: ok={ok} fail={fail} not_in_project={skip_missing}")
 
 
 if __name__ == "__main__":

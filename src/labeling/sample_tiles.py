@@ -1,10 +1,25 @@
 #!/usr/bin/env python3
-"""Save a few car tiles per clip at the autolabel SAHI slice size (target_tiles).
+"""Sample car tiles at labeling SAHI slice size (QA).
 
-Useful QA for labeling resolution; train uses a separate scale_coeff crop (§7).
+  python src/labeling/sample_tiles.py
 """
-
 from __future__ import annotations
+
+import sys
+from pathlib import Path as _Path
+
+def _ensure_src_on_path() -> None:
+    """Allow `python src/<pkg>/….py` without PYTHONPATH."""
+    p = _Path(__file__).resolve().parent
+    while p != p.parent:
+        if (p / "common").is_dir() and (p / "labeling").is_dir():
+            s = str(p)
+            if s not in sys.path:
+                sys.path.insert(0, s)
+            return
+        p = p.parent
+
+_ensure_src_on_path()
 
 import argparse
 import json
@@ -16,16 +31,19 @@ import cv2
 from sahi.slicing import slice_image
 from sahi.utils.coco import CocoAnnotation
 
-from config import (
+
+from common.config import (
     CLIP_TILING_CONFIG_PATH,
     DEBUG_DIR,
     FRAMES_DIR,
     LABELS_DIR,
     build_split_map,
+    clip_skip_reason,
+    is_clip_skipped,
     load_clip_tile_config,
     resolve_clip_tile_config,
 )
-from detect import compute_slice_size
+from common.detect import compute_slice_size
 
 SAMPLES_DIR = DEBUG_DIR / "train_tile_samples"
 CLASS_NAME = "vehicle"
@@ -300,6 +318,9 @@ def main() -> None:
     results = []
     for clip_name in sorted(tile_config):
         if clip_filter and clip_name != clip_filter:
+            continue
+        if is_clip_skipped(clip_name, tile_config):
+            print(f"skip {clip_name}: {clip_skip_reason(clip_name, tile_config)}")
             continue
         split = split_map.get(clip_name) or tile_config[clip_name].get("split")
         if split not in ("train", "eval"):

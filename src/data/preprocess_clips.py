@@ -11,11 +11,26 @@ detections only (person→car alias; ignores truck/bus/bike) to estimate:
   - suggested train_groups band from car size
 
 Replaces the old middle-only probe_clips.py flow. Backward-compatible CLI:
-  python src/preprocess_clips.py
+  python src/data/preprocess_clips.py
   python src/probe_clips.py          # thin wrapper → this script
 """
-
 from __future__ import annotations
+
+import sys
+from pathlib import Path as _Path
+
+def _ensure_src_on_path() -> None:
+    """Allow `python src/<pkg>/….py` without PYTHONPATH."""
+    p = _Path(__file__).resolve().parent
+    while p != p.parent:
+        if (p / "common").is_dir() and (p / "labeling").is_dir():
+            s = str(p)
+            if s not in sys.path:
+                sys.path.insert(0, s)
+            return
+        p = p.parent
+
+_ensure_src_on_path()
 
 import argparse
 import json
@@ -23,7 +38,7 @@ import statistics
 import time
 from pathlib import Path
 
-from config import (
+from common.config import (
     CLIP_TILING_CONFIG_PATH,
     DEBUG_DIR,
     FALLBACK_LABEL_THRESHOLD,
@@ -44,9 +59,10 @@ from config import (
     probe_detection_class,
     probe_model_classes,
     probe_result_to_config_entry,
+    reject_if_clip_skipped,
     save_clip_tile_config,
 )
-from detect import (
+from common.detect import (
     MODEL_NAME,
     build_yolo_world,
     car_detection_record,
@@ -77,6 +93,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--clip", default=None, help="Single clip (video stem).")
     parser.add_argument(
+        "--include-skipped",
+        action="store_true",
+        help="Also process clips marked skip=true in clip_tiling.json.",
+    )
+    parser.add_argument(
         "--per-segment",
         type=int,
         default=FRAMES_PER_SEGMENT,
@@ -91,7 +112,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--enhance",
         action="store_true",
-        help="Experimental: CLAHE contrast boost before YOLO-World (see image_enhance.py).",
+        help="Experimental: CLAHE contrast boost before YOLO-World (see src/common/image_enhance.py).",
     )
     parser.add_argument(
         "--report",
@@ -525,7 +546,11 @@ def main() -> None:
         clip_filter = Path(clip_filter).stem
 
     split_map = build_split_map()
-    clip_dirs = iter_frame_clip_dirs(clip_filter)
+    if clip_filter:
+        reject_if_clip_skipped(clip_filter, allow_skipped=args.include_skipped)
+    clip_dirs = iter_frame_clip_dirs(
+        clip_filter, include_skipped=args.include_skipped
+    )
     if not clip_dirs:
         raise SystemExit("No frame folders found under data/frames/.")
 

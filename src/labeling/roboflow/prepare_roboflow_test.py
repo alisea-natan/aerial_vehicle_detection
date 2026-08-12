@@ -7,19 +7,34 @@ Videos / steps:
 
   python labelling/roboflow/prepare_roboflow_test.py
 """
-
 from __future__ import annotations
+
+import sys
+from pathlib import Path as _Path
+
+def _ensure_src_on_path() -> None:
+    """Allow `python src/<pkg>/….py` without PYTHONPATH."""
+    p = _Path(__file__).resolve().parent
+    while p != p.parent:
+        if (p / "common").is_dir() and (p / "labeling").is_dir():
+            s = str(p)
+            if s not in sys.path:
+                sys.path.insert(0, s)
+            return
+        p = p.parent
+
+_ensure_src_on_path()
+
+from common.config import PROJECT_ROOT
 
 import shutil
 from pathlib import Path
 
-HERE = Path(__file__).resolve().parent
-PROJECT_ROOT = HERE.parents[1]
 
 FRAMES_DIR = PROJECT_ROOT / "data" / "frames"
 LABEL_MAN_DIR = PROJECT_ROOT / "labelling" / "cvat" / "label_man"
-OUT_DIR = HERE / "roboflow_upload"
-PREPARED_DIR = HERE / "roboflow"
+OUT_DIR = PROJECT_ROOT / "labelling" / "roboflow" / "roboflow_upload"
+PREPARED_DIR = PROJECT_ROOT / "labelling" / "roboflow" / "roboflow"
 MANUAL_SUBDIRS = ("obj_Train_data", "obj_Test_data")
 
 # (frames folder name, short video_id for renamed files, step)

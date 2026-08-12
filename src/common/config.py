@@ -7,7 +7,13 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+from common.env import load_project_env
+
+load_project_env()
+
+# src/common/config.py → parents[2] = repo root
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+SRC_ROOT = Path(__file__).resolve().parents[1]
 FRAMES_DIR = PROJECT_ROOT / "data" / "frames"
 LABELS_DIR = PROJECT_ROOT / "labels"
 DEBUG_DIR = PROJECT_ROOT / "debug"
@@ -31,7 +37,7 @@ TILE_HEADROOM_STEPS = 1
 
 # Train/eval model input. Per-clip crop comes from train_groups in clip_tiling.json
 # (explicit tile_size from object-size bands), not from scale_coeff.
-TRAIN_IMGSZ = 640
+TRAIN_IMGSZ = 1024
 TRAIN_OVERLAP_RATIO = 0.2
 TARGET_OBJECT_LONG_PX = 64.0
 DEFAULT_SCALE_COEFF = 1.0
@@ -52,6 +58,11 @@ class TrainGroupTiling:
 
 
 def build_split_map(root: Path | None = None) -> dict[str, str]:
+    """Map clip stem → train|eval from folder placement under data/{train,eval}/.
+
+    Source of truth for the split is the video folder, not clip_tiling.json.
+    The JSON ``split`` field is a mirror written by preprocess for readability.
+    """
     root = root or PROJECT_ROOT
     mapping: dict[str, str] = {}
     for split in SPLITS:
@@ -64,12 +75,54 @@ def build_split_map(root: Path | None = None) -> dict[str, str]:
     return mapping
 
 
-def iter_frame_clip_dirs(clip_filter: str | None = None) -> list[Path]:
+def is_clip_skipped(
+    clip_name: str,
+    clips: dict[str, dict] | None = None,
+) -> bool:
+    """True when clip_tiling.json has skip=true (e.g. objects too small)."""
+    clips = clips if clips is not None else load_clip_tile_config()
+    cfg = clips.get(clip_name) or {}
+    return bool(cfg.get("skip", False))
+
+
+def clip_skip_reason(
+    clip_name: str,
+    clips: dict[str, dict] | None = None,
+) -> str:
+    clips = clips if clips is not None else load_clip_tile_config()
+    cfg = clips.get(clip_name) or {}
+    reason = cfg.get("skip_reason")
+    if reason:
+        return str(reason)
+    return "skip=true in clip_tiling.json"
+
+
+def reject_if_clip_skipped(
+    clip_name: str,
+    clips: dict[str, dict] | None = None,
+    *,
+    allow_skipped: bool = False,
+) -> None:
+    """Exit when an explicitly requested clip is marked skip (unless allow_skipped)."""
+    if allow_skipped or not is_clip_skipped(clip_name, clips):
+        return
+    raise SystemExit(
+        f"Clip {clip_name!r} is skipped: {clip_skip_reason(clip_name, clips)}\n"
+        "Pass --include-skipped to force, or clear skip in config/clip_tiling.json."
+    )
+
+
+def iter_frame_clip_dirs(
+    clip_filter: str | None = None,
+    *,
+    include_skipped: bool = False,
+) -> list[Path]:
     """Every data/frames/* folder with metadata.json and at least one .jpg."""
     clips: list[Path] = []
     if not FRAMES_DIR.is_dir():
         return clips
 
+    tile_cfg = None if include_skipped else load_clip_tile_config()
     for clip_dir in sorted(FRAMES_DIR.iterdir()):
         if not clip_dir.is_dir():
             continue
@@ -79,6 +132,11 @@ def iter_frame_clip_dirs(clip_filter: str | None = None) -> list[Path]:
             continue
         if clip_filter and clip_dir.name != clip_filter:
             continue
+        if not include_skipped and is_clip_skipped(clip_dir.name, tile_cfg):
+            print(
+                f"Skipping {clip_dir.name}: {clip_skip_reason(clip_dir.name, tile_cfg)}"
+            )
+            continue
         clips.append(clip_dir)
     return clips
 
@@ -86,11 +144,14 @@ def iter_frame_clip_dirs(clip_filter: str | None = None) -> list[Path]:
 def iter_autolabel_clips(
     split_map: dict[str, str],
     clip_filter: str | None = None,
+    *,
+    include_skipped: bool = False,
 ) -> list[tuple[str, Path]]:
     clips: list[tuple[str, Path]] = []
     if not FRAMES_DIR.is_dir():
         return clips
 
+    tile_cfg = load_clip_tile_config()
     for clip_dir in sorted(FRAMES_DIR.iterdir()):
         if not clip_dir.is_dir():
             continue
@@ -101,6 +162,12 @@ def iter_autolabel_clips(
 
         clip_name = clip_dir.name
         if clip_filter and clip_name != clip_filter:
+            continue
+
+        if not include_skipped and is_clip_skipped(clip_name, tile_cfg):
+            if clip_filter:
+                reject_if_clip_skipped(clip_name, tile_cfg, allow_skipped=False)
+            print(f"Skipping {clip_name}: {clip_skip_reason(clip_name, tile_cfg)}")
             continue
 
         split = split_map.get(clip_name)
@@ -410,12 +477,16 @@ def merge_probe_results(
     for result in probe_results:
         clip_name = result["clip"]
         entry = probe_result_to_config_entry(result)
-        # Preserve scale_coeff from label_box_stats.py across re-probes.
+        # Preserve scale_coeff from label_box_stats.py and manual skip flags across re-probes.
         old = existing.get(clip_name, {})
         if "scale_coeff" in old:
             entry["scale_coeff"] = old["scale_coeff"]
             if "scale_coeff_note" in old:
                 entry["scale_coeff_note"] = old["scale_coeff_note"]
+        if old.get("skip"):
+            entry["skip"] = True
+            if old.get("skip_reason"):
+                entry["skip_reason"] = old["skip_reason"]
         merged[clip_name] = entry
     return merged
 
@@ -429,7 +500,7 @@ def resolve_clip_tile_config(
         known = ", ".join(sorted(clips)) or "(empty)"
         raise SystemExit(
             f"No tile config for clip {clip_name!r}. "
-            f"Run: python src/preprocess_clips.py --clip {clip_name}\n"
+            f"Run: python src/data/preprocess_clips.py --clip {clip_name}\n"
             f"Known clips in config: {known}"
         )
 
@@ -439,7 +510,7 @@ def resolve_clip_tile_config(
     if "label_confidence_threshold" not in cfg:
         raise SystemExit(
             f"Clip {clip_name!r} missing label_confidence_threshold in config. "
-            f"Run: python src/preprocess_clips.py --clip {clip_name}"
+            f"Run: python src/data/preprocess_clips.py --clip {clip_name}"
         )
     train_tiling = None
     try:
@@ -465,6 +536,8 @@ def resolve_clip_tile_config(
         "frame_step_fraction": cfg.get("frame_step_fraction"),
         "suggested_train_group": cfg.get("suggested_train_group"),
         "frames_probed_by_segment": cfg.get("frames_probed_by_segment"),
+        "skip": bool(cfg.get("skip", False)),
+        "skip_reason": cfg.get("skip_reason"),
     }
     if train_tiling is not None:
         out["train_group"] = train_tiling.group

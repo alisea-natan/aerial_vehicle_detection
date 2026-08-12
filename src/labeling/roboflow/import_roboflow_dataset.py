@@ -11,10 +11,27 @@ Usage:
   python labelling/roboflow/import_roboflow_dataset.py --export-dir path/to/export
 
 Then train without rebuilding the dataset:
-  python src/train.py
+  python src/training/train.py
 """
-
 from __future__ import annotations
+
+import sys
+from pathlib import Path as _Path
+
+def _ensure_src_on_path() -> None:
+    """Allow `python src/<pkg>/….py` without PYTHONPATH."""
+    p = _Path(__file__).resolve().parent
+    while p != p.parent:
+        if (p / "common").is_dir() and (p / "labeling").is_dir():
+            s = str(p)
+            if s not in sys.path:
+                sys.path.insert(0, s)
+            return
+        p = p.parent
+
+_ensure_src_on_path()
+
+from common.config import PROJECT_ROOT
 
 import argparse
 import json
@@ -25,8 +42,6 @@ from pathlib import Path
 import cv2
 import yaml
 
-HERE = Path(__file__).resolve().parent
-PROJECT_ROOT = HERE.parents[1]
 
 DEFAULT_EXPORT_DIR = PROJECT_ROOT / "labelling" / "Vehicle.v1i.yolov8"
 DATASET_DIR = PROJECT_ROOT / "outputs" / "dataset"
@@ -427,7 +442,7 @@ def main() -> None:
     print(f"\nDataset ready: {yaml_path}")
     print(f"  train images: {n_train}")
     print(f"  val images:   {n_val}")
-    print("Train with: python src/train.py")
+    print("Train with: python src/training/train.py")
 
 
 if __name__ == "__main__":
