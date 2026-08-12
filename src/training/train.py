@@ -63,10 +63,14 @@ MODEL_NAME = "yolo11s.pt"  # Ultralytics asset name for YOLO11s
 # YOLO11s backbone = model.0..model.10 (Conv…SPPF…C2PSA). freeze=N → indices 0..N-1.
 FREEZE_BACKBONE = 11
 WARMUP_EPOCHS = 5  # Stage 1: head-only
-EPOCHS = 20  # Stage 2: full fine-tune
+EPOCHS = 20  # Stage 2: full fine-tune (backbone + head)
 STAGE1_LR0 = 0.01  # head adapts quickly on frozen features
 STAGE2_LR0 = STAGE1_LR0 / 10  # gentle backbone adaptation
 PATIENCE = 7  # early stop on val fitness (mAP composite) with no improvement
+# Fast PoC schedule (--prototype): still runs Stage 2 with backbone unfrozen.
+PROTOTYPE_WARMUP_EPOCHS = 2
+PROTOTYPE_EPOCHS = 5
+PROTOTYPE_PATIENCE = 3
 SLICE_OUT_EXT = ".jpg"  # SAHI defaults to PNG — huge on 4K; JPEG saves ~5–10× disk
 # MAX_EMPTY_SLICES_PER_FRAME = 2  # keep a few hard-negative tiles per frame
 MAX_EMPTY_SLICES_PER_FRAME = 0  # temporary: drop all empty tiles (empty_kept=0)
@@ -238,15 +242,24 @@ def parse_args() -> argparse.Namespace:
         help=f"YOLO model imgsz (default {TRAIN_IMGSZ}). Crops still use train_groups tile_size.",
     )
     parser.add_argument(
+        "--prototype",
+        action="store_true",
+        help=(
+            "Fast PoC schedule: short Stage 1 (head) + Stage 2 (full model incl. backbone). "
+            f"Sets --warmup-epochs {PROTOTYPE_WARMUP_EPOCHS}, --epochs {PROTOTYPE_EPOCHS}, "
+            f"--patience {PROTOTYPE_PATIENCE} unless those flags are also passed."
+        ),
+    )
+    parser.add_argument(
         "--epochs",
         type=int,
-        default=EPOCHS,
-        help=f"Stage 2 (full fine-tune) epochs (default {EPOCHS}).",
+        default=None,
+        help=f"Stage 2 (full fine-tune, backbone unfrozen) epochs (default {EPOCHS}).",
     )
     parser.add_argument(
         "--warmup-epochs",
         type=int,
-        default=WARMUP_EPOCHS,
+        default=None,
         help=f"Stage 1 head-only epochs with frozen backbone (default {WARMUP_EPOCHS}).",
     )
     parser.add_argument(
@@ -261,7 +274,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--patience",
         type=int,
-        default=PATIENCE,
+        default=None,
         help=f"Early-stop patience on val fitness (default {PATIENCE}; 0 disables).",
     )
     parser.add_argument(
@@ -1727,6 +1740,29 @@ def main() -> None:
     args = parse_args()
     split_map = build_split_map()
 
+    if args.prototype:
+        print(
+            "Prototype (fast) schedule: Stage1 head-only → Stage2 full "
+            f"(backbone unfrozen); "
+            f"warmup={PROTOTYPE_WARMUP_EPOCHS}, epochs={PROTOTYPE_EPOCHS}, "
+            f"patience={PROTOTYPE_PATIENCE}"
+        )
+    warmup_epochs = (
+        args.warmup_epochs
+        if args.warmup_epochs is not None
+        else (PROTOTYPE_WARMUP_EPOCHS if args.prototype else WARMUP_EPOCHS)
+    )
+    epochs = (
+        args.epochs
+        if args.epochs is not None
+        else (PROTOTYPE_EPOCHS if args.prototype else EPOCHS)
+    )
+    patience = (
+        args.patience
+        if args.patience is not None
+        else (PROTOTYPE_PATIENCE if args.prototype else PATIENCE)
+    )
+
     dataset_dir = args.dataset_dir
     frame_step_only = bool(args.frame_step_only)
     balance = not bool(args.no_balance)
@@ -1791,9 +1827,9 @@ def main() -> None:
         print("Dataset prepared. Run without --prepare-only to train.")
         return
 
-    if args.warmup_epochs < 1:
+    if warmup_epochs < 1:
         raise SystemExit("--warmup-epochs must be >= 1")
-    if args.epochs < 1:
+    if epochs < 1:
         raise SystemExit("--epochs must be >= 1")
     if args.freeze < 0:
         raise SystemExit("--freeze must be >= 0")
@@ -1801,14 +1837,14 @@ def main() -> None:
     weights = train_model(
         yaml_path,
         imgsz=imgsz,
-        warmup_epochs=args.warmup_epochs,
-        epochs=args.epochs,
+        warmup_epochs=warmup_epochs,
+        epochs=epochs,
         batch=batch,
         workers=workers,
         cache=args.cache,
         freeze=args.freeze,
         lr0=args.lr0,
-        patience=args.patience,
+        patience=patience,
     )
     print(f"Done. Best weights: {weights}")
 

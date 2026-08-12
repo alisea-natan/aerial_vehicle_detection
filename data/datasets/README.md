@@ -1,31 +1,41 @@
 # Dataset versions (local only)
 
-Prepared Ultralytics layouts live here. **Do not push dataset blobs or `*.dvc` to GitLab** — only this folder layout is tracked.
+Prepared Ultralytics packs live here. **Do not commit blobs or `*.dvc`** — only this README + `.gitignore` are tracked.
 
 ```
 data/datasets/
-  README.md              # this file (in git)
-  baseline_v0/           # optional: from YOLO-World autolabel (pseudo-GT)
-  baseline_v1/           # human / CVAT GT baseline (frame_step, ~1024 tiling, no aug)
-  <experiment_name>/     # further local experiment packs
+  README.md
+  baseline_v0/ / baseline_v1/     # prepare_baseline.py helpers
+  eval_manual/                    # prepare_eval.py (CVAT / human)
+  eval_autolabel/                 # prepare_eval.py --from-autolabel
+  baseline_1/                     # ablation reference pack
+  variant_2_no_tiling/ …
+  variant_5_aug -> baseline_1     # symlink; train aug only in Round 1
 ```
 
-Build:
+## Build packs (dataset layer)
 
 ```bash
-# GT baseline (default)
-python src/training/prepare_baseline.py
-# → data/datasets/baseline_v1/
+# Shared eval (once per label source; all tests reuse the same pack)
+python src/training/prepare_eval.py --from-autolabel   # → eval_autolabel/
+python src/training/prepare_eval.py                   # → eval_manual/
 
-# Theoretical / smoke baseline from autolabel demo
-python src/labeling/autolabel.py
+# Train packs
 python src/training/prepare_baseline.py --from-autolabel
-# → data/datasets/baseline_v0/
 ```
 
-Optional local DVC (cache in `.dvc-storage/`, not GitLab):
+Ablation specs: `config/datasets/variants.yaml`
 
 ```bash
-dvc add data/datasets/baseline_v1
-dvc push
+python src/training/datasets/generate_variant.py --list
+python src/training/datasets/generate_variant.py --all
 ```
+
+## Train (experiment rounds — separate)
+
+| Round | Config | Command |
+| ----- | ------ | ------- |
+| 1 Datasets | `config/experiments/dataset_round.yaml` | `python src/training/experiments/run_dataset_round.py --dry-run --variant baseline_1` |
+| 2 Models | `config/experiments/model_round.yaml` | `python src/training/experiments/run_model_round.py --dry-run --variant model_n_640` |
+
+See `config/experiments/README.md`.

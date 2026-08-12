@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Build labelling/roboflow/roboflow_upload/ test split (YOLOv8) from label_man + frames.
+"""Build labelling/roboflow/roboflow_upload/ test split (YOLOv8) from labels/ + frames.
 
 Videos / steps:
   266987              → every 9th frame
   13722965_…          → every 18th frame  (video_id prefix: 13722965)
 
-  python labelling/roboflow/prepare_roboflow_test.py
+  python src/labeling/roboflow/prepare_roboflow_test.py
 """
 from __future__ import annotations
 
@@ -25,17 +25,15 @@ def _ensure_src_on_path() -> None:
 
 _ensure_src_on_path()
 
-from common.config import PROJECT_ROOT
+from common.config import LABELS_DIR, PROJECT_ROOT, SPLITS
 
 import shutil
 from pathlib import Path
 
 
 FRAMES_DIR = PROJECT_ROOT / "data" / "frames"
-LABEL_MAN_DIR = PROJECT_ROOT / "labelling" / "cvat" / "label_man"
 OUT_DIR = PROJECT_ROOT / "labelling" / "roboflow" / "roboflow_upload"
 PREPARED_DIR = PROJECT_ROOT / "labelling" / "roboflow" / "roboflow"
-MANUAL_SUBDIRS = ("obj_Train_data", "obj_Test_data")
 
 # (frames folder name, short video_id for renamed files, step)
 CLIPS = (
@@ -44,12 +42,12 @@ CLIPS = (
 )
 
 
-def find_manual_label_dir(clip_dir: Path) -> Path:
-    for name in MANUAL_SUBDIRS:
-        candidate = clip_dir / name
-        if candidate.is_dir() and any(candidate.glob("*.txt")):
-            return candidate
-    raise SystemExit(f"No label_man labels under {clip_dir}")
+def find_cvat_label_dir(clip: str) -> Path:
+    for split in SPLITS:
+        path = LABELS_DIR / split / clip
+        if path.is_dir() and any(path.glob("*.txt")):
+            return path
+    raise SystemExit(f"No CVAT labels under labels/{{train,eval}}/{clip}")
 
 
 def label_has_boxes(path: Path) -> bool:
@@ -65,7 +63,6 @@ def main() -> None:
     images_out.mkdir(parents=True)
     labels_out.mkdir(parents=True)
 
-    # classes from either clip's prepared data.yaml (identical)
     src_yaml = PREPARED_DIR / "266987" / "data.yaml"
     if not src_yaml.is_file():
         src_yaml = PREPARED_DIR / CLIPS[1][0] / "data.yaml"
@@ -93,7 +90,7 @@ def main() -> None:
 
     for folder, video_id, step in CLIPS:
         frame_dir = FRAMES_DIR / folder
-        man_dir = find_manual_label_dir(LABEL_MAN_DIR / folder)
+        man_dir = find_cvat_label_dir(folder)
         jpgs = sorted(frame_dir.glob("*.jpg"))
         if not jpgs:
             raise SystemExit(f"No frames in {frame_dir}")
@@ -105,7 +102,7 @@ def main() -> None:
         for jpg in sampled:
             src_txt = man_dir / f"{jpg.stem}.txt"
             if not src_txt.is_file():
-                raise SystemExit(f"Missing label_man file for every frame: {src_txt}")
+                raise SystemExit(f"Missing CVAT label for frame: {src_txt}")
 
             stem = f"{video_id}_{jpg.stem}"
             shutil.copy2(jpg.resolve(), images_out / f"{stem}.jpg")
@@ -119,14 +116,9 @@ def main() -> None:
         total += len(sampled)
         total_boxes += n_boxes
         total_null += n_null
-        print(
-            f"{video_id}: copied {len(sampled)} "
-            f"(step={step}, source_frames={len(jpgs)}) "
-            f"— with boxes: {n_boxes}, null: {n_null}"
-        )
+        print(f"{folder}: {len(sampled)} frames (step={step}), boxes={n_boxes}, empty={n_null}")
 
-    print(f"test/ total: {total} (with boxes: {total_boxes}, null: {total_null})")
-    print(f"Wrote {OUT_DIR}")
+    print(f"Done: {total} test images → {OUT_DIR} (with boxes={total_boxes}, empty={total_null})")
 
 
 if __name__ == "__main__":

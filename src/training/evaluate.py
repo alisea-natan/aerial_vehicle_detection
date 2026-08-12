@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Evaluate fine-tuned detector on eval clips; report metrics per distance band (0-200 m, 200-400 m)."""
+"""Evaluate fine-tuned detector on prepared eval packs (autolabel / manual) per distance band."""
 from __future__ import annotations
 
 import sys
@@ -53,6 +53,13 @@ OUTPUTS_DIR = PROJECT_ROOT / "outputs"
 DATASET_DIR = OUTPUTS_DIR / "dataset"
 DATASET_YAML = DATASET_DIR / "data.yaml"
 PREPARE_STATS = DATASET_DIR / "prepare_stats.json"
+DATASETS_ROOT = PROJECT_ROOT / "data" / "datasets"
+EVAL_PACKS = {
+    "autolabel": DATASETS_ROOT / "eval_autolabel",
+    "manual": DATASETS_ROOT / "eval_manual",
+    "autolabel_adapted": DATASETS_ROOT / "eval_autolabel_adapted",
+    "manual_adapted": DATASETS_ROOT / "eval_manual_adapted",
+}
 DEFAULT_WEIGHTS = PROJECT_ROOT / "outputs" / "runs" / "yolo11s_vehicle" / "weights" / "best.pt"
 VEHICLE_CLASS = "vehicle"
 PRED_COLOR = (0, 200, 0)  # BGR green
@@ -69,6 +76,8 @@ DEFAULT_BAND_CLIPS = {
 CLIP_EVAL_BAND = {clip: band for band, clip in DEFAULT_BAND_CLIPS.items()}
 
 IOU_MATCH = 0.5
+# COCO-style mAP@0.5:0.95 thresholds
+IOU_THRESHOLDS_50_95 = tuple(round(0.5 + 0.05 * i, 2) for i in range(10))
 
 
 @dataclass(frozen=True)
@@ -159,7 +168,7 @@ def _slice_config_from_payload(payload: dict, *, source: str) -> TrainSliceConfi
     clip_uses_tiling = payload.get("clip_uses_tiling") or {}
     clip_group = payload.get("clip_group") or {}
 
-    # Legacy scale_coeff datasets: synthesize uses_tiling=True for known slice sizes.
+    # Older dataset.json payloads may only have clip_slice_size / clip_scale_coeff.
     if not clip_uses_tiling and clip_slice_size:
         clip_uses_tiling = {k: True for k in clip_slice_size}
     if not clip_overlap and payload.get("clip_scale_coeff"):
@@ -220,7 +229,9 @@ class BandStats:
     n_frames: int = 0
     fps: float = 30.0
     first_tp_frame: int | None = None
-    ap50_pairs: list[tuple[float, int]] = field(default_factory=list)  # (score, is_tp)
+    ap50_pairs: list[tuple[float, int]] = field(default_factory=list)  # (score, is_tp) @0.5
+    # IoU thresh → (score, is_tp) pairs for mAP@0.5:0.95
+    ap_pairs_by_iou: dict[float, list[tuple[float, int]]] = field(default_factory=dict)
 
     def detection_rate(self) -> float | None:
         denom = self.tp + self.fn
@@ -241,51 +252,101 @@ class BandStats:
             return None
         return self.first_tp_frame / self.fps
 
+    def _n_gt(self) -> int:
+        return self.tp + self.fn
+
     def map50(self) -> float | None:
-        if not self.ap50_pairs:
-            return None
-        preds = sorted(self.ap50_pairs, key=lambda item: item[0], reverse=True)
-        tp_cum = 0
-        fp_cum = 0
-        precisions: list[float] = []
-        recalls: list[float] = []
-        n_gt = self.tp + self.fn
+        return average_precision(self.ap50_pairs, self._n_gt())
+
+    def map50_95(self) -> float | None:
+        n_gt = self._n_gt()
         if n_gt == 0:
             return None
-        for _, is_tp in preds:
-            if is_tp:
-                tp_cum += 1
-            else:
-                fp_cum += 1
-            precisions.append(tp_cum / (tp_cum + fp_cum))
-            recalls.append(tp_cum / n_gt)
-        ap = 0.0
-        for t in [i / 10 for i in range(0, 11)]:
-            p_max = max((p for r, p in zip(recalls, precisions) if r >= t), default=0.0)
-            ap += p_max / 11.0
-        return ap
+        aps: list[float] = []
+        for thresh in IOU_THRESHOLDS_50_95:
+            pairs = self.ap_pairs_by_iou.get(thresh) or []
+            ap = average_precision(pairs, n_gt)
+            if ap is None:
+                return None
+            aps.append(ap)
+        return sum(aps) / len(aps) if aps else None
+
+
+def average_precision(
+    pairs: list[tuple[float, int]],
+    n_gt: int,
+) -> float | None:
+    """11-point interpolated AP from (score, is_tp) pairs."""
+    if not pairs or n_gt <= 0:
+        return None
+    preds = sorted(pairs, key=lambda item: item[0], reverse=True)
+    tp_cum = 0
+    fp_cum = 0
+    precisions: list[float] = []
+    recalls: list[float] = []
+    for _, is_tp in preds:
+        if is_tp:
+            tp_cum += 1
+        else:
+            fp_cum += 1
+        precisions.append(tp_cum / (tp_cum + fp_cum))
+        recalls.append(tp_cum / n_gt)
+    ap = 0.0
+    for t in [i / 10 for i in range(0, 11)]:
+        p_max = max((p for r, p in zip(recalls, precisions) if r >= t), default=0.0)
+        ap += p_max / 11.0
+    return ap
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Evaluate detector metrics per distance band.")
+    parser = argparse.ArgumentParser(
+        description=(
+            "Evaluate detector on prepared eval packs "
+            "(data/datasets/eval_autolabel or eval_manual), "
+            "or --live on full videos."
+        ),
+    )
     parser.add_argument("--weights", default=str(DEFAULT_WEIGHTS), help="Fine-tuned YOLO weights (.pt).")
+    parser.add_argument(
+        "--gt",
+        choices=("autolabel", "manual", "autolabel_adapted", "manual_adapted", "both"),
+        default="autolabel",
+        help=(
+            "Prepared pack: autolabel|manual (native scale), "
+            "*_adapted (scale-matched to train band medians), "
+            "both → autolabel + manual (not adapted)."
+        ),
+    )
+    parser.add_argument(
+        "--dataset",
+        default=None,
+        help="Override prepared pack root (images/ + labels/ + data.yaml).",
+    )
+    parser.add_argument(
+        "--live",
+        action="store_true",
+        help="Legacy: score full eval videos from data/frames + labels/eval (not prepared packs).",
+    )
     parser.add_argument(
         "--clips",
         nargs="*",
         default=None,
-        help="Eval clip names (default: one <200m + one 200-400m clip).",
+        help="Eval clip names (default: band clips / pack clips).",
     )
     parser.add_argument("--conf", type=float, default=None, help="Override confidence threshold.")
     parser.add_argument("--iou", type=float, default=IOU_MATCH, help="IoU threshold for TP match.")
     parser.add_argument(
         "--output-dir",
-        default=str(OUTPUTS_DIR),
-        help="Directory for metrics_table.md and eval_metrics.json.",
+        default=None,
+        help=(
+            "Directory for metrics_table.md and eval_metrics.json "
+            "(default outputs/eval_autolabel or outputs/eval_manual)."
+        ),
     )
     parser.add_argument(
         "--video-dir",
-        default=str(OUTPUTS_DIR / "eval_videos"),
-        help="Directory for per-clip prediction overlay videos.",
+        default=None,
+        help="Directory for overlay videos (--live only unless set).",
     )
     parser.add_argument(
         "--no-video",
@@ -457,7 +518,7 @@ def match_frame(
     pred_boxes: list[Box],
     iou_thresh: float,
 ) -> tuple[int, int, int, list[tuple[float, int]]]:
-    """Return tp, fp, fn and (score, is_tp) pairs for AP."""
+    """Return tp, fp, fn and (score, is_tp) pairs for AP at a single IoU threshold."""
     gt_matched = [False] * len(gt_boxes)
     tp = 0
     fp = 0
@@ -484,6 +545,27 @@ def match_frame(
 
     fn = sum(1 for matched in gt_matched if not matched)
     return tp, fp, fn, ap_pairs
+
+
+def accumulate_frame_metrics(
+    stats: BandStats,
+    gt_boxes: list[Box],
+    pred_boxes: list[Box],
+    iou_thresh: float,
+) -> tuple[int, int, int]:
+    """Update band stats (counts + AP@0.5 + AP@0.5:0.95) for one sample; return tp, fp, fn."""
+    tp, fp, fn, ap_pairs = match_frame(gt_boxes, pred_boxes, iou_thresh)
+    stats.tp += tp
+    stats.fp += fp
+    stats.fn += fn
+    stats.ap50_pairs.extend(ap_pairs)
+    for thresh in IOU_THRESHOLDS_50_95:
+        if abs(thresh - iou_thresh) < 1e-9:
+            pairs = ap_pairs
+        else:
+            _, _, _, pairs = match_frame(gt_boxes, pred_boxes, thresh)
+        stats.ap_pairs_by_iou.setdefault(thresh, []).extend(pairs)
+    return tp, fp, fn
 
 
 def iter_all_frames(clip_name: str) -> list[tuple[Path, int]]:
@@ -658,11 +740,7 @@ def evaluate_clip(
         stats.n_frames += 1
         stats.fps = fps
 
-        tp, fp, fn, ap_pairs = match_frame(gt_all, preds, iou_thresh)
-        stats.tp += tp
-        stats.fp += fp
-        stats.fn += fn
-        stats.ap50_pairs.extend(ap_pairs)
+        tp, fp, fn = accumulate_frame_metrics(stats, gt_all, preds, iou_thresh)
         clip_tp += tp
         clip_fp += fp
         clip_fn += fn
@@ -735,6 +813,24 @@ def format_metric(value: float | None, pct: bool = True) -> str:
 
 def build_markdown_table(band_stats: dict[str, BandStats], meta: dict) -> str:
     eval_mode = meta.get("eval_mode", {})
+    assumptions = meta.get("assumptions") or {}
+    gt_line = assumptions.get(
+        "gt_source",
+        "pseudo-labels from `labels/eval/` (class 0 = vehicle).",
+    )
+    infer_line = assumptions.get(
+        "inference",
+        (
+            f"per-clip `train_groups` tiling (or full-frame) → "
+            f"model imgsz={eval_mode.get('imgsz')} (from `{eval_mode.get('train_metadata', 'train dataset')}`), "
+            f"tile NMS IoU {eval_mode.get('tile_nms_iou', TILE_NMS_IOU)}, boxes mapped to full frame."
+        ),
+    )
+    band_line = assumptions.get(
+        "band_assignment",
+        "one eval clip per band; distance band is fixed per whole video from probe "
+        "(`clip_tiling.json`), not recomputed per frame or per car.",
+    )
     lines = [
         "# Eval metrics by distance band",
         "",
@@ -743,12 +839,9 @@ def build_markdown_table(band_stats: dict[str, BandStats], meta: dict) -> str:
         "",
         "## Assumptions",
         "",
-        f"- GT: pseudo-labels from `labels/eval/` (class 0 = vehicle).",
-        f"- Inference: per-clip `train_groups` tiling (or full-frame) → "
-        f"model imgsz={eval_mode.get('imgsz')} (from `{eval_mode.get('train_metadata', 'train dataset')}`), "
-        f"tile NMS IoU {eval_mode.get('tile_nms_iou', TILE_NMS_IOU)}, boxes mapped to full frame.",
-        f"- Bands: one eval clip per band; distance band is fixed per whole video from probe "
-        f"(`clip_tiling.json`), not recomputed per frame or per car.",
+        f"- GT: {gt_line}",
+        f"- Inference: {infer_line}",
+        f"- Bands: {band_line}",
         f"- Match: IoU ≥ {meta['iou']} → TP; unmatched GT → FN; unmatched pred → FP.",
         f"- False alarms/min: `FP / (N_frames / fps / 60)`.",
         f"- Time to first detection: first TP frame index / fps (seconds from clip start).",
@@ -794,8 +887,10 @@ def build_markdown_table(band_stats: dict[str, BandStats], meta: dict) -> str:
             f"| Time to first detection (s) | "
             f"{format_metric(band_stats['0-200m'].time_to_first_detection_s(), pct=False)} | "
             f"{format_metric(band_stats['200-400m'].time_to_first_detection_s(), pct=False)} |",
-            f"| mAP@0.5 (bonus) | {format_metric(band_stats['0-200m'].map50())} | "
+            f"| mAP@0.5 | {format_metric(band_stats['0-200m'].map50())} | "
             f"{format_metric(band_stats['200-400m'].map50())} |",
+            f"| mAP@0.5:0.95 | {format_metric(band_stats['0-200m'].map50_95())} | "
+            f"{format_metric(band_stats['200-400m'].map50_95())} |",
             "",
             "## Per-band counts",
             "",
@@ -809,21 +904,355 @@ def build_markdown_table(band_stats: dict[str, BandStats], meta: dict) -> str:
     return "\n".join(lines) + "\n"
 
 
-def main() -> None:
-    args = parse_args()
-    weights = Path(args.weights)
-    if not weights.exists():
-        raise SystemExit(
-            f"Weights not found: {weights}\n"
-            "Train first: python src/training/train.py"
+def _clip_from_sample_stem(stem: str) -> str:
+    return stem.split("__", 1)[0]
+
+
+def _frame_idx_from_sample_stem(stem: str) -> int | None:
+    """Best-effort frame index from `clip__000001` or `clip__000001_x_y_w_h`."""
+    if "__" not in stem:
+        return None
+    rest = stem.split("__", 1)[1]
+    parts = rest.split("_")
+    if len(parts) >= 5 and all(p.isdigit() for p in parts[-4:]):
+        frame = "_".join(parts[:-4])
+    else:
+        frame = parts[0] if parts else rest
+    try:
+        return int(frame)
+    except ValueError:
+        return None
+
+
+def predict_prepared_image(
+    yolo_model: YOLO,
+    image_path: Path,
+    *,
+    img_w: int,
+    img_h: int,
+    predict_imgsz: int,
+    conf: float,
+    dev: str,
+) -> list[Box]:
+    """Predict on an already-cropped pack image (tile or full-frame sample)."""
+    results = yolo_model.predict(
+        str(image_path),
+        conf=conf,
+        device=dev,
+        imgsz=predict_imgsz,
+        verbose=False,
+    )
+    merged: list[Box] = []
+    result = results[0]
+    if result.boxes is not None and len(result.boxes) > 0:
+        for i in range(len(result.boxes)):
+            xyxy = result.boxes.xyxy[i].cpu().tolist()
+            score = float(result.boxes.conf[i].cpu().item())
+            x1 = float(max(0, min(img_w, xyxy[0])))
+            y1 = float(max(0, min(img_h, xyxy[1])))
+            x2 = float(max(0, min(img_w, xyxy[2])))
+            y2 = float(max(0, min(img_h, xyxy[3])))
+            if x2 - x1 > 1 and y2 - y1 > 1:
+                merged.append(Box(xyxy=[x1, y1, x2, y2], confidence=score))
+    return merged
+
+
+def _clip_fps(clip_name: str) -> float:
+    meta_path = FRAMES_DIR / clip_name / "metadata.json"
+    if meta_path.exists():
+        try:
+            return float(json.loads(meta_path.read_text(encoding="utf-8")).get("fps", 30.0))
+        except (json.JSONDecodeError, TypeError, ValueError):
+            pass
+    return 30.0
+
+
+def _write_eval_outputs(
+    *,
+    out_dir: Path,
+    band_stats: dict[str, BandStats],
+    payload: dict,
+    clip_results: list[dict],
+) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    json_path = out_dir / "eval_metrics.json"
+    md_path = out_dir / "metrics_table.md"
+    json_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    md_path.write_text(build_markdown_table(band_stats, payload), encoding="utf-8")
+
+    print(f"\n{'Metric':<32} {'0-200 m':>10} {'200-400 m':>10}")
+    print("-" * 54)
+    rows = [
+        ("Detection rate", "detection_rate", True),
+        ("Precision", "precision", True),
+        ("False alarms/min", "false_alarms_per_min", False),
+        ("Time to first det (s)", "time_to_first_detection_s", False),
+        ("mAP@0.5", "map50", True),
+        ("mAP@0.5:0.95", "map50_95", True),
+    ]
+    for label, key, pct in rows:
+        getter = {
+            "detection_rate": lambda s: s.detection_rate(),
+            "precision": lambda s: s.precision(),
+            "false_alarms_per_min": lambda s: s.false_alarms_per_min(),
+            "time_to_first_detection_s": lambda s: s.time_to_first_detection_s(),
+            "map50": lambda s: s.map50(),
+            "map50_95": lambda s: s.map50_95(),
+        }[key]
+        a, b = getter(band_stats["0-200m"]), getter(band_stats["200-400m"])
+        print(f"{label:<32} {format_metric(a, pct):>10} {format_metric(b, pct):>10}")
+
+    timing = payload.get("timing") or {}
+    print(f"\nEval wall time: {timing.get('elapsed_human')} ({timing.get('elapsed_sec')}s)")
+    for item in timing.get("clips", []):
+        fps = item.get("frames_per_sec")
+        fps_s = f", {fps:.2f} frame/s" if fps is not None else ""
+        vid = item.get("video_sec") or 0
+        vid_s = f", video {vid:.1f}s" if vid else ""
+        print(
+            f"  {item['clip']}: {item.get('elapsed_sec', 0):.1f}s "
+            f"(infer {item.get('infer_sec', 0):.1f}s{fps_s}{vid_s})"
         )
 
+    print(f"\nSaved: {json_path}")
+    print(f"Saved: {md_path}")
+    for result in clip_results:
+        video = result.get("prediction_video")
+        if video:
+            print(f"Saved: {video}")
+
+
+def evaluate_prepared_pack(
+    dataset_dir: Path,
+    *,
+    weights: Path,
+    gt_name: str,
+    conf_override: float | None,
+    iou_thresh: float,
+    clip_filter: list[str] | None,
+    output_dir: Path,
+    tile_config: dict[str, dict],
+) -> None:
+    """Score a frozen eval pack (images already tiled / cropped)."""
+    yaml_path = dataset_dir / "data.yaml"
+    images_dir = dataset_dir / "images"
+    labels_dir = dataset_dir / "labels"
+    if not yaml_path.exists() or not images_dir.is_dir():
+        raise SystemExit(
+            f"Prepared pack incomplete: {dataset_dir}\n"
+            "Build with: python src/training/prepare_eval.py"
+            + (" --from-autolabel" if "autolabel" in gt_name else "")
+            + (" --scale-adapt" if "adapted" in gt_name else "")
+        )
+
+    payload_yaml = yaml.safe_load(yaml_path.read_text(encoding="utf-8")) or {}
+    bands_map: dict[str, str] = {
+        str(k): str(v) for k, v in (payload_yaml.get("bands") or {}).items()
+    }
+    clip_train_imgsz: dict[str, int] = {
+        str(k): int(v) for k, v in (payload_yaml.get("clip_train_imgsz") or {}).items()
+    }
+    default_imgsz = int(payload_yaml.get("imgsz", TRAIN_IMGSZ))
+    pack_clips = [str(c) for c in (payload_yaml.get("clips") or [])]
+    if clip_filter:
+        clip_names = clip_filter
+    elif pack_clips:
+        clip_names = pack_clips
+    else:
+        clip_names = list(DEFAULT_BAND_CLIPS.values())
+
+    image_paths = sorted(images_dir.glob("*.jpg")) + sorted(images_dir.glob("*.png"))
+    if not image_paths:
+        raise SystemExit(f"No images in {images_dir}")
+
+    clip_set = set(clip_names)
+    by_clip: dict[str, list[Path]] = {c: [] for c in clip_names}
+    for path in image_paths:
+        clip = _clip_from_sample_stem(path.stem)
+        if clip in clip_set:
+            by_clip.setdefault(clip, []).append(path)
+
+    missing = [c for c in clip_names if not by_clip.get(c)]
+    if missing:
+        raise SystemExit(f"Pack {dataset_dir} has no images for clips: {missing}")
+
+    print(
+        f"Eval pack [{gt_name}]: {dataset_dir} "
+        f"({len(image_paths)} images, clips={clip_names})"
+    )
+    yolo_model = YOLO(str(weights))
+    dev = device()
+    band_stats = {band: BandStats() for band in DEFAULT_BAND_CLIPS}
+    clip_results: list[dict] = []
+    run_t0 = time.perf_counter()
+
+    for clip_name in clip_names:
+        paths = by_clip[clip_name]
+        tile_cfg = resolve_clip_tile_config(clip_name, tile_config) if clip_name in tile_config else {}
+        clip_band = bands_map.get(clip_name) or resolve_clip_eval_band(clip_name, tile_cfg)
+        if clip_band not in band_stats:
+            raise SystemExit(
+                f"Clip {clip_name!r} band {clip_band!r} not in {list(band_stats)}"
+            )
+        conf = (
+            conf_override
+            if conf_override is not None
+            else float(tile_cfg.get("label_confidence_threshold", 0.25))
+        )
+        predict_imgsz = clip_train_imgsz.get(clip_name, default_imgsz)
+        fps = _clip_fps(clip_name)
+        stats = band_stats[clip_band]
+        clip_tp = clip_fp = clip_fn = 0
+        print(
+            f"Evaluating {clip_name} ({clip_band}, {len(paths)} samples, "
+            f"predict_imgsz={predict_imgsz}, conf={conf})..."
+        )
+        t_infer0 = time.perf_counter()
+        for i, image_path in enumerate(paths, start=1):
+            img = cv2.imread(str(image_path))
+            if img is None:
+                continue
+            img_h, img_w = img.shape[:2]
+            preds = predict_prepared_image(
+                yolo_model,
+                image_path,
+                img_w=img_w,
+                img_h=img_h,
+                predict_imgsz=predict_imgsz,
+                conf=conf,
+                dev=dev,
+            )
+            label_path = labels_dir / f"{image_path.stem}.txt"
+            gt_all = parse_yolo_label_file(label_path, img_w, img_h)
+            if not gt_all and not preds:
+                continue
+            stats.n_frames += 1
+            stats.fps = fps
+            tp, fp, fn = accumulate_frame_metrics(stats, gt_all, preds, iou_thresh)
+            clip_tp += tp
+            clip_fp += fp
+            clip_fn += fn
+            if tp > 0 and stats.first_tp_frame is None:
+                frame_idx = _frame_idx_from_sample_stem(image_path.stem)
+                stats.first_tp_frame = frame_idx if frame_idx is not None else (i - 1)
+            if i % 25 == 0 or i == len(paths):
+                print(f"  {clip_name}: {i}/{len(paths)} samples")
+        infer_sec = time.perf_counter() - t_infer0
+        frames_per_sec = (len(paths) / infer_sec) if infer_sec > 0 else None
+        print(
+            f"  timing: {infer_sec:.1f}s"
+            + (f", {frames_per_sec:.2f} sample/s" if frames_per_sec else "")
+        )
+        clip_results.append(
+            {
+                "clip": clip_name,
+                "eval_band": clip_band,
+                "samples": len(paths),
+                "conf": conf,
+                "tp": clip_tp,
+                "fp": clip_fp,
+                "fn": clip_fn,
+                "prediction_video": None,
+                "timing": {
+                    "elapsed_sec": round(infer_sec, 2),
+                    "infer_sec": round(infer_sec, 2),
+                    "video_sec": 0.0,
+                    "frames_per_sec": round(frames_per_sec, 3) if frames_per_sec else None,
+                },
+                "eval_mode": {
+                    "prepared_pack": True,
+                    "predict_imgsz": predict_imgsz,
+                    "imgsz": default_imgsz,
+                },
+            }
+        )
+
+    run_elapsed_sec = round(time.perf_counter() - run_t0, 2)
+    source = payload_yaml.get("source") or gt_name
+    labels_root = payload_yaml.get("labels_root") or ""
+    payload = {
+        "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "weights": str(weights),
+        "iou": iou_thresh,
+        "clips": clip_names,
+        "dataset_dir": str(dataset_dir),
+        "gt": gt_name,
+        "timing": {
+            "elapsed_sec": run_elapsed_sec,
+            "elapsed_human": (
+                f"{int(run_elapsed_sec // 60)}m {run_elapsed_sec % 60:.1f}s"
+                if run_elapsed_sec >= 60
+                else f"{run_elapsed_sec:.1f}s"
+            ),
+            "clips": [
+                {"clip": r["clip"], **(r.get("timing") or {})} for r in clip_results
+            ],
+        },
+        "eval_mode": {
+            "mode": "prepared_pack",
+            "imgsz": default_imgsz,
+            "clip_train_imgsz": clip_train_imgsz,
+            "clip_uses_tiling": payload_yaml.get("clip_uses_tiling") or {},
+            "clip_group": payload_yaml.get("clip_group") or {},
+            "train_metadata": str(yaml_path),
+        },
+        "assumptions": {
+            "gt_source": (
+                f"prepared pack `{dataset_dir.name}/` "
+                f"(source={source}"
+                + (f", labels_root={labels_root}" if labels_root else "")
+                + ")"
+            ),
+            "band_assignment": "from pack data.yaml `bands` (clip → distance band)",
+            "eval_clips_by_band": bands_map,
+            "false_alarms_formula": "FP / (N_pack_samples / fps / 60)",
+            "inference": (
+                "direct YOLO predict on pack images (already tiled/cropped); "
+                f"predict_imgsz from pack clip_train_imgsz (default {default_imgsz})"
+            ),
+        },
+        "bands": {
+            band: {
+                "tp": s.tp,
+                "fp": s.fp,
+                "fn": s.fn,
+                "n_frames": s.n_frames,
+                "fps": s.fps,
+                "detection_rate": s.detection_rate(),
+                "precision": s.precision(),
+                "false_alarms_per_min": s.false_alarms_per_min(),
+                "time_to_first_detection_s": s.time_to_first_detection_s(),
+                "map50": s.map50(),
+                "map50_95": s.map50_95(),
+            }
+            for band, s in band_stats.items()
+        },
+        "clips_detail": clip_results,
+    }
+    _write_eval_outputs(
+        out_dir=output_dir,
+        band_stats=band_stats,
+        payload=payload,
+        clip_results=clip_results,
+    )
+
+
+def evaluate_live(
+    *,
+    weights: Path,
+    conf_override: float | None,
+    iou_thresh: float,
+    clip_names: list[str],
+    output_dir: Path,
+    video_dir: Path | None,
+) -> None:
+    """Legacy: full-frame video eval from data/frames + labels/eval."""
     split_map = build_split_map()
     tile_config = load_clip_tile_config()
     slice_cfg = load_train_slice_config()
     verify_materialized_tile_size(slice_cfg)
     print(
-        f"Eval: default_imgsz={slice_cfg.imgsz}, "
+        f"Eval (live): default_imgsz={slice_cfg.imgsz}, "
         f"per-clip train_groups tiling (from {slice_cfg.source})"
     )
     if slice_cfg.clip_group:
@@ -836,23 +1265,19 @@ def main() -> None:
             tile_desc = "full-frame" if not uses else f"tile={size}"
             print(f"  {name}: group={group}, {tile_desc}, overlap={ov}, predict_imgsz={p_imgsz}")
 
-    if args.clips:
-        clip_names = args.clips
-    else:
-        clip_names = list(DEFAULT_BAND_CLIPS.values())
-
     for clip in clip_names:
         if split_map.get(clip) != "eval":
             raise SystemExit(f"Clip {clip!r} is not in data/eval.")
         if clip not in tile_config:
-            raise SystemExit(f"Clip {clip!r} missing from config/clip_tiling.json. Run data/preprocess_clips.py.")
+            raise SystemExit(
+                f"Clip {clip!r} missing from config/clip_tiling.json. Run data/preprocess_clips.py."
+            )
         if is_clip_skipped(clip, tile_config):
             raise SystemExit(
                 f"Clip {clip!r} is skipped: {clip_skip_reason(clip, tile_config)}"
             )
 
     band_stats = {band: BandStats() for band in DEFAULT_BAND_CLIPS}
-    video_dir = None if args.no_video else Path(args.video_dir)
     yolo_model = YOLO(str(weights))
     clip_results = []
     run_t0 = time.perf_counter()
@@ -864,19 +1289,17 @@ def main() -> None:
                 tile_config,
                 slice_cfg,
                 yolo_model=yolo_model,
-                conf_override=args.conf,
-                iou_thresh=args.iou,
+                conf_override=conf_override,
+                iou_thresh=iou_thresh,
                 band_stats=band_stats,
                 video_dir=video_dir,
             )
         )
     run_elapsed_sec = round(time.perf_counter() - run_t0, 2)
-
-    generated_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
     payload = {
-        "generated_at": generated_at,
+        "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "weights": str(weights),
-        "iou": args.iou,
+        "iou": iou_thresh,
         "clips": clip_names,
         "timing": {
             "elapsed_sec": run_elapsed_sec,
@@ -886,14 +1309,11 @@ def main() -> None:
                 else f"{run_elapsed_sec:.1f}s"
             ),
             "clips": [
-                {
-                    "clip": r["clip"],
-                    **(r.get("timing") or {}),
-                }
-                for r in clip_results
+                {"clip": r["clip"], **(r.get("timing") or {})} for r in clip_results
             ],
         },
         "eval_mode": {
+            "mode": "live",
             "imgsz": slice_cfg.imgsz,
             "overlap_ratio": slice_cfg.overlap_ratio,
             "clip_slice_size": slice_cfg.clip_slice_size,
@@ -909,7 +1329,7 @@ def main() -> None:
             r["prediction_video"] for r in clip_results if r.get("prediction_video")
         ],
         "assumptions": {
-            "gt_source": "labels/eval pseudo-labels",
+            "gt_source": "labels/eval (live frames; not a prepared pack)",
             "band_assignment": "whole clip from probe distance_band in clip_tiling.json",
             "eval_clips_by_band": DEFAULT_BAND_CLIPS,
             "false_alarms_formula": "FP / (N_frames / fps / 60)",
@@ -931,57 +1351,82 @@ def main() -> None:
                 "false_alarms_per_min": s.false_alarms_per_min(),
                 "time_to_first_detection_s": s.time_to_first_detection_s(),
                 "map50": s.map50(),
+                "map50_95": s.map50_95(),
             }
             for band, s in band_stats.items()
         },
         "clips_detail": clip_results,
     }
+    _write_eval_outputs(
+        out_dir=output_dir,
+        band_stats=band_stats,
+        payload=payload,
+        clip_results=clip_results,
+    )
 
-    out_dir = Path(args.output_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    json_path = out_dir / "eval_metrics.json"
-    md_path = out_dir / "metrics_table.md"
 
-    json_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-    md_path.write_text(build_markdown_table(band_stats, payload), encoding="utf-8")
-
-    print(f"\n{'Metric':<32} {'0-200 m':>10} {'200-400 m':>10}")
-    print("-" * 54)
-    rows = [
-        ("Detection rate", "detection_rate", True),
-        ("Precision", "precision", True),
-        ("False alarms/min", "false_alarms_per_min", False),
-        ("Time to first det (s)", "time_to_first_detection_s", False),
-        ("mAP@0.5", "map50", True),
-    ]
-    for label, key, pct in rows:
-        getter = {
-            "detection_rate": lambda s: s.detection_rate(),
-            "precision": lambda s: s.precision(),
-            "false_alarms_per_min": lambda s: s.false_alarms_per_min(),
-            "time_to_first_detection_s": lambda s: s.time_to_first_detection_s(),
-            "map50": lambda s: s.map50(),
-        }[key]
-        a, b = getter(band_stats["0-200m"]), getter(band_stats["200-400m"])
-        print(f"{label:<32} {format_metric(a, pct):>10} {format_metric(b, pct):>10}")
-
-    print(f"\nEval wall time: {payload['timing']['elapsed_human']} ({run_elapsed_sec:.1f}s)")
-    for item in payload["timing"]["clips"]:
-        fps = item.get("frames_per_sec")
-        fps_s = f", {fps:.2f} frame/s" if fps is not None else ""
-        vid = item.get("video_sec") or 0
-        vid_s = f", video {vid:.1f}s" if vid else ""
-        print(
-            f"  {item['clip']}: {item.get('elapsed_sec', 0):.1f}s "
-            f"(infer {item.get('infer_sec', 0):.1f}s{fps_s}{vid_s})"
+def main() -> None:
+    args = parse_args()
+    weights = Path(args.weights)
+    if not weights.exists():
+        raise SystemExit(
+            f"Weights not found: {weights}\n"
+            "Train first: python src/training/train.py"
         )
 
-    print(f"\nSaved: {json_path}")
-    print(f"Saved: {md_path}")
-    for result in clip_results:
-        video = result.get("prediction_video")
-        if video:
-            print(f"Saved: {video}")
+    if args.live:
+        clip_names = args.clips or list(DEFAULT_BAND_CLIPS.values())
+        out_dir = Path(args.output_dir) if args.output_dir else OUTPUTS_DIR / "eval_live"
+        video_dir = None
+        if not args.no_video:
+            video_dir = Path(args.video_dir) if args.video_dir else out_dir / "videos"
+        evaluate_live(
+            weights=weights,
+            conf_override=args.conf,
+            iou_thresh=args.iou,
+            clip_names=clip_names,
+            output_dir=out_dir,
+            video_dir=video_dir,
+        )
+        return
+
+    tile_config = load_clip_tile_config()
+    if args.dataset:
+        gt_name = args.gt if args.gt != "both" else "custom"
+        out_dir = (
+            Path(args.output_dir)
+            if args.output_dir
+            else OUTPUTS_DIR / f"eval_{Path(args.dataset).name}"
+        )
+        evaluate_prepared_pack(
+            Path(args.dataset),
+            weights=weights,
+            gt_name=gt_name,
+            conf_override=args.conf,
+            iou_thresh=args.iou,
+            clip_filter=args.clips,
+            output_dir=out_dir,
+            tile_config=tile_config,
+        )
+        return
+
+    targets = ("autolabel", "manual") if args.gt == "both" else (args.gt,)
+    for gt_name in targets:
+        pack = EVAL_PACKS[gt_name]
+        if args.output_dir and len(targets) == 1:
+            out_dir = Path(args.output_dir)
+        else:
+            out_dir = OUTPUTS_DIR / f"eval_{gt_name}"
+        evaluate_prepared_pack(
+            pack,
+            weights=weights,
+            gt_name=gt_name,
+            conf_override=args.conf,
+            iou_thresh=args.iou,
+            clip_filter=args.clips,
+            output_dir=out_dir,
+            tile_config=tile_config,
+        )
 
 
 if __name__ == "__main__":

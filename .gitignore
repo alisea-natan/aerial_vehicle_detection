@@ -37,7 +37,10 @@ debug/
 # --- Manual labeling packs (large / regenerable; keep scripts + README) ---
 labelling/Vehicle.v1i.yolov8/
 labelling/cvat/coco_export/
-labelling/cvat/label_man/
+# Optional CVAT / Roboflow working copies (not pipeline GT — that is labels/).
+labelling/cvat/
+labelling/roboflow/
+
 labelling/roboflow/roboflow/
 labelling/roboflow/roboflow_upload/
 labelling/roboflow/roboflow_ui_upload_8457857/
@@ -77,13 +80,13 @@ mlflow.db
 .mlflow/
 mlflow_server/
 
-# --- Dataset versions: local only (never push blobs / *.dvc to GitLab) ---
+# --- Dataset versions: local only (never commit blobs / *.dvc) ---
 data/datasets/**
 !data/datasets/README.md
 !data/datasets/.gitignore
 data/dataset/
 
-# --- DVC: local cache + remote; do not rely on GitLab for dataset pointers ---
+# --- DVC: local cache + remote ---
 .dvc/cache/
 .dvc/tmp/
 .dvc/tmp/**

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build labelling/roboflow/roboflow/ packs from frames + label_man.
+"""Build labelling/roboflow/roboflow/ packs from frames + labels/ (CVAT via cvat_pull).
 
   python src/labeling/roboflow/prepare_roboflow.py --clean
 """
@@ -26,12 +26,16 @@ import shutil
 from pathlib import Path
 
 
-from common.config import PROJECT_ROOT, clip_skip_reason, is_clip_skipped
+from common.config import (
+    LABELS_DIR,
+    PROJECT_ROOT,
+    SPLITS,
+    clip_skip_reason,
+    is_clip_skipped,
+)
 
 FRAMES_DIR = PROJECT_ROOT / "data" / "frames"
-LABEL_MAN_DIR = PROJECT_ROOT / "labelling" / "cvat" / "label_man"
 OUT_DIR = PROJECT_ROOT / "labelling" / "roboflow" / "roboflow"
-MANUAL_SUBDIRS = ("obj_Train_data", "obj_Test_data")
 CLASS_NAMES = ["vehicle"]
 
 DATA_YAML_TEMPLATE = """\
@@ -50,23 +54,22 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def find_manual_label_dir(clip_dir: Path) -> Path | None:
-    for name in MANUAL_SUBDIRS:
-        candidate = clip_dir / name
-        if candidate.is_dir() and any(candidate.glob("*.txt")):
-            return candidate
+def find_cvat_label_dir(clip: str) -> Path | None:
+    for split in SPLITS:
+        path = LABELS_DIR / split / clip
+        if path.is_dir() and any(path.glob("*.txt")):
+            return path
     return None
 
 
 def prepare_clip(
     clip: str,
     frames_root: Path,
-    man_root: Path,
     out_root: Path,
     *,
     copy_images: bool,
 ) -> tuple[int, int]:
-    """Returns (n_frames, n_labels_from_man)."""
+    """Returns (n_frames, n_labels)."""
     frame_dir = frames_root / clip
     jpg_paths = sorted(frame_dir.glob("*.jpg"))
     if not jpg_paths:
@@ -90,12 +93,14 @@ def prepare_clip(
         else:
             dest.symlink_to(jpg.resolve())
 
-    man_dir = find_manual_label_dir(man_root / clip) if (man_root / clip).is_dir() else None
+    cvat_dir = find_cvat_label_dir(clip)
     n_labels = 0
-    if man_dir is not None:
+    if cvat_dir is not None:
         labels_dir.mkdir(parents=True, exist_ok=True)
         frame_stems = {jpg.stem for jpg in jpg_paths}
-        for src_txt in sorted(man_dir.glob("*.txt")):
+        for src_txt in sorted(cvat_dir.glob("*.txt")):
+            if src_txt.name.lower() == "classes.txt":
+                continue
             if src_txt.stem not in frame_stems:
                 continue
             shutil.copy2(src_txt, labels_dir / src_txt.name)
@@ -106,17 +111,16 @@ def prepare_clip(
         encoding="utf-8",
     )
 
-    if man_dir is None:
-        print(f"[ok] {clip}: {len(jpg_paths)} images, no labels/ (no label_man)")
+    if cvat_dir is None:
+        print(f"[ok] {clip}: {len(jpg_paths)} images, no CVAT labels in labels/")
     else:
-        print(f"[ok] {clip}: {len(jpg_paths)} images, {n_labels} labels from label_man")
+        print(f"[ok] {clip}: {len(jpg_paths)} images, {n_labels} labels from {cvat_dir}")
     return len(jpg_paths), n_labels
 
 
 def main() -> None:
     args = parse_args()
     frames_root = FRAMES_DIR
-    man_root = LABEL_MAN_DIR
     out_root = OUT_DIR
 
     if not frames_root.is_dir():
@@ -143,7 +147,7 @@ def main() -> None:
     total_labels = 0
     for clip in clips:
         n_f, n_l = prepare_clip(
-            clip, frames_root, man_root, out_root, copy_images=args.copy_images
+            clip, frames_root, out_root, copy_images=args.copy_images
         )
         total_frames += n_f
         total_labels += n_l

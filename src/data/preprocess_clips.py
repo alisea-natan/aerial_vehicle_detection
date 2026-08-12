@@ -9,6 +9,7 @@ detections only (person→car alias; ignores truck/bus/bike) to estimate:
   - distance per segment and whether it changes along the video
   - suggested label frame_step = floor(size × fraction / speed_px_per_frame)
   - suggested train_groups band from car size
+  - skip=true when median size < MIN_USABLE_OBJECT_PX (consumed by autolabel/train/eval)
 
 Replaces the old middle-only probe_clips.py flow. Backward-compatible CLI:
   python src/data/preprocess_clips.py
@@ -43,6 +44,7 @@ from common.config import (
     DEBUG_DIR,
     FALLBACK_LABEL_THRESHOLD,
     FALLBACK_TILES,
+    MIN_USABLE_OBJECT_PX,
     PROBE_CLASS_ALIASES,
     PROBE_MAX_LABEL_THRESHOLD,
     RAW_CONFIDENCE_THRESHOLD,
@@ -59,7 +61,6 @@ from common.config import (
     probe_detection_class,
     probe_model_classes,
     probe_result_to_config_entry,
-    reject_if_clip_skipped,
     save_clip_tile_config,
 )
 from common.detect import (
@@ -80,7 +81,7 @@ TRACK_IOU = 0.3
 # Relative size change start↔end (or band mismatch) ⇒ distance_varies
 SIZE_CHANGE_RATIO = 0.30
 # Suggested train group from median car long-side (full-frame px)
-TRAIN_GROUP_FAR_MAX = 32.0
+TRAIN_GROUP_FAR_MAX = MIN_USABLE_OBJECT_PX  # below → C_far + skip
 TRAIN_GROUP_MED_MAX = 80.0
 
 
@@ -92,11 +93,6 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--clip", default=None, help="Single clip (video stem).")
-    parser.add_argument(
-        "--include-skipped",
-        action="store_true",
-        help="Also process clips marked skip=true in clip_tiling.json.",
-    )
     parser.add_argument(
         "--per-segment",
         type=int,
@@ -546,11 +542,9 @@ def main() -> None:
         clip_filter = Path(clip_filter).stem
 
     split_map = build_split_map()
-    if clip_filter:
-        reject_if_clip_skipped(clip_filter, allow_skipped=args.include_skipped)
-    clip_dirs = iter_frame_clip_dirs(
-        clip_filter, include_skipped=args.include_skipped
-    )
+    # Always re-probe every clip (including previously skipped). skip=true is a
+    # *result* written after measuring object size, consumed by autolabel/train/eval.
+    clip_dirs = iter_frame_clip_dirs(clip_filter, include_skipped=True)
     if not clip_dirs:
         raise SystemExit("No frame folders found under data/frames/.")
 
@@ -609,8 +603,7 @@ def main() -> None:
             "last_probe_elapsed_sec": run_elapsed,
             "preprocess_note": (
                 "car-only size/distance from start/middle/end samples; "
-                "frame_step=floor(size×fraction/speed); "
-                "label_box_stats.py remains optional post-label QA"
+                "frame_step=floor(size x fraction/speed)"
             ),
         },
     )
@@ -638,9 +631,9 @@ def main() -> None:
 
     print(
         f"\n{'clip':<36} {'tiles':>5} {'size':>6} {'dist':>6} {'vary':>4} "
-        f"{'step':>5} {'group':>9} {'sec':>6}"
+        f"{'step':>5} {'group':>9} {'skip':>4} {'sec':>6}"
     )
-    print("-" * 90)
+    print("-" * 96)
     for item in results:
         entry = probe_result_to_config_entry(item)
         tiles = str(entry["target_tiles"])
@@ -653,10 +646,13 @@ def main() -> None:
         vary = "yes" if item.get("distance_varies") else "no"
         step = str(item["frame_step"]) if item.get("frame_step") is not None else "-"
         group = item.get("suggested_train_group") or "-"
+        skipped = "yes" if entry.get("skip") else "no"
         print(
             f"{item['clip']:<36} {tiles:>5} {size:>6} {dist:>6} {vary:>4} "
-            f"{step:>5} {group:>9} {item['total_probe_sec']:>5.1f}s"
+            f"{step:>5} {group:>9} {skipped:>4} {item['total_probe_sec']:>5.1f}s"
         )
+        if entry.get("skip"):
+            print(f"  → mark skip: {entry.get('skip_reason')}")
 
     print(f"\nConfig: {config_path}")
     print(f"Report: {report_path} (total {run_elapsed}s)")

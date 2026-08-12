@@ -36,14 +36,11 @@ TILE_CANDIDATES = (1, 2, 3, 4, 6, 8, 12)
 TILE_HEADROOM_STEPS = 1
 
 # Train/eval model input. Per-clip crop comes from train_groups in clip_tiling.json
-# (explicit tile_size from object-size bands), not from scale_coeff.
+# (explicit tile_size from object-size bands).
 TRAIN_IMGSZ = 1024
 TRAIN_OVERLAP_RATIO = 0.2
-TARGET_OBJECT_LONG_PX = 64.0
-DEFAULT_SCALE_COEFF = 1.0
-SCALE_COEFF_MIN = 0.4
-SCALE_COEFF_MAX = 3.0
-MIN_TRAIN_SLICE_PX = 256
+# Preprocess marks skip=true when median car long-side is below this (C_far band).
+MIN_USABLE_OBJECT_PX = 32.0
 
 
 @dataclass(frozen=True)
@@ -304,50 +301,6 @@ def next_tile_candidate(tiles: int, steps: int = TILE_HEADROOM_STEPS) -> int:
     return TILE_CANDIDATES[min(idx + steps, len(TILE_CANDIDATES) - 1)]
 
 
-def clamp_scale_coeff(scale: float) -> float:
-    return float(min(SCALE_COEFF_MAX, max(SCALE_COEFF_MIN, scale)))
-
-
-def scale_coeff_from_median(
-    ff_p50: float,
-    *,
-    target_px: float = TARGET_OBJECT_LONG_PX,
-) -> float:
-    """Choose scale so median full-frame long-side ≈ target_px after imgsz resize."""
-    if ff_p50 is None or ff_p50 <= 0:
-        return DEFAULT_SCALE_COEFF
-    return round(clamp_scale_coeff(float(target_px) / float(ff_p50)), 2)
-
-
-def align_slice_size(size: int, multiple: int = 32, *, max_size: int | None = None) -> int:
-    """Floor to multiple of `multiple`, capped by frame short side."""
-    size = int(size)
-    if max_size is not None:
-        size = min(size, int(max_size))
-    size = max(MIN_TRAIN_SLICE_PX, size)
-    aligned = (size // multiple) * multiple
-    return max(multiple, aligned)
-
-
-def slice_size_from_scale(
-    scale_coeff: float,
-    frame_w: int,
-    frame_h: int,
-    *,
-    imgsz: int = TRAIN_IMGSZ,
-) -> int:
-    """Legacy helper: slice ≈ imgsz / scale_coeff (capped to frame)."""
-    coeff = clamp_scale_coeff(float(scale_coeff))
-    raw = imgsz / coeff
-    return align_slice_size(int(round(raw)), max_size=min(frame_w, frame_h))
-
-
-def resolve_scale_coeff(clip_cfg: dict | None, default: float = DEFAULT_SCALE_COEFF) -> float:
-    if not clip_cfg or "scale_coeff" not in clip_cfg:
-        return float(default)
-    return clamp_scale_coeff(float(clip_cfg["scale_coeff"]))
-
-
 def save_clip_tile_config(
     clips: dict[str, dict],
     path: Path | None = None,
@@ -368,8 +321,6 @@ def save_clip_tile_config(
     for key in (
         "train_groups",
         "train_imgsz",
-        "target_object_long_px",
-        "scale_coeff_note",
         "model_name",
         "raw_confidence_threshold",
         "probe_max_label_threshold",
@@ -385,9 +336,6 @@ def save_clip_tile_config(
         "frames_per_segment",
         "frame_step_fraction",
         "preprocess_note",
-        "scale_coeff_source",
-        "scale_coeff_updated_at",
-        "scale_coeff_formula",
     ):
         if key in existing and key not in payload:
             payload[key] = existing[key]
@@ -466,6 +414,15 @@ def probe_result_to_config_entry(result: dict) -> dict:
     entry["frame_step_fraction"] = result.get("frame_step_fraction")
     entry["suggested_train_group"] = result.get("suggested_train_group")
     entry["frames_probed_by_segment"] = result.get("frames_probed_by_segment")
+
+    # Skip is a preprocess *result*, not an input: too-small objects → unusable.
+    size_med = result.get("object_size_px_median")
+    if size_med is not None and float(size_med) < MIN_USABLE_OBJECT_PX:
+        entry["skip"] = True
+        entry["skip_reason"] = (
+            f"objects too small for reliable detection "
+            f"(~{float(size_med):.0f} px median); do not train/eval/autolabel"
+        )
     return entry
 
 
@@ -476,18 +433,8 @@ def merge_probe_results(
     merged = dict(existing)
     for result in probe_results:
         clip_name = result["clip"]
-        entry = probe_result_to_config_entry(result)
-        # Preserve scale_coeff from label_box_stats.py and manual skip flags across re-probes.
-        old = existing.get(clip_name, {})
-        if "scale_coeff" in old:
-            entry["scale_coeff"] = old["scale_coeff"]
-            if "scale_coeff_note" in old:
-                entry["scale_coeff_note"] = old["scale_coeff_note"]
-        if old.get("skip"):
-            entry["skip"] = True
-            if old.get("skip_reason"):
-                entry["skip_reason"] = old["skip_reason"]
-        merged[clip_name] = entry
+        # Fresh probe entry replaces the clip (including prior skip flags).
+        merged[clip_name] = probe_result_to_config_entry(result)
     return merged
 
 
@@ -526,7 +473,6 @@ def resolve_clip_tile_config(
         "distance_m": cfg.get("distance_m"),
         "note": str(cfg.get("note", "")),
         "uses_sahi": target_tiles > 1,
-        "scale_coeff": resolve_scale_coeff(cfg),
         "object_size_px_median": cfg.get("object_size_px_median"),
         "object_size_px_mean": cfg.get("object_size_px_mean"),
         "distance_varies": bool(cfg.get("distance_varies", False)),

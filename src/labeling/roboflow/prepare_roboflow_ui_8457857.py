@@ -32,9 +32,7 @@ CLIP_DIR = "8457857-uhd_3840_2160_24fps"
 VIDEO_ID = "8457857"
 STEP = 5
 FRAMES_DIR = PROJECT_ROOT / "data" / "frames" / CLIP_DIR
-LABEL_MAN_DIR = (
-    PROJECT_ROOT / "labelling" / "cvat" / "label_man" / CLIP_DIR / "obj_Train_data"
-)
+CVAT_LABELS_DIR = PROJECT_ROOT / "labels" / "train" / CLIP_DIR
 PROJECT_YAML = PROJECT_ROOT / "labelling" / "roboflow" / "Vehicle_roboflow" / "data.yaml"
 OUT_DIR = PROJECT_ROOT / "labelling" / "roboflow" / "roboflow_ui_upload_8457857"
 
@@ -64,8 +62,8 @@ def classes_from_yaml(path: Path) -> list[str]:
 def main() -> None:
     if not FRAMES_DIR.is_dir():
         raise SystemExit(f"Missing frames: {FRAMES_DIR}")
-    if not LABEL_MAN_DIR.is_dir():
-        raise SystemExit(f"Missing label_man: {LABEL_MAN_DIR}")
+    if not CVAT_LABELS_DIR.is_dir():
+        raise SystemExit(f"Missing CVAT labels: {CVAT_LABELS_DIR}")
     if not PROJECT_YAML.is_file():
         raise SystemExit(f"Missing project yaml: {PROJECT_YAML}")
 
@@ -82,9 +80,9 @@ def main() -> None:
     n_null = 0
 
     for jpg in sampled:
-        src_txt = LABEL_MAN_DIR / f"{jpg.stem}.txt"
+        src_txt = CVAT_LABELS_DIR / f"{jpg.stem}.txt"
         if not src_txt.is_file():
-            raise SystemExit(f"Missing label_man for frame: {src_txt}")
+            raise SystemExit(f"Missing CVAT label for frame: {src_txt}")
 
         stem = f"{VIDEO_ID}_{jpg.stem}"
         shutil.copy2(jpg.resolve(), OUT_DIR / f"{stem}.jpg")

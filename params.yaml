@@ -5,7 +5,7 @@ prepare:
   val_fraction: 0.15
   seed: 42
 
-# Versioned baseline prepare defaults (local data/datasets/ only — not GitLab).
+# Versioned baseline prepare defaults (local data/datasets/ only).
 # GT:     python src/training/prepare_baseline.py
 # Pseudo: python src/training/prepare_baseline.py --from-autolabel  → baseline_v0
 baseline:
@@ -17,6 +17,16 @@ baseline:
   frame_step_only: true
   balance: false
   empty_slices_per_frame: 0
+
+# Ablation packs: config/datasets/variants.yaml
+#   python src/training/datasets/generate_variant.py --all
+# Round 1 (datasets): python src/training/experiments/run_dataset_round.py --dry-run
+# Round 2 (models):   python src/training/experiments/run_model_round.py --dry-run
+experiment:
+  model: yolo11n.pt
+  imgsz: 640
+  epochs: 10
+  warmup_epochs: 2
 
 train:
   model: yolo11s.pt

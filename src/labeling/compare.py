@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare CVAT manual labels (labelling/cvat/label_man/) with labels/.
+"""Compare CVAT labels (labels/, from cvat_pull --sync-labels) vs YOLO-World autolabel.
 
   python src/labeling/compare.py
   python src/labeling/compare.py --iou 0.5 --clip 266987
@@ -28,12 +28,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 
-from common.config import PROJECT_ROOT, LABELS_DIR, build_split_map
+from common.config import PROJECT_ROOT, LABELS_DIR, SPLITS, build_split_map
 
-LABEL_MAN_DIR = PROJECT_ROOT / "labelling" / "cvat" / "label_man"
-DEFAULT_OUT = PROJECT_ROOT / "debug" / "compare_labels_report.txt"
+# CVAT extract (source of truth for human GT). Autolabel never writes here.
+CVAT_LABELS_DIR = LABELS_DIR
+AUTOLABEL_LABELS_DIR = PROJECT_ROOT / "outputs" / "autolabel" / "labels"
+DEFAULT_OUT = PROJECT_ROOT / "debug" / "compare_autolabel_vs_cvat.txt"
 DEFAULT_IOU = 0.5
-MANUAL_SUBDIRS = ("obj_Train_data", "obj_Test_data")
 
 
 @dataclass
@@ -41,7 +42,7 @@ class FrameStats:
     stem: str
     n_manual: int
     n_auto: int
-    match_ious: list[float]  # one IoU per matched pair (greedy, any IoU > 0)
+    match_ious: list[float]
     tp: int
     fp: int
     fn: int
@@ -108,12 +109,15 @@ class ClipStats:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Compare label_man (CVAT) vs labels/ (autolabel) — IoU + bbox counts.",
+        description=(
+            "Compare CVAT labels (labels/, from cvat_pull) vs "
+            "YOLO-World autolabel (outputs/autolabel/labels/)."
+        ),
     )
     parser.add_argument(
         "--clip",
         default=None,
-        help="Compare one clip only (default: every folder under label_man/).",
+        help="Compare one clip only (default: every clip under labels/).",
     )
     parser.add_argument(
         "--iou",
@@ -122,25 +126,24 @@ def parse_args() -> argparse.Namespace:
         help=f"IoU threshold for TP match (default {DEFAULT_IOU}).",
     )
     parser.add_argument(
-        "--man-dir",
-        default=str(LABEL_MAN_DIR),
-        help="Root of CVAT exports (default label_man/).",
+        "--cvat-dir",
+        default=str(CVAT_LABELS_DIR),
+        help="CVAT extract root (default labels/).",
     )
     parser.add_argument(
-        "--labels-dir",
-        default=str(LABELS_DIR),
-        help="Root of autolabels (default labels/).",
+        "--autolabel-dir",
+        default=str(AUTOLABEL_LABELS_DIR),
+        help="Autolabel root (default outputs/autolabel/labels/).",
     )
     parser.add_argument(
         "--out",
         default=str(DEFAULT_OUT),
-        help=f"Report .txt path (default {DEFAULT_OUT}).",
+        help=f"Report .txt path (default {DEFAULT_OUT.name}).",
     )
     return parser.parse_args()
 
 
 def yolo_line_to_xyxy(parts: list[str]) -> list[float] | None:
-    """Normalized YOLO → [x1, y1, x2, y2] in the same normalized space."""
     if len(parts) < 5:
         return None
     try:
@@ -177,7 +180,9 @@ def box_iou(a: list[float], b: list[float]) -> float:
     inter_y1 = max(ay1, by1)
     inter_x2 = min(ax2, bx2)
     inter_y2 = min(ay2, by2)
-    inter = max(0.0, inter_x2 - inter_x1) * max(0.0, inter_y2 - inter_y1)
+    iw = max(0.0, inter_x2 - inter_x1)
+    ih = max(0.0, inter_y2 - inter_y1)
+    inter = iw * ih
     if inter <= 0:
         return 0.0
     area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
@@ -191,11 +196,6 @@ def match_boxes(
     pred_boxes: list[list[float]],
     iou_thresh: float,
 ) -> tuple[list[float], int, int, int]:
-    """Greedy best-IoU matching. Returns (pair_ious, tp, fp, fn).
-
-    pair_ious: IoU of every greedy pair with IoU > 0 (for mean IoU).
-    TP = pairs with IoU ≥ thresh; FN = |GT| − TP; FP = |pred| − TP.
-    """
     gt_used = [False] * len(gt_boxes)
     pred_used = [False] * len(pred_boxes)
     pair_ious: list[float] = []
@@ -221,54 +221,50 @@ def match_boxes(
     return pair_ious, tp, fp, fn
 
 
-def find_manual_label_dir(clip_dir: Path) -> Path | None:
-    for name in MANUAL_SUBDIRS:
-        candidate = clip_dir / name
-        if candidate.is_dir() and any(candidate.glob("*.txt")):
-            return candidate
-    return None
-
-
-def find_auto_label_dir(clip: str, labels_root: Path, split_map: dict[str, str]) -> Path | None:
+def find_split_clip_dir(root: Path, clip: str, split_map: dict[str, str]) -> Path | None:
     split = split_map.get(clip)
     if split:
-        path = labels_root / split / clip
+        path = root / split / clip
         if path.is_dir():
             return path
-    for split in ("train", "eval"):
-        path = labels_root / split / clip
+    for split in SPLITS:
+        path = root / split / clip
         if path.is_dir():
             return path
     return None
+
+
+def list_cvat_clips(cvat_root: Path) -> list[tuple[str, str, Path]]:
+    """Return (clip, split, dir) for every labels/{split}/{clip}/ with .txt files."""
+    found: list[tuple[str, str, Path]] = []
+    for split in SPLITS:
+        split_dir = cvat_root / split
+        if not split_dir.is_dir():
+            continue
+        for clip_dir in sorted(split_dir.iterdir()):
+            if not clip_dir.is_dir() or clip_dir.name.startswith("."):
+                continue
+            if not any(clip_dir.glob("*.txt")):
+                continue
+            found.append((clip_dir.name, split, clip_dir))
+    return found
 
 
 def compare_clip(
     clip: str,
-    man_root: Path,
-    labels_root: Path,
-    split_map: dict[str, str],
+    split: str,
+    cvat_dir: Path,
+    auto_dir: Path,
     iou_thresh: float,
-) -> ClipStats | None:
-    clip_dir = man_root / clip
-    manual_dir = find_manual_label_dir(clip_dir)
-    if manual_dir is None:
-        print(f"[skip] {clip}: no obj_Train_data / obj_Test_data under {clip_dir}")
-        return None
-
-    auto_dir = find_auto_label_dir(clip, labels_root, split_map)
-    if auto_dir is None:
-        print(f"[skip] {clip}: no autolabels under {labels_root}/{{train,eval}}/{clip}")
-        return None
-
-    split = split_map.get(clip, auto_dir.parent.name)
-    man_stems = {p.stem for p in manual_dir.glob("*.txt")}
-    auto_stems = {p.stem for p in auto_dir.glob("*.txt")}
+) -> ClipStats:
+    man_stems = {p.stem for p in cvat_dir.glob("*.txt") if p.name.lower() != "classes.txt"}
+    auto_stems = {p.stem for p in auto_dir.glob("*.txt") if p.name.lower() != "classes.txt"}
     common = sorted(man_stems & auto_stems)
 
     stats = ClipStats(
         clip=clip,
         split=split,
-        manual_dir=manual_dir,
+        manual_dir=cvat_dir,
         auto_dir=auto_dir,
         iou_thresh=iou_thresh,
         only_manual=sorted(man_stems - auto_stems),
@@ -276,7 +272,7 @@ def compare_clip(
     )
 
     for stem in common:
-        gt = parse_yolo_boxes(manual_dir / f"{stem}.txt")
+        gt = parse_yolo_boxes(cvat_dir / f"{stem}.txt")
         pred = parse_yolo_boxes(auto_dir / f"{stem}.txt")
         ious, tp, fp, fn = match_boxes(gt, pred, iou_thresh)
         stats.frames.append(
@@ -315,26 +311,26 @@ def format_clip_report(stats: ClipStats) -> list[str]:
     lines = [
         "=" * 72,
         f"CLIP: {stats.clip}  (split={stats.split})",
-        f"  manual: {stats.manual_dir}",
-        f"  auto:   {stats.auto_dir}",
+        f"  cvat:      {stats.manual_dir}",
+        f"  autolabel: {stats.auto_dir}",
         f"  IoU threshold (TP): {stats.iou_thresh}",
         "-" * 72,
         "SUMMARY",
         f"  frames compared:     {stats.n_frames}",
-        f"  frames only manual:  {len(stats.only_manual)}",
+        f"  frames only cvat:    {len(stats.only_manual)}",
         f"  frames only auto:    {len(stats.only_auto)}",
-        f"  total bboxes manual: {stats.total_manual}",
+        f"  total bboxes cvat:   {stats.total_manual}",
         f"  total bboxes auto:   {stats.total_auto}",
-        f"  delta (auto-manual): {stats.total_auto - stats.total_manual}",
+        f"  delta (auto-cvat):   {stats.total_auto - stats.total_manual}",
         f"  matched pairs (IoU>0): {len(ious)}",
         f"  mean IoU (matched):  {fmt_float(mean_iou)}",
         f"  median IoU (matched):{fmt_float(median_iou)}",
         f"  mean IoU (TP≥thresh):{fmt_float(mean_strong)}",
         f"  TP / FP / FN:        {stats.total_tp} / {stats.total_fp} / {stats.total_fn}",
         f"  precision (auto):    {fmt_pct(stats.precision())}",
-        f"  recall (vs manual):  {fmt_pct(stats.recall())}",
+        f"  recall (vs cvat):    {fmt_pct(stats.recall())}",
         "-" * 72,
-        "PER-FRAME  (stem | n_man | n_auto | delta | matched | mean_iou | TP FP FN)",
+        "PER-FRAME  (stem | n_cvat | n_auto | delta | matched | mean_iou | TP FP FN)",
     ]
 
     for f in stats.frames:
@@ -348,11 +344,11 @@ def format_clip_report(stats: ClipStats) -> list[str]:
     if stats.only_manual:
         preview = ", ".join(stats.only_manual[:10])
         more = f" … (+{len(stats.only_manual) - 10})" if len(stats.only_manual) > 10 else ""
-        lines.append(f"  [only in manual] {preview}{more}")
+        lines.append(f"  [only in cvat] {preview}{more}")
     if stats.only_auto:
         preview = ", ".join(stats.only_auto[:10])
         more = f" … (+{len(stats.only_auto) - 10})" if len(stats.only_auto) > 10 else ""
-        lines.append(f"  [only in auto]   {preview}{more}")
+        lines.append(f"  [only in auto] {preview}{more}")
 
     lines.append("")
     return lines
@@ -360,7 +356,7 @@ def format_clip_report(stats: ClipStats) -> list[str]:
 
 def format_report(all_stats: list[ClipStats], iou_thresh: float) -> str:
     lines = [
-        "Manual (label_man / CVAT) vs Autolabel (labels/) comparison",
+        "CVAT (labels/, from cvat_pull) vs YOLO-World autolabel (outputs/autolabel/labels/)",
         f"IoU match threshold: {iou_thresh}",
         f"Clips: {len(all_stats)}",
         "",
@@ -369,13 +365,12 @@ def format_report(all_stats: list[ClipStats], iou_thresh: float) -> str:
         lines.extend(format_clip_report(stats))
 
     if len(all_stats) > 1:
-        lines.append("=" * 72)
-        lines.append("OVERALL (all clips)")
         tot_man = sum(s.total_manual for s in all_stats)
         tot_auto = sum(s.total_auto for s in all_stats)
         tot_tp = sum(s.total_tp for s in all_stats)
         tot_fp = sum(s.total_fp for s in all_stats)
         tot_fn = sum(s.total_fn for s in all_stats)
+        lines.extend(["=" * 72, "OVERALL (all clips)"])
         all_ious: list[float] = []
         for s in all_stats:
             all_ious.extend(s.all_match_ious)
@@ -385,7 +380,7 @@ def format_report(all_stats: list[ClipStats], iou_thresh: float) -> str:
         lines.extend(
             [
                 f"  frames:              {sum(s.n_frames for s in all_stats)}",
-                f"  total bboxes manual: {tot_man}",
+                f"  total bboxes cvat:   {tot_man}",
                 f"  total bboxes auto:   {tot_auto}",
                 f"  mean IoU (matched):  {fmt_float(mean_iou)}",
                 f"  TP / FP / FN:        {tot_tp} / {tot_fp} / {tot_fn}",
@@ -399,33 +394,44 @@ def format_report(all_stats: list[ClipStats], iou_thresh: float) -> str:
 
 def main() -> None:
     args = parse_args()
-    man_root = Path(args.man_dir)
-    labels_root = Path(args.labels_dir)
+    cvat_root = Path(args.cvat_dir)
+    auto_root = Path(args.autolabel_dir)
     out_path = Path(args.out)
 
-    if not man_root.is_dir():
-        raise SystemExit(f"Manual label root not found: {man_root}")
+    if not cvat_root.is_dir():
+        raise SystemExit(
+            f"CVAT labels not found: {cvat_root}\n"
+            "Pull with: python src/labeling/cvat_pull.py --verify --sync-labels"
+        )
+    if not auto_root.is_dir():
+        raise SystemExit(
+            f"Autolabel labels not found: {auto_root}\n"
+            "Run: python src/labeling/autolabel.py"
+        )
 
     split_map = build_split_map()
-    clip_names = sorted(
-        d.name
-        for d in man_root.iterdir()
-        if d.is_dir() and not d.name.startswith(".")
-    )
+    clips = list_cvat_clips(cvat_root)
     if args.clip:
         clip_filter = Path(args.clip).stem
-        clip_names = [c for c in clip_names if c == clip_filter]
-        if not clip_names:
-            raise SystemExit(f"Clip {clip_filter!r} not found under {man_root}")
+        clips = [c for c in clips if c[0] == clip_filter]
+        if not clips:
+            raise SystemExit(f"Clip {clip_filter!r} not found under {cvat_root}")
 
     all_stats: list[ClipStats] = []
-    for clip in clip_names:
-        stats = compare_clip(clip, man_root, labels_root, split_map, args.iou)
-        if stats is not None:
-            all_stats.append(stats)
+    for clip, split, cvat_dir in clips:
+        auto_dir = find_split_clip_dir(auto_root, clip, split_map)
+        if auto_dir is None:
+            print(f"[skip] {clip}: no autolabels under {auto_root}/{{train,eval}}/{clip}")
+            continue
+        all_stats.append(
+            compare_clip(clip, split, cvat_dir, auto_dir, args.iou)
+        )
 
     if not all_stats:
-        raise SystemExit("No clips compared — check label_man/ and labels/ paths.")
+        raise SystemExit(
+            "No clips compared — need both labels/{split}/{clip}/ "
+            "and outputs/autolabel/labels/{split}/{clip}/."
+        )
 
     report = format_report(all_stats, args.iou)
     print(report)
