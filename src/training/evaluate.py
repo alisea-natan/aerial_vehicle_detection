@@ -20,6 +20,7 @@ _ensure_src_on_path()
 
 import argparse
 import json
+import math
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -30,6 +31,8 @@ import numpy as np
 import yaml
 from sahi.slicing import slice_image
 from ultralytics import YOLO
+
+from training.model_load import load_ultralytics_model, predict_device
 
 from common.config import (
     CLIP_TILING_CONFIG_PATH,
@@ -65,12 +68,21 @@ VEHICLE_CLASS = "vehicle"
 PRED_COLOR = (0, 200, 0)  # BGR green
 
 TILE_NMS_IOU = 0.5
+PRED_NMS_IOU = 0.7
+SOFT_NMS_SIGMA = 0.5
 PREDICT_BATCH_SIZE = 8
 
 # One eval clip per band; whole clip inherits probe distance band (no per-frame distance).
+# A = <200 m, B = >200 m. JSON keys stay 0-200m / 200-400m for Round 1 compatibility.
+EVAL_BAND_A = "0-200m"
+EVAL_BAND_B = "200-400m"
+BAND_LABELS = {
+    EVAL_BAND_A: "A (<200m)",
+    EVAL_BAND_B: "B (>200m)",
+}
 DEFAULT_BAND_CLIPS = {
-    "0-200m": "13722965_2160_3840_30fps",
-    "200-400m": "266987",
+    EVAL_BAND_A: "13722965_2160_3840_30fps",
+    EVAL_BAND_B: "266987",
 }
 
 CLIP_EVAL_BAND = {clip: band for band, clip in DEFAULT_BAND_CLIPS.items()}
@@ -438,6 +450,89 @@ def nms_boxes(boxes: list[Box], iou_thresh: float) -> list[Box]:
     return kept
 
 
+def soft_nms_boxes(
+    boxes: list[Box],
+    iou_thresh: float,
+    *,
+    sigma: float = SOFT_NMS_SIGMA,
+    score_thresh: float = 0.001,
+    method: str = "gaussian",
+) -> list[Box]:
+    """Bodla et al. Soft-NMS: decay overlapping scores instead of dropping boxes.
+
+    Gaussian (default): ``s *= exp(-(iou²)/σ)`` for every other box.
+    Linear: ``s *= (1 - iou)`` when IoU ≥ ``iou_thresh``.
+    Boxes whose decayed score falls below ``score_thresh`` are removed.
+    """
+    if not boxes:
+        return []
+    remaining = [Box(xyxy=list(b.xyxy), confidence=float(b.confidence)) for b in boxes]
+    kept: list[Box] = []
+    method = method.lower()
+    while remaining:
+        remaining.sort(key=lambda b: b.confidence, reverse=True)
+        best = remaining.pop(0)
+        if best.confidence < score_thresh:
+            break
+        kept.append(best)
+        nxt: list[Box] = []
+        for other in remaining:
+            iou = box_iou(best.xyxy, other.xyxy)
+            if method == "linear":
+                scale = (1.0 - iou) if iou >= iou_thresh else 1.0
+            else:
+                scale = math.exp(-(iou * iou) / sigma) if iou > 0 else 1.0
+            new_score = other.confidence * scale
+            if new_score >= score_thresh:
+                nxt.append(Box(xyxy=other.xyxy, confidence=new_score))
+        remaining = nxt
+    return kept
+
+
+def split_predict_kw(predict_kw: dict | None) -> tuple[dict, str | None, dict]:
+    """Split Ultralytics predict kwargs from our NMS postprocess keys.
+
+    When ``nms`` is set (hard / off / soft), Ultralytics NMS is disabled
+    (``iou=1.0``) so all three Group C modes start from the same raw boxes.
+    """
+    extra = dict(predict_kw or {})
+    nms_mode = extra.pop("nms", None)
+    nms_iou = float(extra.pop("iou", PRED_NMS_IOU)) if nms_mode else float(extra.get("iou", PRED_NMS_IOU))
+    opts = {
+        "iou": nms_iou,
+        "sigma": float(extra.pop("soft_nms_sigma", SOFT_NMS_SIGMA)),
+        "method": str(extra.pop("soft_nms_method", "gaussian")),
+    }
+    if nms_mode:
+        extra["iou"] = 1.0
+        extra.setdefault("max_det", 300)
+    return extra, (str(nms_mode).lower() if nms_mode is not None else None), opts
+
+
+def apply_pred_nms(
+    boxes: list[Box],
+    nms_mode: str | None,
+    *,
+    iou: float,
+    score_thresh: float,
+    sigma: float = SOFT_NMS_SIGMA,
+    method: str = "gaussian",
+) -> list[Box]:
+    if nms_mode in (None, "off", "none"):
+        return boxes
+    if nms_mode in ("hard", "on"):
+        return nms_boxes(boxes, iou)
+    if nms_mode in ("soft", "soft_nms"):
+        return soft_nms_boxes(
+            boxes,
+            iou,
+            sigma=sigma,
+            score_thresh=score_thresh,
+            method=method,
+        )
+    raise ValueError(f"Unknown predict nms={nms_mode!r} (use hard, off, soft)")
+
+
 def predict_frame_tiled(
     yolo_model: YOLO,
     image_path: Path,
@@ -681,7 +776,8 @@ def evaluate_clip(
         )
 
     conf = conf_override if conf_override is not None else tile_cfg["label_confidence_threshold"]
-    dev = device()
+    ckpt_hint = str(getattr(yolo_model, "ckpt_path", "") or "")
+    dev = predict_device(ckpt_hint) if ckpt_hint else device()
 
     meta = load_metadata(FRAMES_DIR / clip_name)
     img_w, img_h = int(meta["width"]), int(meta["height"])
@@ -867,30 +963,30 @@ def build_markdown_table(band_stats: dict[str, BandStats], meta: dict) -> str:
                 f"- `{item.get('clip')}`: {item.get('elapsed_sec')}s "
                 f"(infer {item.get('infer_sec')}s{fps_s}{vid_s})"
             )
-        lines.extend(["", "| Metric | 0-200 m | 200-400 m |"])
+        lines.extend(["", f"| Metric | {BAND_LABELS[EVAL_BAND_A]} | {BAND_LABELS[EVAL_BAND_B]} |"])
     else:
         lines.extend(
             [
-                "| Metric | 0-200 m | 200-400 m |",
+                f"| Metric | {BAND_LABELS[EVAL_BAND_A]} | {BAND_LABELS[EVAL_BAND_B]} |",
             ]
         )
     lines.extend(
         [
             "|--------|---------|-----------|",
-            f"| Detection rate TP/(TP+FN) | {format_metric(band_stats['0-200m'].detection_rate())} | "
-            f"{format_metric(band_stats['200-400m'].detection_rate())} |",
-            f"| Precision TP/(TP+FP) | {format_metric(band_stats['0-200m'].precision())} | "
-            f"{format_metric(band_stats['200-400m'].precision())} |",
+            f"| Detection rate TP/(TP+FN) | {format_metric(band_stats[EVAL_BAND_A].detection_rate())} | "
+            f"{format_metric(band_stats[EVAL_BAND_B].detection_rate())} |",
+            f"| Precision TP/(TP+FP) | {format_metric(band_stats[EVAL_BAND_A].precision())} | "
+            f"{format_metric(band_stats[EVAL_BAND_B].precision())} |",
             f"| False alarms / min | "
-            f"{format_metric(band_stats['0-200m'].false_alarms_per_min(), pct=False)} | "
-            f"{format_metric(band_stats['200-400m'].false_alarms_per_min(), pct=False)} |",
+            f"{format_metric(band_stats[EVAL_BAND_A].false_alarms_per_min(), pct=False)} | "
+            f"{format_metric(band_stats[EVAL_BAND_B].false_alarms_per_min(), pct=False)} |",
             f"| Time to first detection (s) | "
-            f"{format_metric(band_stats['0-200m'].time_to_first_detection_s(), pct=False)} | "
-            f"{format_metric(band_stats['200-400m'].time_to_first_detection_s(), pct=False)} |",
-            f"| mAP@0.5 | {format_metric(band_stats['0-200m'].map50())} | "
-            f"{format_metric(band_stats['200-400m'].map50())} |",
-            f"| mAP@0.5:0.95 | {format_metric(band_stats['0-200m'].map50_95())} | "
-            f"{format_metric(band_stats['200-400m'].map50_95())} |",
+            f"{format_metric(band_stats[EVAL_BAND_A].time_to_first_detection_s(), pct=False)} | "
+            f"{format_metric(band_stats[EVAL_BAND_B].time_to_first_detection_s(), pct=False)} |",
+            f"| mAP@0.5 | {format_metric(band_stats[EVAL_BAND_A].map50())} | "
+            f"{format_metric(band_stats[EVAL_BAND_B].map50())} |",
+            f"| mAP@0.5:0.95 | {format_metric(band_stats[EVAL_BAND_A].map50_95())} | "
+            f"{format_metric(band_stats[EVAL_BAND_B].map50_95())} |",
             "",
             "## Per-band counts",
             "",
@@ -933,14 +1029,17 @@ def predict_prepared_image(
     predict_imgsz: int,
     conf: float,
     dev: str,
+    predict_kw: dict | None = None,
 ) -> list[Box]:
     """Predict on an already-cropped pack image (tile or full-frame sample)."""
+    extra, nms_mode, nms_opts = split_predict_kw(predict_kw)
     results = yolo_model.predict(
         str(image_path),
         conf=conf,
         device=dev,
         imgsz=predict_imgsz,
         verbose=False,
+        **extra,
     )
     merged: list[Box] = []
     result = results[0]
@@ -954,7 +1053,14 @@ def predict_prepared_image(
             y2 = float(max(0, min(img_h, xyxy[3])))
             if x2 - x1 > 1 and y2 - y1 > 1:
                 merged.append(Box(xyxy=[x1, y1, x2, y2], confidence=score))
-    return merged
+    return apply_pred_nms(
+        merged,
+        nms_mode,
+        iou=float(nms_opts["iou"]),
+        score_thresh=conf,
+        sigma=float(nms_opts["sigma"]),
+        method=str(nms_opts["method"]),
+    )
 
 
 def _clip_fps(clip_name: str) -> float:
@@ -1032,6 +1138,7 @@ def evaluate_prepared_pack(
     clip_filter: list[str] | None,
     output_dir: Path,
     tile_config: dict[str, dict],
+    predict_kw: dict | None = None,
 ) -> None:
     """Score a frozen eval pack (images already tiled / cropped)."""
     yaml_path = dataset_dir / "data.yaml"
@@ -1080,8 +1187,10 @@ def evaluate_prepared_pack(
         f"Eval pack [{gt_name}]: {dataset_dir} "
         f"({len(image_paths)} images, clips={clip_names})"
     )
-    yolo_model = YOLO(str(weights))
-    dev = device()
+    yolo_model = load_ultralytics_model(weights)
+    dev = predict_device(str(weights))
+    if dev != device():
+        print(f"Eval on {dev} (Apple Silicon fallback for this architecture)")
     band_stats = {band: BandStats() for band in DEFAULT_BAND_CLIPS}
     clip_results: list[dict] = []
     run_t0 = time.perf_counter()
@@ -1121,6 +1230,7 @@ def evaluate_prepared_pack(
                 predict_imgsz=predict_imgsz,
                 conf=conf,
                 dev=dev,
+                predict_kw=predict_kw,
             )
             label_path = labels_dir / f"{image_path.stem}.txt"
             gt_all = parse_yolo_label_file(label_path, img_w, img_h)
@@ -1195,6 +1305,8 @@ def evaluate_prepared_pack(
             "clip_uses_tiling": payload_yaml.get("clip_uses_tiling") or {},
             "clip_group": payload_yaml.get("clip_group") or {},
             "train_metadata": str(yaml_path),
+            "predict_kw": dict(predict_kw or {}),
+            "band_labels": dict(BAND_LABELS),
         },
         "assumptions": {
             "gt_source": (
@@ -1229,6 +1341,7 @@ def evaluate_prepared_pack(
         },
         "clips_detail": clip_results,
     }
+    del yolo_model
     _write_eval_outputs(
         out_dir=output_dir,
         band_stats=band_stats,
@@ -1278,7 +1391,7 @@ def evaluate_live(
             )
 
     band_stats = {band: BandStats() for band in DEFAULT_BAND_CLIPS}
-    yolo_model = YOLO(str(weights))
+    yolo_model = load_ultralytics_model(weights)
     clip_results = []
     run_t0 = time.perf_counter()
     for clip_name in clip_names:

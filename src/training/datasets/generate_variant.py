@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Build dataset packs under data/datasets/<variant_id>/.
 
-Does not train — see ``src/training/experiments/`` for Round 1 / Round 2.
+Does not train — Round 1 is ``src/training/experiments/run_dataset_round.py``.
+
+Default: CVAT ``labels/``, frame_step, imgsz 1024 (config/datasets/variants.yaml).
 
   python src/training/datasets/generate_variant.py --list
   python src/training/datasets/generate_variant.py --variant baseline_1
@@ -52,6 +54,7 @@ from training.datasets.specs import (
     VariantSpec,
     list_variant_ids,
     load_variants_config,
+    resolve_labels_root,
     resolve_variant,
 )
 from training.train import (
@@ -463,7 +466,7 @@ def build_variant(spec: VariantSpec, *, recreate: bool = True) -> Path:
     frames = iter_labeled_frames(
         "train",
         split_map,
-        frame_step_only=False,
+        frame_step_only=spec.frame_step_only,
         labels_root=spec.labels_root,
     )
     if not frames:
@@ -484,7 +487,8 @@ def build_variant(spec: VariantSpec, *, recreate: bool = True) -> Path:
 
     print(
         f"Building {spec.id}: train_frames={len(train_frames)}, val_frames={len(val_frames)}, "
-        f"tiling={spec.tiling_mode}, aug={spec.train_augmentation} (dataset has no online aug)"
+        f"tiling={spec.tiling_mode}, frame_step_only={spec.frame_step_only}, "
+        f"labels={spec.labels_root}, aug={spec.train_augmentation} (dataset has no online aug)"
     )
     if out.exists():
         shutil.rmtree(out)
@@ -523,7 +527,10 @@ def build_variant(spec: VariantSpec, *, recreate: bool = True) -> Path:
         "description": spec.description,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "dataset_dir": str(out.relative_to(PROJECT_ROOT)),
-        "labels_root": str(spec.labels_root.relative_to(PROJECT_ROOT)),
+        "labels_root": str(spec.labels_root.relative_to(PROJECT_ROOT))
+        if spec.labels_root.is_relative_to(PROJECT_ROOT)
+        else str(spec.labels_root),
+        "frame_step_only": spec.frame_step_only,
         "tiling": {
             "mode": spec.tiling_mode,
             "tile_size": spec.tile_size,
@@ -561,6 +568,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--variant", action="append", default=None, help="Variant id (repeatable).")
     parser.add_argument("--all", action="store_true", help="Build all variants (reuse last).")
     parser.add_argument(
+        "--from-autolabel",
+        action="store_true",
+        help="Use outputs/autolabel/labels instead of CVAT labels/.",
+    )
+    parser.add_argument(
+        "--labels-root",
+        type=Path,
+        default=None,
+        help="Override label tree (must contain train/<clip>/*.txt). Default: labels/.",
+    )
+    parser.add_argument(
         "--no-recreate",
         action="store_true",
         help="Skip rebuild when data.yaml already exists.",
@@ -572,10 +590,18 @@ def main() -> None:
     args = parse_args()
     cfg = load_variants_config()
     ids = list_variant_ids(cfg)
+    labels_root = None
+    if args.labels_root is not None:
+        labels_root = resolve_labels_root(args.labels_root)
+    elif args.from_autolabel:
+        labels_root = resolve_labels_root(from_autolabel=True)
     if args.list:
         for vid in ids:
-            spec = resolve_variant(vid, cfg)
-            print(f"{vid}: {spec.description} [{spec.dataset_action}]")
+            spec = resolve_variant(vid, cfg, labels_root=labels_root)
+            print(
+                f"{vid}: {spec.description} [{spec.dataset_action}] "
+                f"aug={spec.train_augmentation} frame_step={spec.frame_step_only}"
+            )
         return
 
     selected = list(args.variant or [])
@@ -595,7 +621,7 @@ def main() -> None:
 
     recreate = not args.no_recreate
     for vid in ordered:
-        spec = resolve_variant(vid, cfg)
+        spec = resolve_variant(vid, cfg, labels_root=labels_root)
         print(f"\n=== {vid} ===")
         build_variant(spec, recreate=recreate)
 

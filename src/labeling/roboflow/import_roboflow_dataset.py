@@ -6,9 +6,8 @@ them as full-frame samples (no SAHI re-tiling) and optionally adds object-centri
 zoom crops for small vehicles so they appear larger during training.
 
 Usage:
-  python labelling/roboflow/import_roboflow_dataset.py
-  python labelling/roboflow/import_roboflow_dataset.py --no-zoom-aug
-  python labelling/roboflow/import_roboflow_dataset.py --export-dir path/to/export
+  python src/labeling/roboflow/import_roboflow_dataset.py --export-dir path/to/yolov8_export
+  python src/labeling/roboflow/import_roboflow_dataset.py --export-dir path/to/yolov8_export --no-zoom-aug
 
 Then train without rebuilding the dataset:
   python src/training/train.py
@@ -43,7 +42,6 @@ import cv2
 import yaml
 
 
-DEFAULT_EXPORT_DIR = PROJECT_ROOT / "labelling" / "Vehicle.v1i.yolov8"
 DATASET_DIR = PROJECT_ROOT / "outputs" / "dataset"
 CLASS_NAME = "vehicle"
 OUT_EXT = ".jpg"
@@ -67,8 +65,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--export-dir",
         type=Path,
-        default=DEFAULT_EXPORT_DIR,
-        help=f"Roboflow YOLOv8 folder (default: {DEFAULT_EXPORT_DIR})",
+        required=True,
+        help="Unpacked Roboflow YOLOv8 export folder.",
     )
     parser.add_argument(
         "--output-dir",

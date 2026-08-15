@@ -597,7 +597,7 @@ def main() -> None:
     if not frames:
         raise SystemExit(
             f"No eval frames for clips {sorted(want_clips)} under {labels_root / 'eval'}.\n"
-            "CVAT: python src/labeling/cvat_pull.py --verify --sync-labels\n"
+            "CVAT: python src/labeling/cvat/cvat_pull.py --verify --sync-labels\n"
             "Autolabel: python src/labeling/autolabel.py"
         )
 

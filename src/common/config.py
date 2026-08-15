@@ -16,6 +16,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SRC_ROOT = Path(__file__).resolve().parents[1]
 FRAMES_DIR = PROJECT_ROOT / "data" / "frames"
 LABELS_DIR = PROJECT_ROOT / "labels"
+AUTOLABEL_LABELS_DIR = PROJECT_ROOT / "outputs" / "autolabel" / "labels"
 DEBUG_DIR = PROJECT_ROOT / "debug"
 CLIP_TILING_CONFIG_PATH = PROJECT_ROOT / "config" / "clip_tiling.json"
 

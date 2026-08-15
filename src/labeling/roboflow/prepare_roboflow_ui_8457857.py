@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Build flat roboflow_ui_upload_8457857/ for Roboflow UI upload (train).
 
-  python labelling/roboflow/prepare_roboflow_ui_8457857.py
+  python src/labeling/roboflow/prepare_roboflow_ui_8457857.py
 """
 from __future__ import annotations
 
@@ -23,9 +23,7 @@ _ensure_src_on_path()
 
 from common.config import PROJECT_ROOT
 
-import re
 import shutil
-from pathlib import Path
 
 
 CLIP_DIR = "8457857-uhd_3840_2160_24fps"
@@ -33,30 +31,8 @@ VIDEO_ID = "8457857"
 STEP = 5
 FRAMES_DIR = PROJECT_ROOT / "data" / "frames" / CLIP_DIR
 CVAT_LABELS_DIR = PROJECT_ROOT / "labels" / "train" / CLIP_DIR
-PROJECT_YAML = PROJECT_ROOT / "labelling" / "roboflow" / "Vehicle_roboflow" / "data.yaml"
 OUT_DIR = PROJECT_ROOT / "labelling" / "roboflow" / "roboflow_ui_upload_8457857"
-
-
-def classes_from_yaml(path: Path) -> list[str]:
-    text = path.read_text(encoding="utf-8")
-    # names: ['Vehicle']  or  names:\n  - Vehicle
-    m = re.search(r"names:\s*\[([^\]]*)\]", text)
-    if m:
-        return [x.strip().strip("'\"") for x in m.group(1).split(",") if x.strip()]
-    names: list[str] = []
-    in_names = False
-    for line in text.splitlines():
-        if line.startswith("names:"):
-            in_names = True
-            continue
-        if in_names:
-            if re.match(r"\s*-\s*", line):
-                names.append(re.sub(r"^\s*-\s*", "", line).strip().strip("'\""))
-            elif line.strip() and not line.startswith(" "):
-                break
-    if not names:
-        raise SystemExit(f"Could not parse names from {path}")
-    return names
+CLASS_NAME = "vehicle"
 
 
 def main() -> None:
@@ -64,15 +40,11 @@ def main() -> None:
         raise SystemExit(f"Missing frames: {FRAMES_DIR}")
     if not CVAT_LABELS_DIR.is_dir():
         raise SystemExit(f"Missing CVAT labels: {CVAT_LABELS_DIR}")
-    if not PROJECT_YAML.is_file():
-        raise SystemExit(f"Missing project yaml: {PROJECT_YAML}")
-
     if OUT_DIR.exists():
         shutil.rmtree(OUT_DIR)
     OUT_DIR.mkdir(parents=True)
 
-    classes = classes_from_yaml(PROJECT_YAML)
-    (OUT_DIR / "classes.txt").write_text("\n".join(classes) + "\n", encoding="utf-8")
+    (OUT_DIR / "classes.txt").write_text(CLASS_NAME + "\n", encoding="utf-8")
 
     jpgs = sorted(FRAMES_DIR.glob("*.jpg"))
     sampled = jpgs[::STEP]
@@ -93,7 +65,7 @@ def main() -> None:
         else:
             n_null += 1
 
-    print(f"classes.txt: {classes}")
+    print(f"classes.txt: [{CLASS_NAME}]")
     print(
         f"{VIDEO_ID}: copied {len(sampled)} "
         f"(step={STEP}, source_frames={len(jpgs)}) "

@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Optional: build data/dataset/ YOLO layout from CVAT pulls + local frames.
 
-Prefer ``cvat_pull.py --sync-labels`` for train.py (writes labels/).
-Use this when you want a flat Ultralytics/DVC dataset under data/dataset/.
+Prefer ``cvat/cvat_pull.py --sync-labels`` for train.py (writes labels/).
+Use this when you want a flat Ultralytics dataset under data/dataset/.
 
-  python src/labeling/cvat_merge.py
+  python src/labeling/cvat/cvat_merge.py
 """
 from __future__ import annotations
 
@@ -53,13 +53,13 @@ def _write_data_yaml(root: Path) -> None:
 
 def merge() -> None:
     if not RAW.is_dir():
-        raise SystemExit(f"Missing {RAW} — run: python src/labeling/cvat_pull.py")
+        raise SystemExit(f"Missing {RAW} — run: python src/labeling/cvat/cvat_pull.py")
 
     label_dirs = sorted(RAW.glob("*/*/labels_raw"))
     if not label_dirs:
         raise SystemExit(
             f"No */*/labels_raw under {RAW}. "
-            "Run: python src/labeling/cvat_pull.py --verify"
+            "Run: python src/labeling/cvat/cvat_pull.py --verify"
         )
 
     if DATASET.exists():
@@ -97,7 +97,6 @@ def merge() -> None:
 
     _write_data_yaml(DATASET)
     print(f"Merge done → {DATASET}")
-    print("Next: dvc add data/dataset && git add data/dataset.dvc && dvc push")
 
 
 if __name__ == "__main__":

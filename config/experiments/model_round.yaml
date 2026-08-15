@@ -1,0 +1,133 @@
+# Round 2 — model & optimization (after Round 1 picks a train pack).
+#
+# Eval bands (metrics only; train tiling is unchanged):
+#   A = <200 m  (clip 13722965…)
+#   B = >200 m  (clip 266987)
+# Decision metric: mAP@0.5 per band (native eval_manual). Finding the car > box tightness.
+#
+# Every train run except Group D frozen-head starts from a COCO backbone and
+# fine-tunes it (Stage 2 freeze=0). Group D scratch is the other backbone ablation.
+#
+#
+# Group A (9 runs) is what you launch now:
+#   python src/training/experiments/run_model_round.py
+#   python src/training/experiments/run_model_round.py --resume
+#   python src/training/experiments/run_model_round.py --pick-winner
+#
+# Later (need --winner <Group A id>):
+#   python src/training/experiments/run_model_round.py --group B --winner yolo11s_lr_x2
+#   python src/training/experiments/run_model_round.py --group C --winner yolo11s_lr_x2
+#   python src/training/experiments/run_model_round.py --group D --winner yolo11s_lr_x2
+#   python src/training/experiments/run_model_round.py --group E --winner yolo11s_lr_x2
+
+defaults:
+  dataset: variant_6_strided
+  datasets_root: data/datasets
+  imgsz: 1024
+  # freeze: Stage 1 only. Stage 2 always trains the backbone except Group D frozen-head.
+  warmup_epochs: 5
+  epochs: 15
+  lr0: 0.01
+  patience: 7
+  seed: 42
+  train_augmentation: poc
+  labels_root: labels
+  eval_targets:
+    - gt: manual
+      pack: data/datasets/eval_manual
+    - gt: manual_adapted
+      pack: data/datasets/eval_manual_adapted
+  runs_dir: outputs/experiments/model_round
+  # Rank YOLO models by mean mAP@0.5 of A and B (native). 1.5 pts = 0.015.
+  winner_delta: 0.015
+  decision_metric: map50
+  # Group D/E longer budget (closer to final).
+  full_warmup_epochs: 5
+  full_epochs: 20
+
+# Fine LR around the Group A optimum (Group B).
+fine_lr_mults: [0.8, 1.0, 1.25]
+
+groups:
+  A:
+    description: Architecture + coarse LR (3 YOLO × 3 LR)
+    runs:
+      - yolov8s_lr_default
+      - yolov8s_lr_x0.5
+      - yolov8s_lr_x2
+      - yolo11s_lr_default
+      - yolo11s_lr_x0.5
+      - yolo11s_lr_x2
+      - yolo26s_lr_default
+      - yolo26s_lr_x0.5
+      - yolo26s_lr_x2
+  B:
+    description: Fine LR on the Group A winner (generated via --winner)
+    runs: []
+  C:
+    description: Hard NMS / no NMS / Soft-NMS on frozen weights (generated via --winner)
+    runs: []
+  D:
+    description: Backbone pretrained vs scratch (generated via --winner)
+    runs: []
+  E:
+    description: P2 small-object head (generated via --winner)
+    runs: []
+
+variants:
+  yolov8s_lr_default:
+    group: A
+    description: "YOLOv8s, LR ×1"
+    model: yolov8s.pt
+    lr_mult: 1.0
+    freeze: 10
+  yolov8s_lr_x0.5:
+    group: A
+    description: "YOLOv8s, LR ×0.5"
+    model: yolov8s.pt
+    lr_mult: 0.5
+    freeze: 10
+  yolov8s_lr_x2:
+    group: A
+    description: "YOLOv8s, LR ×2"
+    model: yolov8s.pt
+    lr_mult: 2.0
+    freeze: 10
+
+  yolo11s_lr_default:
+    group: A
+    description: "YOLO11s, LR ×1"
+    model: yolo11s.pt
+    lr_mult: 1.0
+    freeze: 11
+  yolo11s_lr_x0.5:
+    group: A
+    description: "YOLO11s, LR ×0.5"
+    model: yolo11s.pt
+    lr_mult: 0.5
+    freeze: 11
+  yolo11s_lr_x2:
+    group: A
+    description: "YOLO11s, LR ×2"
+    model: yolo11s.pt
+    lr_mult: 2.0
+    freeze: 11
+
+  yolo26s_lr_default:
+    group: A
+    description: "YOLO26s (native NMS-free), LR ×1"
+    model: yolo26s.pt
+    lr_mult: 1.0
+    freeze: 11
+  yolo26s_lr_x0.5:
+    group: A
+    description: "YOLO26s (native NMS-free), LR ×0.5"
+    model: yolo26s.pt
+    lr_mult: 0.5
+    freeze: 11
+  yolo26s_lr_x2:
+    group: A
+    description: "YOLO26s (native NMS-free), LR ×2"
+    model: yolo26s.pt
+    lr_mult: 2.0
+    freeze: 11

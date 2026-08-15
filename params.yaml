@@ -20,13 +20,18 @@ baseline:
 
 # Ablation packs: config/datasets/variants.yaml
 #   python src/training/datasets/generate_variant.py --all
-# Round 1 (datasets): python src/training/experiments/run_dataset_round.py --dry-run
-# Round 2 (models):   python src/training/experiments/run_model_round.py --dry-run
+# Round 1 (datasets, yolo11s --prototype, CVAT labels):
+#   python src/training/experiments/run_dataset_round.py
+# Round 2 (models, later):
+#   python src/training/experiments/run_model_round.py --dry-run
 experiment:
-  model: yolo11n.pt
-  imgsz: 640
-  epochs: 10
+  model: yolo11s.pt
+  imgsz: 1024
   warmup_epochs: 2
+  epochs: 5
+  freeze: 11
+  patience: 3
+  lr0: 0.01
 
 train:
   model: yolo11s.pt

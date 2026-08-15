@@ -149,9 +149,6 @@ def main() -> None:
     )
     print(f"\nBaseline saved: {yaml_path}")
     print("Local only under data/datasets/ (gitignored).")
-    print("Optional local DVC cache:")
-    rel = out_dir.relative_to(PROJECT_ROOT) if out_dir.is_relative_to(PROJECT_ROOT) else out_dir
-    print(f"  dvc add {rel} && dvc push")
 
 
 if __name__ == "__main__":

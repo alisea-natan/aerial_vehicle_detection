@@ -34,17 +34,12 @@ labels/
 # --- Probe / label debug artifacts (regenerate: probe_clips.py) ---
 debug/
 
-# --- Manual labeling packs (large / regenerable; keep scripts + README) ---
+# --- Manual labeling: generated packs (rebuild). Keep downloaded exports you use. ---
 labelling/Vehicle.v1i.yolov8/
-labelling/cvat/coco_export/
-# Optional CVAT / Roboflow working copies (not pipeline GT — that is labels/).
 labelling/cvat/
-labelling/roboflow/
-
 labelling/roboflow/roboflow/
 labelling/roboflow/roboflow_upload/
 labelling/roboflow/roboflow_ui_upload_8457857/
-labelling/roboflow/Vehicle_roboflow/
 
 # --- Training & evaluation outputs (regenerate: train.py, evaluate.py) ---
 outputs/*
@@ -71,8 +66,10 @@ checkpoints/*
 # Ultralytics run folders (if created outside outputs/)
 runs/
 
-# --- Local-only experiment scripts (not committed) ---
-experiments/
+# --- Local-only ad-hoc scripts at repo root (not committed) ---
+# Tracked: config/experiments/ (round settings) and src/training/experiments/ (runners).
+# Pack blobs stay gitignored under data/datasets/; outputs under outputs/.
+/experiments/
 
 # --- MLflow (local tracking; not in git) ---
 mlruns/
@@ -80,18 +77,12 @@ mlflow.db
 .mlflow/
 mlflow_server/
 
-# --- Dataset versions: local only (never commit blobs / *.dvc) ---
+# --- Dataset packs: local only (never commit blobs) ---
 data/datasets/**
 !data/datasets/README.md
 !data/datasets/.gitignore
 data/dataset/
 
-# --- DVC: local cache + remote ---
-.dvc/cache/
-.dvc/tmp/
-.dvc/tmp/**
-*.dvc.bak
-.dvc-storage/
 data/raw_export/
 data/raw_base/
 data/cvat/

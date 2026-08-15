@@ -76,17 +76,63 @@ Manual / CVAT paths → **[GUIDELINE.md](GUIDELINE.md)**.
 
 ## 1. Config generation (`clip_tiling.json`)
 
-`preprocess_clips.py` probes each clip with **YOLO-World** on three frames (start / middle / end) and writes per-clip settings used by autolabel, train, and eval:
+`python src/data/preprocess_clips.py` (alias: `probe_clips.py`) probes each clip with **YOLO-World** and writes `config/clip_tiling.json`. Autolabel, train, and eval all read that file (tiles, `frame_step`, distance band, skip).
 
-| Field | Role |
-| ----- | ---- |
-| `target_tiles` / overlap / conf | How to cut the frame so small cars are still visible |
-| `object_size_px_median` | Typical car long-side in pixels |
-| `distance_m` / band | Rough range from assumed 4.5 m car length |
-| `frame_step` | Annotate / train every N-th frame: `floor(size × 0.5 / speed_px)` |
-| `train_groups` | Band → tile size (e.g. A_close full-frame, B_medium tile 1024 @ 0.2 overlap) |
+### How it works
 
-Tile search tries `1 → 2 → 3 → 4 → 6 → 8 → 12`; first car hit gets +1 headroom for `target_tiles`. During the **probe only**, `person` is aliased to car so distant blobs still drive tiling.
+1. Sample **3 frames from start, middle, end** of each clip (9 frames total).
+2. Try tile candidates `1 → 2 → 3 → 4 → 6 → 8 → 12`. First **car** hit (`person` → car during probe only) = `probe_min_tiles`.
+3. `target_tiles` = next candidate (+1 headroom). Threshold / overlap follow `target_tiles`.
+4. Detail pass: car-only sizes & distances per segment; `distance_varies` if bands differ or start↔end size changes ≥30%.
+5. Motion: match cars on consecutive frames → `speed_px_per_frame`.
+6. `frame_step = floor(object_size_px_median × 0.5 / speed)` (min 1). Suggests `train_groups` from size.
+
+Fallback if no car: **12 tiles** @ threshold 0.1.
+
+### Distance (metres from a standard car)
+
+There is no altimeter on these stock clips. Range is inferred from **bbox size** under a pinhole camera, assuming a **standard passenger-car length of 4.5 m** (the long side of the box ≈ that length in top-down view):
+
+```
+distance_m = 4.5 m × focal_px / bbox_long_side_px
+```
+
+`focal_px` comes from an assumed **24 mm** lens. Sensor defaults: 1-inch (4K / 1080p) or 1/2.3″ (SD). Override per clip with `calibration/{clip}.json` (`focal_length_mm`, sensor size, or `vertical_fov_deg`).
+
+Clip-level `distance_m` is the **largest** probed car (else the median of all car boxes). That value is then binned:
+
+| `distance_m` | Stored band | Eval column |
+| -----------: | ----------- | ----------- |
+| &lt; 200 | `<200m` | **0–200 m** |
+| 200–400 | `>200m` | **200–400 m** |
+| ≥ 400 | `>400m` | (no eval clip in this PoC) |
+
+So the 200 m / 400 m cuts are **not** GPS altitude — they are “how far would this box be if it were a 4.5 m car.” Eval uses one clip per band (`13722965…` ≈ 95 m, `266987` ≈ 295 m).
+
+### Tiles & confidence
+
+| Tiles | Typical band | Overlap |
+| ----- | ------------ | ------- |
+| 1     | &lt;200 m    | 0       |
+| 2–7   | &gt;200 m    | 0.10    |
+| ≥8    | &gt;400 m    | 0.05    |
+
+```
+tiles = 1   →  conf 0.50
+tiles > 1   →  conf max(0.05, 0.50 / tiles)
+```
+
+Autolabel uses these `target_tiles` / overlap / conf. Train/eval crops use `train_groups` (object-size bands), not the probe tile count:
+
+| Median car long-side | Group | Crop |
+| -------------------- | ----- | ---- |
+| ≥ 80 px | `A_close` | full frame, letterbox to 1024 |
+| 32–80 px | `B_medium` | tile 1024 @ 0.2 overlap |
+| &lt; 32 px | `C_far` | skipped (`MIN_USABLE_OBJECT_PX`) |
+
+### Probe-only alias
+
+During **preprocess only**, `person → car` for tile search / size / distance (aerial YOLO-World often tags top-down cars as people). Autolabel does **not** use that alias — it uses vehicle text prompts.
 
 ```bash
 python src/data/preprocess_clips.py
@@ -94,14 +140,14 @@ python src/data/preprocess_clips.py
 
 Rough object sizes from preprocess (also drive `frame_step` and the skip):
 
-| Clip (short) | Median px | Typical `frame_step` |
-| ------------ | --------: | -------------------: |
-| `13722965…` (eval, close) | ~369 | 19 |
-| `3405804…` | ~137 | 18 |
-| `266987` (eval, mid) | ~133 | 3 |
-| `8457857…` | ~108 | 5 |
-| `5382494…` | ~53 | 9–14 |
-| `8968356…` (**skipped**) | ~17 | — |
+| Clip (short) | Median px | Typical `frame_step` | Band |
+| ------------ | --------: | -------------------: | ---- |
+| `13722965…` (eval, close) | ~369 | 19 | 0–200 m |
+| `3405804…` | ~137 | 18 | &lt;200 m |
+| `266987` (eval, mid) | ~133 | 3 | 200–400 m |
+| `8457857…` | ~108 | 5 | &lt;200 m |
+| `5382494…` | ~53 | 9–14 | &lt;200 m |
+| `8968356…` (**skipped**) | ~17 | — | — |
 
 ### Rejected video (decision after probe)
 
@@ -206,12 +252,12 @@ python src/training/evaluate.py --gt autolabel           # same (native scale)
 python src/training/evaluate.py --gt autolabel_adapted   # scale-matched diagnostic
 ```
 
-IoU 0.5 match on pack images (already tiled/cropped). Bands:
+IoU 0.5 match on pack images (already tiled/cropped). Bands are the preprocess distance bins (4.5 m car → metres; see §1):
 
-| Band | Clip |
-| ---- | ---- |
-| 0–200 m | `13722965_2160_3840_30fps` |
-| 200–400 m | `266987` |
+| Band | Clip | Probe `distance_m` |
+| ---- | ---- | -----------------: |
+| 0–200 m | `13722965_2160_3840_30fps` | ~95 m |
+| 200–400 m | `266987` | ~295 m |
 
 ### Eval runs (2026-08-12, MPS — after prototype train)
 
@@ -245,4 +291,4 @@ Mid-band matches exactly (unchanged video). Close-band gains are from scale pad.
 
 ## Further reading
 
-**[GUIDELINE.md](GUIDELINE.md)** — manual-label compare, CVAT, dataset ablations, experiment rounds.
+**[GUIDELINE.md](GUIDELINE.md)** — CVAT labels, dataset ablations, experiment rounds.

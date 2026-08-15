@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Compare CVAT labels (labels/, from cvat_pull --sync-labels) vs YOLO-World autolabel.
 
-  python src/labeling/compare.py
-  python src/labeling/compare.py --iou 0.5 --clip 266987
+  python src/labeling/cvat/compare.py
+  python src/labeling/cvat/compare.py --iou 0.5 --clip 266987
 """
 from __future__ import annotations
 
@@ -401,7 +401,7 @@ def main() -> None:
     if not cvat_root.is_dir():
         raise SystemExit(
             f"CVAT labels not found: {cvat_root}\n"
-            "Pull with: python src/labeling/cvat_pull.py --verify --sync-labels"
+            "Pull with: python src/labeling/cvat/cvat_pull.py --verify --sync-labels"
         )
     if not auto_root.is_dir():
         raise SystemExit(

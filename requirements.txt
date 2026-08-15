@@ -17,11 +17,8 @@ clip @ git+https://github.com/ultralytics/CLIP.git@488e81a6711eea7346872b46ea928
 ftfy==6.3.1
 regex==2026.7.19
 
-# Dataset versioning (local remote: .dvc-storage; git tracks *.dvc pointers only).
-dvc==3.67.1
-
 # Load .env (CVAT_*, ROBOFLOW_*, …)
 python-dotenv==1.1.1
 
-# Optional: CVAT export (src/labeling/cvat_pull.py). Pin near your server (2.70.x).
+# Optional: CVAT export (src/labeling/cvat/cvat_pull.py). Pin near your server (2.70.x).
 cvat-sdk==2.70.0

@@ -1,1 +1,1 @@
-"""Labeling: CVAT I/O, YOLO-World autolabel demo, QA."""
+"""Labeling: CVAT, Roboflow, YOLO-World autolabel demo."""

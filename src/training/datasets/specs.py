@@ -8,7 +8,7 @@ from typing import Any
 
 import yaml
 
-from common.config import PROJECT_ROOT
+from common.config import AUTOLABEL_LABELS_DIR, LABELS_DIR, PROJECT_ROOT
 
 VARIANTS_PATH = PROJECT_ROOT / "config" / "datasets" / "variants.yaml"
 
@@ -26,13 +26,14 @@ class VariantSpec:
     min_visible_ratio: float
     keep_negative_tiles: bool
     negative_ratio: float
-    train_augmentation: str  # metadata for dataset_round; not applied on disk
+    train_augmentation: str  # applied in dataset_round; tiles on disk are unaugmented
     sampling: str  # full | strided
     stride: int
     log_multi_tile_bboxes: bool
     imgsz: int
     val_fraction: float
     seed: int
+    frame_step_only: bool
     labels_root: Path
     out_dir: Path
     raw: dict[str, Any]
@@ -50,7 +51,29 @@ def list_variant_ids(cfg: dict[str, Any] | None = None) -> list[str]:
     return list((data.get("variants") or {}).keys())
 
 
-def resolve_variant(variant_id: str, cfg: dict[str, Any] | None = None) -> VariantSpec:
+def resolve_labels_root(
+    raw: str | Path | None = None,
+    *,
+    from_autolabel: bool = False,
+) -> Path:
+    """Resolve label tree (train|eval/<clip>/*.txt). Default = CVAT ``labels/``."""
+    if from_autolabel and raw is None:
+        return AUTOLABEL_LABELS_DIR
+    if raw is None:
+        return LABELS_DIR
+    path = Path(raw)
+    if not path.is_absolute():
+        path = PROJECT_ROOT / path
+    return path
+
+
+def resolve_variant(
+    variant_id: str,
+    cfg: dict[str, Any] | None = None,
+    *,
+    labels_root: Path | str | None = None,
+    from_autolabel: bool = False,
+) -> VariantSpec:
     data = cfg or load_variants_config()
     variants = data.get("variants") or {}
     if variant_id not in variants:
@@ -66,9 +89,11 @@ def resolve_variant(variant_id: str, cfg: dict[str, Any] | None = None) -> Varia
     out_root = Path(str(defaults.get("out_root") or "data/datasets"))
     if not out_root.is_absolute():
         out_root = PROJECT_ROOT / out_root
-    labels_root = Path(str(defaults.get("labels_root") or "labels"))
-    if not labels_root.is_absolute():
-        labels_root = PROJECT_ROOT / labels_root
+    labels_override = labels_root if labels_root is not None else defaults.get("labels_root")
+    labels_path = resolve_labels_root(
+        labels_override,
+        from_autolabel=from_autolabel and labels_root is None and labels_override is None,
+    )
 
     mode = str(tiling.get("mode") or "auto").lower()
     tile_size = tiling.get("tile_size", None)
@@ -86,7 +111,7 @@ def resolve_variant(variant_id: str, cfg: dict[str, Any] | None = None) -> Varia
     if aug is None:
         aug = (raw.get("augmentation") or {}).get("set")
     if aug is None:
-        aug = defaults.get("train_augmentation") or "none"
+        aug = defaults.get("train_augmentation") or "poc"
 
     return VariantSpec(
         id=variant_id,
@@ -111,10 +136,13 @@ def resolve_variant(variant_id: str, cfg: dict[str, Any] | None = None) -> Varia
         sampling=str(sampling.get("strategy") or "full").lower(),
         stride=max(1, int(sampling.get("stride") or 1)),
         log_multi_tile_bboxes=bool(metrics.get("log_multi_tile_bboxes", False)),
-        imgsz=int(defaults.get("imgsz") or 640),
+        imgsz=int(defaults.get("imgsz") or 1024),
         val_fraction=float(defaults.get("val_fraction") or 0.15),
         seed=int(defaults.get("seed") or 42),
-        labels_root=labels_root,
+        frame_step_only=bool(
+            raw.get("frame_step_only", defaults.get("frame_step_only", True))
+        ),
+        labels_root=labels_path,
         out_dir=out_root / variant_id,
         raw=raw,
     )

@@ -56,7 +56,7 @@ def experiment_aug_kwargs() -> dict[str, float]:
 
 def aug_preset(name: str) -> dict[str, float]:
     """Named presets for ablation variants."""
-    key = (name or "none").strip().lower()
+    key = (name or "poc").strip().lower()
     if key in ("none", "off", "no", "null"):
         return {
             "hsv_h": 0.0,
@@ -86,6 +86,6 @@ def aug_preset(name: str) -> dict[str, float]:
             "mixup": 0.0,
             "copy_paste": 0.0,
         }
-    if key in ("default", "main", "train"):
+    if key in ("default", "main", "train", "poc", "prototype"):
         return train_aug_kwargs()
     raise SystemExit(f"Unknown augmentation set: {name!r}")

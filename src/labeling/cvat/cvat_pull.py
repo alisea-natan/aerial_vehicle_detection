@@ -4,11 +4,11 @@
 Primary usage — credentials from repo ``.env`` (see ``.env.example``):
 
   cp .env.example .env   # set CVAT_HOST, CVAT_USER, CVAT_PASS, optional CVAT_PROJECT
-  python src/labeling/cvat_pull.py --project aerial_vehicles --verify --sync-labels
+  python src/labeling/cvat/cvat_pull.py --project aerial_vehicles --verify --sync-labels
 
   # control run on one task (with images) after listing
-  python src/labeling/cvat_pull.py --project aerial_vehicles --list
-  python src/labeling/cvat_pull.py --project aerial_vehicles --task 7 --with-images --verify
+  python src/labeling/cvat/cvat_pull.py --project aerial_vehicles --list
+  python src/labeling/cvat/cvat_pull.py --project aerial_vehicles --task 7 --with-images --verify
 
 Task.name must match local clip stem under data/frames/ (same as upload).
 Split (train|eval) is taken from data/train vs data/eval video folders.
@@ -470,7 +470,7 @@ def main() -> None:
         else:
             raise SystemExit(
                 "Pass --project NAME (or --project-id / --config).\n"
-                "Example: python src/labeling/cvat_pull.py --project aerial_vehicles --list"
+                "Example: python src/labeling/cvat/cvat_pull.py --project aerial_vehicles --list"
             )
 
         if args.list:

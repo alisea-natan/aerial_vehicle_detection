@@ -38,6 +38,8 @@ from sahi.slicing import slice_image
 from sahi.utils.coco import CocoAnnotation
 from ultralytics import YOLO
 
+from training.model_load import load_ultralytics_model, skip_in_train_val
+
 from common.config import (
     FRAMES_DIR,
     LABELS_DIR,
@@ -151,6 +153,28 @@ def configure_mps_runtime() -> None:
         pass
 
 
+def release_torch_memory() -> None:
+    """Drop Python + GPU/MPS caches so the next experiment can reuse RAM."""
+    import gc
+
+    gc.collect()
+    if DEVICE == "mps":
+        try:
+            torch.mps.empty_cache()
+        except Exception:
+            pass
+        try:
+            torch.mps.synchronize()
+        except Exception:
+            pass
+    elif torch.cuda.is_available():
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+    gc.collect()
+
+
 def patch_ultralytics_mps_unique() -> None:
     """Avoid MPS bug: unique(return_counts=True) can overflow → negative dim in loss.
 
@@ -184,7 +208,46 @@ def patch_ultralytics_mps_unique() -> None:
         return out
 
     yolo_loss.v8DetectionLoss.preprocess = preprocess
+    for cls_name in ("E2EDetectLoss", "E2ELoss", "v8OBBLoss"):
+        cls = getattr(yolo_loss, cls_name, None)
+        if cls is not None and hasattr(cls, "preprocess"):
+            cls.preprocess = preprocess
     print("Applied MPS unique() workaround for Ultralytics detection loss")
+
+
+def patch_ultralytics_honor_val_false() -> None:
+    """Ultralytics still calls validate() on the last epoch when val=False.
+
+    YOLO26 end2end and P2 heads at imgsz=1024 hit MPS limits on val/predict
+    (GatherND abort; DFL conv with >65536 output channels). When we pass
+    val=False, skip that path entirely (including final_eval).
+    """
+    from ultralytics.engine.trainer import BaseTrainer
+
+    if getattr(BaseTrainer.validate, "_vd_honor_val_false", False):
+        return
+
+    _validate = BaseTrainer.validate
+    _final_eval = BaseTrainer.final_eval
+
+    def validate(self):
+        if not bool(getattr(self.args, "val", True)):
+            metrics = getattr(self, "metrics", None) or {}
+            fitness = float(getattr(self, "fitness", 0.0) or 0.0)
+            self.metrics = metrics
+            self.fitness = fitness
+            return metrics, fitness
+        return _validate(self)
+
+    def final_eval(self):
+        if not bool(getattr(self.args, "val", True)):
+            return None
+        return _final_eval(self)
+
+    validate._vd_honor_val_false = True  # type: ignore[attr-defined]
+    BaseTrainer.validate = validate
+    BaseTrainer.final_eval = final_eval
+    print("Ultralytics: val=False now skips last-epoch and final val (needed on Apple MPS / YOLO26 / P2)")
 
 
 def parse_args() -> argparse.Namespace:
@@ -1557,6 +1620,8 @@ def train_one_stage(
     patience: int,
     close_mosaic: int,
     aug: dict[str, float] | None = None,
+    pretrained: bool = True,
+    model_hint: str | None = None,
 ) -> tuple[Path, int]:
     """Run one Ultralytics train() stage with MPS OOM batch backoff.
 
@@ -1573,29 +1638,33 @@ def train_one_stage(
     run_dir = RUNS_DIR / run_name
 
     for attempt in range(4):
-        if DEVICE == "mps":
-            try:
-                torch.mps.empty_cache()
-            except Exception:
-                pass
-
-        model = YOLO(str(weights))
-        attach_component_loss_logger(model, run_name)
-        freeze_desc = (
-            f"freeze first {freeze} layers (backbone)"
-            if freeze > 0
-            else "all layers trainable"
-        )
-        print(
-            f"[{run_name}] {weights} on {DEVICE}: {epochs} epochs, imgsz={imgsz}, "
-            f"batch={batch_try}, workers={workers}, cache={cache_arg}, "
-            f"lr0={lr0}, patience={patience}, {freeze_desc}, "
-            f"aug(hsv=({aug_kwargs['hsv_h']},{aug_kwargs['hsv_s']},{aug_kwargs['hsv_v']}), "
-            f"deg={aug_kwargs['degrees']}, fliplr={aug_kwargs['fliplr']}, "
-            f"flipud={aug_kwargs['flipud']}, mosaic={aug_kwargs['mosaic']}) "
-            f"(attempt {attempt + 1}/4)"
-        )
+        release_torch_memory()
+        model = None
         try:
+            model = load_ultralytics_model(weights)
+            attach_component_loss_logger(model, run_name)
+            freeze_desc = (
+                f"freeze first {freeze} layers (backbone)"
+                if freeze > 0
+                else "all layers trainable"
+            )
+            hint = model_hint or str(weights)
+            do_val = not skip_in_train_val(hint, DEVICE)
+            if not do_val:
+                print(
+                    f"[{run_name}] Apple Silicon: in-train val off for this "
+                    "architecture (including last epoch / final val); "
+                    "holdout scores come from the eval packs."
+                )
+            print(
+                f"[{run_name}] {weights} on {DEVICE}: {epochs} epochs, imgsz={imgsz}, "
+                f"batch={batch_try}, workers={workers}, cache={cache_arg}, "
+                f"lr0={lr0}, patience={patience}, val={do_val}, {freeze_desc}, "
+                f"aug(hsv=({aug_kwargs['hsv_h']},{aug_kwargs['hsv_s']},{aug_kwargs['hsv_v']}), "
+                f"deg={aug_kwargs['degrees']}, fliplr={aug_kwargs['fliplr']}, "
+                f"flipud={aug_kwargs['flipud']}, mosaic={aug_kwargs['mosaic']}) "
+                f"(attempt {attempt + 1}/4)"
+            )
             model.train(
                 data=str(yaml_path),
                 epochs=epochs,
@@ -1606,11 +1675,11 @@ def train_one_stage(
                 project=str(RUNS_DIR),
                 name=run_name,
                 exist_ok=True,
-                pretrained=True,
+                pretrained=pretrained,
                 freeze=freeze,
                 lr0=lr0,
-                val=True,
-                patience=patience,
+                val=do_val,
+                patience=patience if do_val else 10**9,
                 amp=True,
                 cache=cache_arg,
                 plots=False,
@@ -1640,6 +1709,9 @@ def train_one_stage(
                 batch_try = new_batch
                 continue
             raise
+        finally:
+            del model
+            release_torch_memory()
 
     if last_error is not None:
         raise last_error
@@ -1664,10 +1736,15 @@ def train_model(
     stage1_run_name: str | None = None,
     stage2_run_name: str | None = None,
     deliverable_name: str = "yolo11s_vehicle_best.pt",
+    write_checkpoint: bool = True,
+    pretrained: bool = True,
+    staged: bool = True,
+    train_backbone: bool = True,
 ) -> Path:
     RUNS_DIR.mkdir(parents=True, exist_ok=True)
     configure_mps_runtime()
     patch_ultralytics_mps_unique()
+    patch_ultralytics_honor_val_false()
 
     cache_arg = resolve_cache_arg(cache)
     stage2_lr0 = lr0 / 10.0
@@ -1676,56 +1753,95 @@ def train_model(
     aug_kwargs = dict(train_aug_kwargs() if aug is None else aug)
     s1_name = stage1_run_name or STAGE1_RUN_NAME
     s2_name = stage2_run_name or STAGE2_RUN_NAME
+    # Backbone is trained unless this is the Group D frozen-head ablation.
+    do_stage1 = bool(train_backbone) and staged and warmup_epochs > 0
+    do_stage2 = bool(train_backbone)
+    stage2_freeze = 0 if train_backbone else freeze
 
-    print(
-        f"Staged fine-tune: Stage1 head-only ({warmup_epochs} ep, freeze={freeze}, "
-        f"lr0={lr0}) → Stage2 full ({epochs} ep, freeze=0, lr0={stage2_lr0}), "
-        f"val=True, patience={patience if patience > 0 else 'off'}, "
-        f"mosaic={aug_kwargs.get('mosaic', 0.0)}"
-    )
+    if do_stage1 and do_stage2:
+        print(
+            f"Staged fine-tune: Stage1 head-only ({warmup_epochs} ep, freeze={freeze}, "
+            f"lr0={lr0}) → Stage2 backbone+head ({epochs} ep, freeze=0, lr0={stage2_lr0}), "
+            f"val=True, patience={patience if patience > 0 else 'off'}, "
+            f"mosaic={aug_kwargs.get('mosaic', 0.0)}, pretrained={pretrained}"
+        )
+    elif do_stage2 and not do_stage1:
+        print(
+            f"Single-stage train (backbone+head): {epochs} ep, freeze={stage2_freeze}, "
+            f"lr0={lr0}, pretrained={pretrained}"
+        )
+    else:
+        print(
+            f"Head-only fine-tune (backbone frozen): {max(warmup_epochs, epochs)} ep, "
+            f"freeze={freeze}, lr0={lr0}, pretrained={pretrained}"
+        )
 
-    # --- Stage 1: freeze backbone, adapt Detect head to single-class "vehicle" ---
-    stage1_weights, batch = train_one_stage(
-        weights=MODEL_NAME,
-        yaml_path=yaml_path,
-        run_name=s1_name,
-        imgsz=imgsz,
-        epochs=warmup_epochs,
-        batch=batch,
-        workers=workers,
-        cache_arg=cache_arg,
-        freeze=freeze,
-        lr0=lr0,
-        patience=patience_arg,
-        close_mosaic=max(0, min(3, warmup_epochs // 2)),
-        aug=aug_kwargs,
-    )
-    # Continue from end-of-warmup weights (trajectory into Stage 2), not necessarily best.
-    stage1_last = RUNS_DIR / s1_name / "weights" / "last.pt"
-    stage2_init = stage1_last if stage1_last.exists() else stage1_weights
-    print(f"Stage 1 done. Continuing from {stage2_init}")
+    best_weights: Path
+    if do_stage1:
+        stage1_weights, batch = train_one_stage(
+            weights=MODEL_NAME,
+            yaml_path=yaml_path,
+            run_name=s1_name,
+            imgsz=imgsz,
+            epochs=warmup_epochs,
+            batch=batch,
+            workers=workers,
+            cache_arg=cache_arg,
+            freeze=freeze,
+            lr0=lr0,
+            patience=patience_arg,
+            close_mosaic=max(0, min(3, warmup_epochs // 2)),
+            aug=aug_kwargs,
+            pretrained=pretrained,
+            model_hint=MODEL_NAME,
+        )
+        if not do_stage2:
+            best_weights = stage1_weights
+        else:
+            stage1_last = RUNS_DIR / s1_name / "weights" / "last.pt"
+            stage2_init = stage1_last if stage1_last.exists() else stage1_weights
+            print(f"Stage 1 done. Continuing from {stage2_init} (backbone unfrozen)")
+            best_weights, _ = train_one_stage(
+                weights=stage2_init,
+                yaml_path=yaml_path,
+                run_name=s2_name,
+                imgsz=imgsz,
+                epochs=epochs,
+                batch=batch,
+                workers=workers,
+                cache_arg=cache_arg,
+                freeze=stage2_freeze,
+                lr0=stage2_lr0,
+                patience=patience_arg,
+                close_mosaic=max(0, min(5, epochs // 3)),
+                aug=aug_kwargs,
+                pretrained=pretrained,
+                model_hint=MODEL_NAME,
+            )
+    else:
+        best_weights, _ = train_one_stage(
+            weights=MODEL_NAME,
+            yaml_path=yaml_path,
+            run_name=s2_name,
+            imgsz=imgsz,
+            epochs=epochs if epochs > 0 else warmup_epochs,
+            batch=batch,
+            workers=workers,
+            cache_arg=cache_arg,
+            freeze=0 if train_backbone else freeze,
+            lr0=lr0,
+            patience=patience_arg,
+            close_mosaic=max(0, min(5, max(epochs, warmup_epochs) // 3)),
+            aug=aug_kwargs,
+            pretrained=pretrained,
+            model_hint=MODEL_NAME,
+        )
 
-    # --- Stage 2: unfreeze all, lower LR, early-stop on val ---
-    best_weights, _ = train_one_stage(
-        weights=stage2_init,
-        yaml_path=yaml_path,
-        run_name=s2_name,
-        imgsz=imgsz,
-        epochs=epochs,
-        batch=batch,
-        workers=workers,
-        cache_arg=cache_arg,
-        freeze=0,
-        lr0=stage2_lr0,
-        patience=patience_arg,
-        close_mosaic=max(0, min(5, epochs // 3)),
-        aug=aug_kwargs,
-    )
-
-    deliverable = PROJECT_ROOT / "checkpoints" / deliverable_name
-    deliverable.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(best_weights, deliverable)
-    print(f"Git-tracked copy: {deliverable}")
+    if write_checkpoint:
+        deliverable = PROJECT_ROOT / "checkpoints" / deliverable_name
+        deliverable.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(best_weights, deliverable)
+        print(f"Git-tracked copy: {deliverable}")
     return best_weights
 
 
@@ -1803,7 +1919,7 @@ def main() -> None:
         if not train_frames:
             raise SystemExit(
                 "No train labels under labels/train/. "
-                "Sync CVAT: python src/labeling/cvat_pull.py --verify --sync-labels"
+                "Sync CVAT: python src/labeling/cvat/cvat_pull.py --verify --sync-labels"
             )
 
     batch = args.batch if args.batch is not None else default_batch_size(imgsz)

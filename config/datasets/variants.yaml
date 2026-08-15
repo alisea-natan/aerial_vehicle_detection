@@ -1,9 +1,11 @@
-# Dataset pack variants (local only under data/datasets/).
-# AUTO_* from config/clip_tiling.json → train_groups.
+# Dataset pack variants (local blobs under data/datasets/ — not git).
+# Settings in this file ARE git-tracked.
 #
+# Manual-label defaults: CVAT labels/, frame_step, imgsz 1024.
+# Train protocol (yolo11s --prototype) lives in config/experiments/dataset_round.yaml.
+#
+#   python src/training/datasets/generate_variant.py --list
 #   python src/training/datasets/generate_variant.py --all
-#
-# Training belongs in config/experiments/ (dataset_round / model_round).
 
 auto:
   source: "config/clip_tiling.json train_groups"
@@ -24,18 +26,20 @@ auto:
       train_imgsz: 1024
 
 defaults:
-  imgsz: 640
+  imgsz: 1024
   val_fraction: 0.15
   seed: 42
   min_visible_ratio: 0.3
   keep_negative_tiles: false
+  frame_step_only: true
   labels_root: labels
   out_root: data/datasets
-  train_augmentation: none   # metadata for dataset_round; tiles on disk are never augmented
+  # Online aug at train time (dataset_round). Tiles on disk are never augmented.
+  train_augmentation: poc
 
 variants:
   baseline_1:
-    description: "Reference — AUTO tiling from train_groups, full frames, drop empty tiles"
+    description: "Reference — AUTO tiling, frame_step, CVAT labels, drop empty tiles"
     dataset: build
     tiling:
       mode: auto
@@ -80,7 +84,7 @@ variants:
       log_multi_tile_bboxes: true
 
   variant_5_aug:
-    description: "Same tiles as baseline_1; mosaic_hsv applied only at train (dataset_round)"
+    description: "Same tiles as baseline_1; mosaic_hsv instead of PoC aug (train time only)"
     dataset: reuse
     reuse_from: baseline_1
     train_augmentation: mosaic_hsv
@@ -92,7 +96,7 @@ variants:
       strategy: full
 
   variant_6_strided:
-    description: "AUTO tiling; every Nth frame per clip"
+    description: "AUTO tiling; keep every 5th frame_step frame per clip"
     dataset: build
     tiling:
       mode: auto
