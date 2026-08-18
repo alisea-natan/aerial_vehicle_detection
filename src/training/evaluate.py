@@ -109,11 +109,22 @@ class TrainSliceConfig:
     clip_group: dict[str, str]
     source: str
 
-    def tiling_for(self, clip_name: str, frame_w: int, frame_h: int) -> tuple[int, float, int, bool]:
-        """Return (slice_size, overlap, predict_imgsz, uses_tiling) from train_groups."""
+    def tiling_for(
+        self,
+        clip_name: str,
+        frame_w: int,
+        frame_h: int,
+        *,
+        predict_imgsz: int | None = None,
+    ) -> tuple[int, float, int, bool]:
+        """Return (slice_size, overlap, predict_imgsz, uses_tiling).
+
+        Crop comes from train_groups; YOLO11s letterbox is TRAIN_IMGSZ unless overridden.
+        """
         group = resolve_train_group_tiling(clip_name)
         slice_size = effective_slice_size(group, frame_w, frame_h)
-        return slice_size, group.overlap, group.train_imgsz, group.uses_tiling
+        imgsz = TRAIN_IMGSZ if predict_imgsz is None else int(predict_imgsz)
+        return slice_size, group.overlap, imgsz, group.uses_tiling
 
 
 def load_train_slice_config() -> TrainSliceConfig:
@@ -350,6 +361,13 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=None,
         help=f"Override infer confidence (default {EVAL_CONF_THRESHOLD}, Ultralytics YOLO default).",
+    )
+    parser.add_argument(
+        "--imgsz",
+        type=int,
+        default=TRAIN_IMGSZ,
+        help=f"YOLO11s predict imgsz (default {TRAIN_IMGSZ}; same as train). "
+        "Ignores leftover pack metadata.",
     )
     parser.add_argument("--iou", type=float, default=IOU_MATCH, help="IoU threshold for TP match.")
     parser.add_argument(
@@ -589,10 +607,11 @@ def predict_frame_tiled(
     img_h: int,
     conf: float,
     dev: str,
+    predict_imgsz: int | None = None,
 ) -> list[Box]:
     """Infer with train_groups tiling (or full-frame); map boxes to full frame."""
     slice_size, overlap, predict_imgsz, uses_tiling = slice_cfg.tiling_for(
-        clip_name, img_w, img_h
+        clip_name, img_w, img_h, predict_imgsz=predict_imgsz
     )
 
     if not uses_tiling:
@@ -825,6 +844,7 @@ def evaluate_clip(
     iou_thresh: float,
     band_stats: dict[str, BandStats],
     video_dir: Path | None = None,
+    predict_imgsz: int | None = None,
 ) -> dict:
     tile_cfg = resolve_clip_tile_config(clip_name, tile_config)
     clip_band = resolve_clip_eval_band(clip_name, tile_cfg)
@@ -846,7 +866,7 @@ def evaluate_clip(
         probe_distance_m = float(probe_distance_m)
 
     slice_size, overlap, predict_imgsz, uses_tiling = slice_cfg.tiling_for(
-        clip_name, img_w, img_h
+        clip_name, img_w, img_h, predict_imgsz=predict_imgsz
     )
     group = slice_cfg.clip_group.get(clip_name) or resolve_train_group_tiling(clip_name).group
     tile_desc = "full-frame" if not uses_tiling else f"tile={slice_size}"
@@ -877,6 +897,7 @@ def evaluate_clip(
             img_h=img_h,
             conf=conf,
             dev=dev,
+            predict_imgsz=predict_imgsz,
         )
         preds_by_frame[image_path.stem] = preds
 
@@ -1218,10 +1239,9 @@ def evaluate_prepared_pack(
     bands_map: dict[str, str] = {
         str(k): str(v) for k, v in (payload_yaml.get("bands") or {}).items()
     }
-    clip_train_imgsz: dict[str, int] = {
-        str(k): int(v) for k, v in (payload_yaml.get("clip_train_imgsz") or {}).items()
-    }
-    default_imgsz = int(payload_yaml.get("imgsz", TRAIN_IMGSZ))
+    default_imgsz = TRAIN_IMGSZ
+    if predict_kw and predict_kw.get("imgsz") is not None:
+        default_imgsz = int(predict_kw["imgsz"])
     pack_clips = [str(c) for c in (payload_yaml.get("clips") or [])]
     if clip_filter:
         clip_names = clip_filter
@@ -1247,7 +1267,7 @@ def evaluate_prepared_pack(
 
     print(
         f"Eval pack [{gt_name}]: {dataset_dir} "
-        f"({len(image_paths)} images, clips={clip_names})"
+        f"({len(image_paths)} images, clips={clip_names}, predict_imgsz={default_imgsz})"
     )
     yolo_model = load_ultralytics_model(weights)
     dev = predict_device(str(weights))
@@ -1266,9 +1286,7 @@ def evaluate_prepared_pack(
                 f"Clip {clip_name!r} band {clip_band!r} not in {list(band_stats)}"
             )
         conf = resolve_eval_conf(conf_override)
-        predict_imgsz = clip_train_imgsz.get(clip_name, default_imgsz)
-        if predict_kw and predict_kw.get("imgsz") is not None:
-            predict_imgsz = int(predict_kw["imgsz"])
+        predict_imgsz = default_imgsz
         fps = _clip_fps(clip_name)
         stats = band_stats[clip_band]
         clip_tp = clip_fp = clip_fn = 0
@@ -1355,6 +1373,7 @@ def evaluate_prepared_pack(
                 iou_thresh=iou_thresh,
                 band_stats=dummy_stats,
                 video_dir=video_dir,
+                predict_imgsz=default_imgsz,
             )
             target = by_id.get(clip_name)
             if target is None:
@@ -1386,7 +1405,6 @@ def evaluate_prepared_pack(
         "eval_mode": {
             "mode": "prepared_pack",
             "imgsz": default_imgsz,
-            "clip_train_imgsz": clip_train_imgsz,
             "clip_uses_tiling": payload_yaml.get("clip_uses_tiling") or {},
             "clip_group": payload_yaml.get("clip_group") or {},
             "train_metadata": str(yaml_path),
@@ -1405,7 +1423,7 @@ def evaluate_prepared_pack(
             "false_alarms_formula": "FP / (N_pack_samples / fps / 60)",
             "inference": (
                 "direct YOLO predict on pack images (already tiled/cropped); "
-                f"predict_imgsz from pack clip_train_imgsz (default {default_imgsz})"
+                f"YOLO11s predict_imgsz={default_imgsz} (train default {TRAIN_IMGSZ})"
             ),
         },
         "bands": {
@@ -1443,6 +1461,7 @@ def evaluate_live(
     clip_names: list[str],
     output_dir: Path,
     video_dir: Path | None,
+    predict_imgsz: int = TRAIN_IMGSZ,
 ) -> None:
     """Legacy: full-frame video eval from data/frames + labels/eval."""
     split_map = build_split_map()
@@ -1450,7 +1469,7 @@ def evaluate_live(
     slice_cfg = load_train_slice_config()
     verify_materialized_tile_size(slice_cfg)
     print(
-        f"Eval (live): default_imgsz={slice_cfg.imgsz}, "
+        f"Eval (live): predict_imgsz={predict_imgsz}, "
         f"per-clip train_groups tiling (from {slice_cfg.source})"
     )
     if slice_cfg.clip_group:
@@ -1459,9 +1478,8 @@ def evaluate_live(
             uses = slice_cfg.clip_uses_tiling.get(name, True)
             size = slice_cfg.clip_slice_size.get(name, "?")
             ov = slice_cfg.clip_overlap.get(name, "?")
-            p_imgsz = slice_cfg.clip_train_imgsz.get(name, slice_cfg.imgsz)
             tile_desc = "full-frame" if not uses else f"tile={size}"
-            print(f"  {name}: group={group}, {tile_desc}, overlap={ov}, predict_imgsz={p_imgsz}")
+            print(f"  {name}: group={group}, {tile_desc}, overlap={ov}, predict_imgsz={predict_imgsz}")
 
     for clip in clip_names:
         if split_map.get(clip) != "eval":
@@ -1491,6 +1509,7 @@ def evaluate_live(
                 iou_thresh=iou_thresh,
                 band_stats=band_stats,
                 video_dir=video_dir,
+                predict_imgsz=predict_imgsz,
             )
         )
     run_elapsed_sec = round(time.perf_counter() - run_t0, 2)
@@ -1511,11 +1530,10 @@ def evaluate_live(
         },
         "eval_mode": {
             "mode": "live",
-            "imgsz": slice_cfg.imgsz,
+            "imgsz": predict_imgsz,
             "overlap_ratio": slice_cfg.overlap_ratio,
             "clip_slice_size": slice_cfg.clip_slice_size,
             "clip_overlap": slice_cfg.clip_overlap,
-            "clip_train_imgsz": slice_cfg.clip_train_imgsz,
             "clip_uses_tiling": slice_cfg.clip_uses_tiling,
             "clip_group": slice_cfg.clip_group,
             "tile_nms_iou": TILE_NMS_IOU,
@@ -1532,7 +1550,7 @@ def evaluate_live(
             "false_alarms_formula": "FP / (N_frames / fps / 60)",
             "inference": (
                 f"per-clip train_groups tile_size (or full-frame), "
-                f"YOLO predict_imgsz from group (default {slice_cfg.imgsz}), "
+                f"YOLO11s predict_imgsz={predict_imgsz}, "
                 "merged to full frame"
             ),
         },
@@ -1582,6 +1600,7 @@ def main() -> None:
             clip_names=clip_names,
             output_dir=out_dir,
             video_dir=video_dir,
+            predict_imgsz=args.imgsz,
         )
         return
 
@@ -1603,6 +1622,7 @@ def main() -> None:
             clip_filter=args.clips,
             output_dir=out_dir,
             tile_config=tile_config,
+            predict_kw={"imgsz": args.imgsz},
             video_dir=video_dir,
         )
         return
@@ -1623,6 +1643,7 @@ def main() -> None:
             clip_filter=args.clips,
             output_dir=out_dir,
             tile_config=tile_config,
+            predict_kw={"imgsz": args.imgsz},
             video_dir=video_dir,
         )
 

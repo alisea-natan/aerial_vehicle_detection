@@ -11,7 +11,7 @@ prepare:
 baseline:
   name: baseline_v1
   out_dir: data/datasets/baseline_v1
-  imgsz: 1024
+  imgsz: 640
   val_fraction: 0.15
   seed: 42
   frame_step_only: true
@@ -22,11 +22,11 @@ baseline:
 #   python src/training/datasets/generate_variant.py --all
 # Round 1 (datasets, yolo11s --prototype, CVAT labels):
 #   python src/training/experiments/run_dataset_round.py
-# Round 2 (models, later):
+# Round 2 (protocol → family → size → epochs):
 #   python src/training/experiments/run_model_round.py --dry-run
 experiment:
   model: yolo11s.pt
-  imgsz: 1024
+  imgsz: 640
   warmup_epochs: 2
   epochs: 5
   freeze: 11
@@ -40,5 +40,5 @@ train:
   freeze: 11
   lr0: 0.01
   patience: 10
-  imgsz: 1024
+  imgsz: 640
   seed: 42

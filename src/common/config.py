@@ -48,10 +48,12 @@ TILE_HEADROOM_STEPS = 1
 
 # Train/eval model input. Per-clip crop comes from train_groups in clip_tiling.json
 # (explicit tile_size from object-size bands).
-TRAIN_IMGSZ = 1024
+ULTRALYTICS_DEFAULT_IMGSZ = 640  # Ultralytics predict default when imgsz omitted
+TRAIN_IMGSZ = 640  # YOLO11s PoC train / eval predict (override with --imgsz)
 TRAIN_OVERLAP_RATIO = 0.2
 # Preprocess marks skip=true when median car long-side is below this (C_far band).
 MIN_USABLE_OBJECT_PX = 32.0
+AUTOLABEL_IMGSZ = 1280  # YOLO-World autolabel only
 
 
 @dataclass(frozen=True)

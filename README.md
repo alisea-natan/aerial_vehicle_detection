@@ -18,22 +18,15 @@ Single class `0 = vehicle`: a **car, van, truck, or bus** (powered road unit). T
 
 If a truck tows a trailer: box the **tractor only**. Leave non-vehicles unlabeled.
 
-YOLO-World is prompted with a **keep** list and a **drop** list. Drop classes are detected so they do not steal a vehicle box; they are never written as labels. A keep box that overlaps a drop box (IoU ≥ 0.5) is discarded.
+Both probe and autolabel use **YOLO-World**, an open-vocabulary detector: **keep** and **drop** lists are text prompts, so we can search for vehicles before any hand labels or fine-tuned model. **Drop** classes (e.g. `motorcycle`, `bicycle`, `person`) are prompted too — the model finds them as their own class instead of tagging them as `car`. Those drop boxes are never saved as labels; they only block a keep box (IoU ≥ 0.5) so a bike does not become a vehicle label.
 
 **Autolabel** (training boxes) follows the table: truck/bus stay keep.
 
-**Probe** (tiles / size / metres) is stricter: only **`car`** is measured (distance assumes a 4.5 m passenger car). Truck and bus are drop there so a lorry is not treated as a 4.5 m car.
-
-## Setup
-
-```bash
-python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-```
-
-Python **3.12**. Run from the repo root.
+**Probe** (tiles / size / metres) is stricter: only `car` is measured — truck and bus are drop so a lorry is not treated as a 4.5 m car.
 
 ## Pipeline
+
+Python 3.12, `pip install -r requirements.txt`. Clips in `data/train/` and `data/eval/`. Ultralytics weights download on first run. Runtimes below are MPS.
 
 ```mermaid
 flowchart LR
@@ -47,38 +40,44 @@ flowchart LR
     W --> Ev[evaluate]
 ```
 
-
-
-
-| Step                           | Command                                                                                   | Runtime        |
-| ------------------------------ | ----------------------------------------------------------------------------------------- | -------------- |
-| 1. Frames                      | `python src/data/extract_frames.py`                                                       | —              |
-| 2. Config                      | `python src/data/preprocess_clips.py` → `config/clip_tiling.json` (optional `--save-probe-frames` → `outputs/probe_frames/`) | 100.71s        |
-| 3. Autolabel                   | `python src/labeling/autolabel.py` → `outputs/autolabel/`                                 | 10m 21s        |
-| 4. Dataset                     | `python src/training/prepare_baseline.py --from-autolabel` → `data/datasets/baseline_v0/` | —              |
-| 4b. Eval pack (optional, once) | `python src/training/prepare_eval.py --from-autolabel` → `data/datasets/eval_autolabel/`  | —              |
-| 5. Train                       | `python -u src/training/train.py --dataset-dir data/datasets/baseline_v0 --prototype`     | ~17 min        |
-| 6. Eval                        | `python src/training/evaluate.py`                                                         | ~16 s          |
+| Step                           | Command                                                                                                                      | Runtime |
+| ------------------------------ | ---------------------------------------------------------------------------------------------------------------------------- | ------- |
+| 1. Frames                      | `python src/data/extract_frames.py`                                                                                          | —       |
+| 2. Config                      | `python src/data/preprocess_clips.py` → `config/clip_tiling.json` (optional `--save-probe-frames` → `outputs/probe_frames/`) | 100.71s |
+| 3. Autolabel                   | `python src/labeling/autolabel.py` → `outputs/autolabel/`                                                                    | 23m 0s  |
+| 4. Dataset                     | `python src/training/prepare_baseline.py --from-autolabel` → `data/datasets/baseline_v0/`                                    | —       |
+| 4b. Eval pack (optional, once) | `python src/training/prepare_eval.py --from-autolabel` → `data/datasets/eval_autolabel/`                                     | —       |
+| 5. Train                       | `python -u src/training/train.py --dataset-dir data/datasets/baseline_v0 --prototype`                                        | ~17 min |
+| 6. Eval                        | `python src/training/evaluate.py`                                                                                            | —  |
 
 
 Single clip: add `--clip NAME` where supported.
 
 Generated frames, autolabel boxes, dataset packs, and run folders stay on disk (gitignored). In the repo: `config/clip_tiling.json`, `outputs/probe_frames/` (if saved), and `checkpoints/yolo11s_vehicle_best.pt`.
 
+### Inference sizes (`src/common/config.py`)
+
+
+| Stage                | Model      | `imgsz`  | Notes                                                 |
+| -------------------- | ---------- | -------- | ----------------------------------------------------- |
+| Preprocess probe     | YOLO-World | **640**  | `ULTRALYTICS_DEFAULT_IMGSZ` — coarse tiles / distance |
+| Autolabel            | YOLO-World | **1280** | `AUTOLABEL_IMGSZ` — label quality                     |
+| Train / eval YOLO11s | YOLO11s    | **640**  | `TRAIN_IMGSZ` — PoC default; override `--imgsz`       |
+
+
+Native **tile crops** stay **1024 px** on the frame for `B_medium` (`train_groups.tile_size`); only the letterbox into the model uses `train_imgsz` (640).
+
 ---
 
 ## 1. Config generation (`clip_tiling.json`)
 
-`python src/data/preprocess_clips.py` probes each clip with **YOLO-World** and writes `config/clip_tiling.json`. Autolabel, train, and eval all read that file (tiles, `frame_step`, distance band, skip).
+`python src/data/preprocess_clips.py` probes each clip with **YOLO-World** (`yolov8x-worldv2.pt`): open-vocabulary detection via text prompts (`set_classes`, not COCO ids). Output is `config/clip_tiling.json` — per-clip tiles, `frame_step`, distance band, skip. Autolabel, train, and eval read that file.
+Probe prompts:
 
-Class names come from `set_classes` (not leftover COCO ids). Probe prompts:
-
-| Role | Prompts | Used for tiles / size / metres? |
-| ---- | ------- | ------------------------------- |
-| Keep | `car` | yes |
+| Role | Prompts                                                      | Used for tiles / size / metres?  |
+| ---- | ------------------------------------------------------------ | -------------------------------- |
+| Keep | `car`                                                        | yes                              |
 | Drop | `truck`, `bus`, `trailer`, `motorcycle`, `bicycle`, `person` | no (neutralize false `car` tags) |
-
-A `car` box overlapping a drop box (IoU ≥ 0.5) is discarded.
 
 ### How it works
 
@@ -101,17 +100,7 @@ distance_m = 4.5 m × focal_px / bbox_long_side_px
 
 `focal_px` comes from an assumed **24 mm** lens. Sensor defaults: 1-inch (4K / 1080p) or 1/2.3″ (SD). Override per clip with `calibration/{clip}.json` (`focal_length_mm`, sensor size, or `vertical_fov_deg`).
 
-Clip-level `distance_m` is the **largest** probed **car** (else the median of car boxes). Drop-class hits are prompted then ignored. That value is then binned:
-
-
-| `distance_m` | Stored band | Eval column                |
-| ------------ | ----------- | -------------------------- |
-| < 200        | `<200m`     | **0–200 m**                |
-| 200–400      | `>200m`     | **200–400 m**              |
-| ≥ 400        | `>400m`     | (no eval clip in this PoC) |
-
-
-So the 200 m / 400 m cuts are **not** GPS altitude — they are “how far would this box be if it were a 4.5 m car.” Eval uses one clip per band (`13722965…` ≈ 95 m, `266987` ≈ 295 m).
+Clip-level `distance_m` is the **largest** probed **car** (else the median of car boxes), binned to `<200m`, `>200m`, or `>400m` (eval uses the first two; ≥400 m clips are skipped). The 200 m / 400 m cuts are **not** GPS altitude — they are “how far would this box be if it were a 4.5 m car.”
 
 ### Tiles & confidence
 
@@ -131,13 +120,11 @@ tiles > 1   →  conf max(0.05, 0.20 / tiles)
 Autolabel uses these `target_tiles` / overlap / conf. Train/eval crops use `train_groups` (object-size bands), not the probe tile count:
 
 
-| Median car long-side | Group      | Crop                             |
-| -------------------- | ---------- | -------------------------------- |
-| ≥ 80 px              | `A_close`  | full frame, letterbox to 1024    |
-| 32–80 px             | `B_medium` | tile 1024 @ 0.2 overlap          |
-| < 32 px              | `C_far`    | skipped (`MIN_USABLE_OBJECT_PX`) |
-
-
+| Median car long-side | Group      | Crop                                            |
+| -------------------- | ---------- | ----------------------------------------------- |
+| ≥ 80 px              | `A_close`  | full frame, letterbox to **640**                |
+| 32–80 px             | `B_medium` | tile **1024** @ 0.2 overlap → letterbox **640** |
+| < 32 px              | `C_far`    | skipped (`MIN_USABLE_OBJECT_PX`)                |
 
 
 ```bash
@@ -152,14 +139,12 @@ Rough object sizes from preprocess (also drive `frame_step` and the skip):
 
 | Clip (short)              | Median px | Typical `frame_step` | Band      |
 | ------------------------- | --------- | -------------------- | --------- |
-| `13722965…` (eval, close) | ~369      | 19                   | 0–200 m   |
-| `3405804…`                | ~137      | 18                   | <200 m    |
-| `266987` (eval, mid)      | ~133      | 3                    | 200–400 m |
-| `8457857…`                | ~108      | 5                    | <200 m    |
-| `5382494…`                | ~53       | 9–14                 | <200 m    |
-| `8968356…` (**skipped**)  | ~17       | —                    | —         |
-
-
+| `13722965…` (eval, close) | ~299      | 23                   | 0–200 m   |
+| `3405804…`                | ~89       | 9                    | <200 m    |
+| `266987` (eval, mid)      | ~142      | 4                    | 200–400 m |
+| `8457857…`                | ~51       | 2                    | <200 m    |
+| `5382494…`                | ~53       | 8                    | <200 m    |
+| `8968356…` (**skipped**)  | ~18       | —                    | —         |
 
 
 ### Rejected video (decision after probe)
@@ -170,26 +155,18 @@ Preprocess **always probes every clip**. If median car size is **< 32 px** (`MIN
 
 ---
 
+## 2. Autolabel
 
+Same **YOLO-World** weights as the config probe — reused to bootstrap training labels:
 
-## 2. Autolabel (YOLO-World)
-
-
-
-### Why YOLO-World
-
-Open-vocabulary detector (`yolov8x-worldv2.pt`). Same weights as preprocess, different prompt lists. It fits this PoC because:
-
-1. **Same model** already drives preprocess (tiles / size / `frame_step`).
-2. No labeled data needed up front — bootstrap boxes for every `frame_step` frame.
-3. Single class `0 = vehicle` after collapsing **keep** prompts.
+1. **No manual boxes first** — write labels on every `frame_step` frame from preprocess.
+2. **Prompts = vehicle definition** — wider keep list than probe (truck/bus stay keep); all keeps collapse to class `0 = vehicle`; drop list suppresses confounders only.
+3. **Per-clip infer settings** — `target_tiles`, overlap, and conf from `clip_tiling.json`; imgsz **1280** (`AUTOLABEL_IMGSZ`).
 
 **Keep** (written as `vehicle`): `car`, `suv`, `pickup`, `van`, `truck`, `bus`, `minibus`, `taxi`  
 **Drop** (prompted, not labeled): `motorcycle`, `scooter`, `moped`, `trailer`, `caravan`, `bicycle`, `cyclist`, `person`
 
-A keep box overlapping a drop box (IoU ≥ 0.5) is dropped. Truck/bus are keep here (they are vehicles) but **drop on probe** (not 4.5 m cars).
-
-Labels are **per subsampled frame only** (`frame_step` from preprocess): conf threshold + dedupe, no temporal tracking. On a dense whole-clip run, IoU/ByteTrack plus dip/spike smoothing would help; with `frame_step` we pick unique looks on purpose, so tracks rarely span ≥3 processed frames and the old stable-track gate mostly dropped real cars.
+Labels are **per subsampled frame only**: conf threshold + dedupe, no temporal tracking. Full-frame and SAHI tiles. On a dense whole-clip run, IoU/ByteTrack plus dip/spike smoothing would help; with `frame_step` we pick unique looks on purpose, so tracks rarely span ≥3 processed frames and the old stable-track gate mostly dropped real cars.
 
 Output: `outputs/autolabel/` (labels + images). Used as training labels for this PoC. Gitignored.
 
@@ -198,15 +175,13 @@ python src/labeling/autolabel.py                  # all non-skipped clips
 python src/labeling/autolabel.py --clip 266987   # one clip
 ```
 
-Example wall time (full run): **Done in 10m 21s.** Stats: `outputs/autolabel/debug/label_stats.json`.
+Example wall time (full run): **Done in 23m 0s.** Stats: `outputs/autolabel/debug/label_stats.json`.
 
 ---
 
-
-
 ## 3. Train YOLO11s & metrics
 
-Fine-tune **YOLO11s** (`yolo11s.pt`) in two stages. Crops follow `train_groups` in `clip_tiling.json` (letterbox to `train_imgsz`, typically 1024). Aug: HSV + flips + degrees=180.
+Fine-tune **YOLO11s** (`yolo11s.pt`) in two stages. Crops follow `train_groups` in `clip_tiling.json` (native tiles up to 1024 px, letterbox to **`train_imgsz` 640**). Aug: HSV + flips + degrees=180.
 
 
 | Stage | What trains                                         | Default (full) | `--prototype` (fast PoC) |
@@ -234,17 +209,17 @@ Override any schedule piece with `--warmup-epochs`, `--epochs`, `--patience` (om
 ### Prototype run (MPS, 32 GB unified RAM)
 
 Command: `--dataset-dir data/datasets/baseline_v0 --prototype`  
-Pack: 403 train / 71 val images (holdout from train videos; autolabel GT), imgsz 1024, batch 8.
+Pack: 403 train / 71 val images (holdout from train videos; autolabel GT), **imgsz 640**, batch 8.
 
 
-| Stage                     | Wall time          | Val (best / end)                                                |
-| ------------------------- | ------------------ | --------------------------------------------------------------- |
-| 1 — head only, 2 ep       | 3m 29s (0.058 h)   | mAP50 **0.537**, P 0.61, R 0.57                                 |
-| 2 — full (backbone), 5 ep | 13m 7s (0.219 h)   | best @ ep4: mAP50 **0.748**, mAP50-95 **0.398**, P 0.75, R 0.67 |
-| **Total**                 | **16m 36s (0.277 h)** | deliverable: `checkpoints/yolo11s_vehicle_best.pt`              |
+| Stage                     | Wall time             | Val (`best.pt`)                                                 |
+| ------------------------- | --------------------- | --------------------------------------------------------------- |
+| 1 — head only, 2 ep       | 3m 36s (0.060 h)      | mAP50 **0.374**, P 0.56, R 0.34                                 |
+| 2 — full (backbone), 5 ep | 12m 54s (0.215 h)     | mAP50 **0.410**, mAP50-95 **0.184**, P 0.62, R 0.38             |
+| **Total**                 | **16m 31s (0.275 h)** | deliverable: `checkpoints/yolo11s_vehicle_best.pt`              |
 
 
-Stage 2 per-epoch val mAP50: 0.72 → 0.70 → 0.60 → **0.75** → 0.77 (best checkpoint is ep4 by Ultralytics fitness / mAP50-95).
+Stage 2 per-epoch val mAP50: 0.34 → 0.29 → 0.36 → **0.41** → 0.39 (`best.pt` = ep4; Ultralytics fitness, not max mAP50).
 
 **Fixed eval pack** (same tiling, eval clips only — reuse for every experiment):
 
@@ -252,11 +227,11 @@ Stage 2 per-epoch val mAP50: 0.72 → 0.70 → 0.60 → **0.75** → 0.77 (best 
 python src/training/prepare_eval.py --from-autolabel   # → data/datasets/eval_autolabel/
 ```
 
-After `frame_step`, each clip is capped at **64** evenly spaced frames by default (`--max-frames-per-clip`). That thins long/fast clips (e.g. `266987` step=3 → hundreds of near-duplicates) without changing preprocess or other videos under the cap. Use `--max-frames-per-clip 0` for no cap.
+After `frame_step`, each clip is capped at **64** evenly spaced frames by default (`--max-frames-per-clip`). That thins long/fast clips (e.g. `266987` step=4 → hundreds of near-duplicates) without changing preprocess or other videos under the cap. Use `--max-frames-per-clip 0` for no cap.
 
 ### Evaluate
 
-Scores the prepared pack (not live re-tiling). Default GT = autolabel pack. Infer confidence defaults to **0.25** (Ultralytics YOLO default), same for all clips — not the autolabel per-tile thresholds.
+Scores the prepared pack (not live re-tiling). Default GT = autolabel pack. YOLO11s infer **imgsz 640** (same as train). Confidence defaults to **0.25** (Ultralytics YOLO default), same for all clips — not the autolabel per-tile thresholds.
 
 ```bash
 # Standard eval (conf 0.25), metrics only
@@ -269,7 +244,7 @@ python src/training/evaluate.py --gt autolabel --conf 0.5 --no-video --output-di
 python src/training/evaluate.py --gt autolabel
 ```
 
-IoU 0.5 match on pack images (already tiled/cropped). Bands are the preprocess distance bins (4.5 m car → metres; see §1):
+IoU 0.5 match on pack images (already tiled/cropped). Distance bands from preprocess:
 
 
 | Band      | Clip                       | Probe `distance_m` |
@@ -278,36 +253,20 @@ IoU 0.5 match on pack images (already tiled/cropped). Bands are the preprocess d
 | 200–400 m | `266987`                   | ~295 m             |
 
 
-
-
 ### Eval runs (MPS — after prototype train)
 
 Weights: `outputs/runs/yolo11s_vehicle/weights/best.pt`. Autolabel GT. Pack: **88 images** (frame_step + cap 64). No overlay videos (`--no-video`).
 
-**conf 0.25** (default). Wall time **~11 s**. Report: `outputs/eval_autolabel/`.
-
-
-| Metric                         | 0–200 m | 200–400 m |
-| ------------------------------ | ------- | --------- |
-| Detection rate                 | 70.3%   | 81.8%     |
-| Precision                      | 43.3%   | 78.3%     |
-| False alarms / min             | 6300.00 | 642.84    |
-| Time to first det (s)          | 0.03    | 0.03      |
-| [mAP@0.5](mailto:mAP@0.5)      | 51.1%   | 80.5%     |
-| [mAP@0.5](mailto:mAP@0.5):0.95 | 26.7%   | 25.7%     |
-
-
-**conf 0.5** (stricter deploy point). Wall time **~11 s**. Report: `outputs/eval_autolabel_conf05/`.
-
+**conf 0.25** (default). Wall time **9.4 s**. Report: `outputs/eval_autolabel/`.
 
 | Metric                         | 0–200 m | 200–400 m |
 | ------------------------------ | ------- | --------- |
-| Detection rate                 | 65.7%   | 81.8%     |
-| Precision                      | 59.3%   | 84.4%     |
-| False alarms / min             | 3091.30 | 428.56    |
+| Detection rate                 | 65.7%   | 74.2%     |
+| Precision                      | 59.0%   | 89.1%     |
+| False alarms / min             | 3130.43 | 257.13    |
 | Time to first det (s)          | 0.03    | 0.03      |
-| [mAP@0.5](mailto:mAP@0.5)      | 47.1%   | 80.5%     |
-| [mAP@0.5](mailto:mAP@0.5):0.95 | 25.8%   | 25.7%     |
+| mAP@0.5                        | 50.0%   | 69.0%     |
+| mAP@0.5:0.95                   | 22.9%   | 15.0%     |
 
 ### Prediction postprocess (nested boxes)
 

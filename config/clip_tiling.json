@@ -1,28 +1,27 @@
 {
   "source": "preprocess_clips.py",
-  "updated_at": "2026-08-12T09:33:41+00:00",
   "clips": {
     "13722965_2160_3840_30fps": {
       "target_tiles": 2,
       "overlap_ratio": 0.1,
-      "label_confidence_threshold": 0.25,
+      "label_confidence_threshold": 0.1,
       "detection_class": "car",
       "distance_band": "<200m",
       "distance_m": 94.6,
       "split": "eval",
-      "note": "probed start/middle/end (hit 000307); distance from largest_car; car_size_med=365.1px; frame_step=19; probe_min_tiles=1 \u2192 target_tiles=2 (+1 headroom)",
+      "note": "probed start/middle/end (hit 000307); distance from largest_car; car_size_med=298.5px; frame_step=23; probe_min_tiles=1 \u2192 target_tiles=2 (+1 headroom)",
       "probe_min_tiles": 1,
-      "object_size_px_median": 365.1,
-      "object_size_px_mean": 336.4,
-      "object_size_n_boxes": 26,
+      "object_size_px_median": 298.5,
+      "object_size_px_mean": 314.0,
+      "object_size_n_boxes": 27,
       "distance_varies": false,
       "distance_by_segment": {
         "start": {
           "frames_with_cars": 3,
           "car_boxes": 10,
-          "object_size_px_median": 291.1,
-          "object_size_px_mean": 301.6,
-          "distance_m_median": 161.9,
+          "object_size_px_median": 290.9,
+          "object_size_px_mean": 301.3,
+          "distance_m_median": 162.1,
           "distance_band": "<200m",
           "frames": [
             "000001",
@@ -32,10 +31,10 @@
         },
         "middle": {
           "frames_with_cars": 3,
-          "car_boxes": 8,
-          "object_size_px_median": 378.1,
-          "object_size_px_mean": 363.8,
-          "distance_m_median": 124.9,
+          "car_boxes": 9,
+          "object_size_px_median": 365.0,
+          "object_size_px_mean": 335.2,
+          "distance_m_median": 129.1,
           "distance_band": "<200m",
           "frames": [
             "000307",
@@ -46,9 +45,9 @@
         "end": {
           "frames_with_cars": 3,
           "car_boxes": 8,
-          "object_size_px_median": 374.3,
-          "object_size_px_mean": 352.7,
-          "distance_m_median": 126.0,
+          "object_size_px_median": 318.6,
+          "object_size_px_mean": 305.9,
+          "distance_m_median": 151.1,
           "distance_band": "<200m",
           "frames": [
             "000613",
@@ -57,9 +56,9 @@
           ]
         }
       },
-      "size_ratio_change_start_end": 0.222,
-      "speed_px_per_frame_median": 9.26,
-      "frame_step": 19,
+      "size_ratio_change_start_end": 0.087,
+      "speed_px_per_frame_median": 6.38,
+      "frame_step": 23,
       "frame_step_fraction": 0.5,
       "suggested_train_group": "A_close",
       "frames_probed_by_segment": {
@@ -81,26 +80,26 @@
       }
     },
     "266987": {
-      "target_tiles": 3,
+      "target_tiles": 2,
       "overlap_ratio": 0.1,
-      "label_confidence_threshold": 0.1667,
+      "label_confidence_threshold": 0.1,
       "detection_class": "car",
       "distance_band": ">200m",
-      "distance_m": 295.3,
+      "distance_m": 292.2,
       "split": "eval",
-      "note": "probed start/middle/end (hit 000153); distance from largest_car; car_size_med=140.1px; frame_step=3; probe_min_tiles=2 \u2192 target_tiles=3 (+1 headroom)",
-      "probe_min_tiles": 2,
-      "object_size_px_median": 140.1,
-      "object_size_px_mean": 140.8,
-      "object_size_n_boxes": 8,
+      "note": "probed start/middle/end (hit 000001); distance from largest_car; car_size_med=141.8px; frame_step=4; probe_min_tiles=1 \u2192 target_tiles=2 (+1 headroom)",
+      "probe_min_tiles": 1,
+      "object_size_px_median": 141.8,
+      "object_size_px_mean": 143.0,
+      "object_size_n_boxes": 5,
       "distance_varies": false,
       "distance_by_segment": {
         "start": {
           "frames_with_cars": 3,
-          "car_boxes": 5,
-          "object_size_px_median": 141.8,
-          "object_size_px_mean": 146.0,
-          "distance_m_median": 332.4,
+          "car_boxes": 4,
+          "object_size_px_median": 141.1,
+          "object_size_px_mean": 143.3,
+          "distance_m_median": 334.0,
           "distance_band": ">200m",
           "frames": [
             "000001",
@@ -109,32 +108,29 @@
           ]
         },
         "middle": {
-          "frames_with_cars": 2,
-          "car_boxes": 2,
-          "object_size_px_median": 136.2,
-          "object_size_px_mean": 136.2,
-          "distance_m_median": 346.6,
+          "frames_with_cars": 1,
+          "car_boxes": 1,
+          "object_size_px_median": 141.8,
+          "object_size_px_mean": 141.8,
+          "distance_m_median": 332.3,
           "distance_band": ">200m",
           "frames": [
-            "000305",
-            "000457"
+            "000305"
           ]
         },
         "end": {
-          "frames_with_cars": 1,
-          "car_boxes": 1,
-          "object_size_px_median": 124.2,
-          "object_size_px_mean": 124.2,
-          "distance_m_median": 379.5,
-          "distance_band": ">200m",
-          "frames": [
-            "000912"
-          ]
+          "frames_with_cars": 0,
+          "car_boxes": 0,
+          "object_size_px_median": null,
+          "object_size_px_mean": null,
+          "distance_m_median": null,
+          "distance_band": null,
+          "frames": []
         }
       },
-      "size_ratio_change_start_end": 0.124,
-      "speed_px_per_frame_median": 18.96,
-      "frame_step": 3,
+      "size_ratio_change_start_end": null,
+      "speed_px_per_frame_median": 16.47,
+      "frame_step": 4,
       "frame_step_fraction": 0.5,
       "suggested_train_group": "A_close",
       "frames_probed_by_segment": {
@@ -156,26 +152,26 @@
       }
     },
     "8968356-hd_1920_1080_30fps": {
-      "target_tiles": 3,
+      "target_tiles": 2,
       "overlap_ratio": 0.1,
-      "label_confidence_threshold": 0.1667,
+      "label_confidence_threshold": 0.1,
       "detection_class": "car",
-      "distance_band": "<200m",
-      "distance_m": 197.6,
+      "distance_band": ">200m",
+      "distance_m": 324.1,
       "split": "train",
-      "note": "probed start/middle/end (hit 000481); distance from largest_car; car_size_med=17.2px; frame_step=2; probe_min_tiles=2 \u2192 target_tiles=3 (+1 headroom)",
-      "probe_min_tiles": 2,
-      "object_size_px_median": 17.2,
-      "object_size_px_mean": 20.3,
-      "object_size_n_boxes": 126,
+      "note": "probed start/middle/end (hit 000192); distance from largest_car; car_size_med=17.6px; frame_step=2; probe_min_tiles=1 \u2192 target_tiles=2 (+1 headroom)",
+      "probe_min_tiles": 1,
+      "object_size_px_median": 17.6,
+      "object_size_px_mean": 18.9,
+      "object_size_n_boxes": 124,
       "distance_varies": false,
       "distance_by_segment": {
         "start": {
           "frames_with_cars": 3,
-          "car_boxes": 45,
-          "object_size_px_median": 17.3,
-          "object_size_px_mean": 20.0,
-          "distance_m_median": 767.3,
+          "car_boxes": 46,
+          "object_size_px_median": 17.8,
+          "object_size_px_mean": 19.0,
+          "distance_m_median": 744.0,
           "distance_band": ">400m",
           "frames": [
             "000001",
@@ -185,10 +181,10 @@
         },
         "middle": {
           "frames_with_cars": 3,
-          "car_boxes": 41,
-          "object_size_px_median": 16.8,
-          "object_size_px_mean": 20.0,
-          "distance_m_median": 788.7,
+          "car_boxes": 40,
+          "object_size_px_median": 17.1,
+          "object_size_px_mean": 18.7,
+          "distance_m_median": 774.5,
           "distance_band": ">400m",
           "frames": [
             "000193",
@@ -198,10 +194,10 @@
         },
         "end": {
           "frames_with_cars": 3,
-          "car_boxes": 40,
-          "object_size_px_median": 17.4,
-          "object_size_px_mean": 21.1,
-          "distance_m_median": 762.0,
+          "car_boxes": 38,
+          "object_size_px_median": 17.6,
+          "object_size_px_mean": 18.9,
+          "distance_m_median": 752.8,
           "distance_band": ">400m",
           "frames": [
             "000385",
@@ -210,8 +206,8 @@
           ]
         }
       },
-      "size_ratio_change_start_end": 0.006,
-      "speed_px_per_frame_median": 3.38,
+      "size_ratio_change_start_end": 0.011,
+      "speed_px_per_frame_median": 3.12,
       "frame_step": 2,
       "frame_step_fraction": 0.5,
       "suggested_train_group": "C_far",
@@ -233,30 +229,30 @@
         ]
       },
       "skip": true,
-      "skip_reason": "objects too small for reliable detection (~17 px median); do not train/eval/autolabel"
+      "skip_reason": "objects too small for reliable detection (~18 px median); do not train/eval/autolabel"
     },
     "3405804-uhd_3840_2160_30fps": {
       "target_tiles": 2,
       "overlap_ratio": 0.1,
-      "label_confidence_threshold": 0.25,
+      "label_confidence_threshold": 0.1,
       "detection_class": "car",
       "distance_band": "<200m",
-      "distance_m": 86.6,
+      "distance_m": 103.3,
       "split": "train",
-      "note": "probed start/middle/end (hit 000001); distance from largest_car; car_size_med=110.2px; distance_varies; frame_step=11; probe_min_tiles=1 \u2192 target_tiles=2 (+1 headroom)",
+      "note": "probed start/middle/end (hit 000001); distance from largest_car; car_size_med=88.9px; distance_varies; frame_step=9; probe_min_tiles=1 \u2192 target_tiles=2 (+1 headroom)",
       "probe_min_tiles": 1,
-      "object_size_px_median": 110.2,
-      "object_size_px_mean": 129.3,
-      "object_size_n_boxes": 127,
+      "object_size_px_median": 88.9,
+      "object_size_px_mean": 102.9,
+      "object_size_n_boxes": 248,
       "distance_varies": true,
       "distance_by_segment": {
         "start": {
           "frames_with_cars": 3,
-          "car_boxes": 39,
-          "object_size_px_median": 157.2,
-          "object_size_px_mean": 179.9,
-          "distance_m_median": 168.6,
-          "distance_band": "<200m",
+          "car_boxes": 72,
+          "object_size_px_median": 127.1,
+          "object_size_px_mean": 139.9,
+          "distance_m_median": 208.7,
+          "distance_band": ">200m",
           "frames": [
             "000001",
             "000123",
@@ -265,10 +261,10 @@
         },
         "middle": {
           "frames_with_cars": 3,
-          "car_boxes": 51,
-          "object_size_px_median": 104.3,
-          "object_size_px_mean": 116.3,
-          "distance_m_median": 254.1,
+          "car_boxes": 87,
+          "object_size_px_median": 91.1,
+          "object_size_px_mean": 100.4,
+          "distance_m_median": 290.9,
           "distance_band": ">200m",
           "frames": [
             "000245",
@@ -278,10 +274,10 @@
         },
         "end": {
           "frames_with_cars": 3,
-          "car_boxes": 37,
-          "object_size_px_median": 84.3,
-          "object_size_px_mean": 94.0,
-          "distance_m_median": 314.5,
+          "car_boxes": 89,
+          "object_size_px_median": 72.2,
+          "object_size_px_mean": 75.3,
+          "distance_m_median": 367.1,
           "distance_band": ">200m",
           "frames": [
             "000490",
@@ -290,9 +286,9 @@
           ]
         }
       },
-      "size_ratio_change_start_end": 0.464,
-      "speed_px_per_frame_median": 4.93,
-      "frame_step": 11,
+      "size_ratio_change_start_end": 0.432,
+      "speed_px_per_frame_median": 4.69,
+      "frame_step": 9,
       "frame_step_fraction": 0.5,
       "suggested_train_group": "A_close",
       "frames_probed_by_segment": {
@@ -316,24 +312,24 @@
     "5382494-uhd_3840_2160_24fps": {
       "target_tiles": 2,
       "overlap_ratio": 0.1,
-      "label_confidence_threshold": 0.25,
+      "label_confidence_threshold": 0.1,
       "detection_class": "car",
       "distance_band": "<200m",
-      "distance_m": 180.4,
+      "distance_m": 182.1,
       "split": "train",
-      "note": "probed start/middle/end (hit 000250); distance from largest_car; car_size_med=43.1px; frame_step=14; probe_min_tiles=1 \u2192 target_tiles=2 (+1 headroom)",
+      "note": "probed start/middle/end (hit 000251); distance from largest_car; car_size_med=52.8px; frame_step=8; probe_min_tiles=1 \u2192 target_tiles=2 (+1 headroom)",
       "probe_min_tiles": 1,
-      "object_size_px_median": 43.1,
-      "object_size_px_mean": 54.0,
-      "object_size_n_boxes": 35,
+      "object_size_px_median": 52.8,
+      "object_size_px_mean": 59.8,
+      "object_size_n_boxes": 62,
       "distance_varies": false,
       "distance_by_segment": {
         "start": {
           "frames_with_cars": 3,
-          "car_boxes": 9,
-          "object_size_px_median": 43.1,
-          "object_size_px_mean": 54.5,
-          "distance_m_median": 615.7,
+          "car_boxes": 18,
+          "object_size_px_median": 54.2,
+          "object_size_px_mean": 61.0,
+          "distance_m_median": 494.1,
           "distance_band": ">400m",
           "frames": [
             "000001",
@@ -343,10 +339,10 @@
         },
         "middle": {
           "frames_with_cars": 3,
-          "car_boxes": 13,
-          "object_size_px_median": 37.1,
-          "object_size_px_mean": 48.6,
-          "distance_m_median": 714.8,
+          "car_boxes": 20,
+          "object_size_px_median": 45.2,
+          "object_size_px_mean": 55.0,
+          "distance_m_median": 586.2,
           "distance_band": ">400m",
           "frames": [
             "000251",
@@ -356,10 +352,10 @@
         },
         "end": {
           "frames_with_cars": 3,
-          "car_boxes": 13,
-          "object_size_px_median": 54.4,
-          "object_size_px_mean": 58.9,
-          "distance_m_median": 487.6,
+          "car_boxes": 24,
+          "object_size_px_median": 60.6,
+          "object_size_px_mean": 62.9,
+          "distance_m_median": 439.0,
           "distance_band": ">400m",
           "frames": [
             "000501",
@@ -368,9 +364,9 @@
           ]
         }
       },
-      "size_ratio_change_start_end": 0.208,
-      "speed_px_per_frame_median": 1.46,
-      "frame_step": 14,
+      "size_ratio_change_start_end": 0.106,
+      "speed_px_per_frame_median": 3.23,
+      "frame_step": 8,
       "frame_step_fraction": 0.5,
       "suggested_train_group": "B_medium",
       "frames_probed_by_segment": {
@@ -394,24 +390,24 @@
     "8457857-uhd_3840_2160_24fps": {
       "target_tiles": 2,
       "overlap_ratio": 0.1,
-      "label_confidence_threshold": 0.25,
+      "label_confidence_threshold": 0.1,
       "detection_class": "car",
       "distance_band": "<200m",
-      "distance_m": 68.9,
+      "distance_m": 97.7,
       "split": "train",
-      "note": "probed start/middle/end (hit 000136); distance from largest_car; car_size_med=55.0px; distance_varies; frame_step=2; probe_min_tiles=1 \u2192 target_tiles=2 (+1 headroom)",
+      "note": "probed start/middle/end (hit 000001); distance from largest_car; car_size_med=50.9px; distance_varies; frame_step=2; probe_min_tiles=1 \u2192 target_tiles=2 (+1 headroom)",
       "probe_min_tiles": 1,
-      "object_size_px_median": 55.0,
-      "object_size_px_mean": 89.5,
-      "object_size_n_boxes": 136,
+      "object_size_px_median": 50.9,
+      "object_size_px_mean": 74.0,
+      "object_size_n_boxes": 175,
       "distance_varies": true,
       "distance_by_segment": {
         "start": {
           "frames_with_cars": 3,
-          "car_boxes": 34,
-          "object_size_px_median": 123.6,
-          "object_size_px_mean": 149.9,
-          "distance_m_median": 214.6,
+          "car_boxes": 43,
+          "object_size_px_median": 74.5,
+          "object_size_px_mean": 100.0,
+          "distance_m_median": 356.0,
           "distance_band": ">200m",
           "frames": [
             "000001",
@@ -421,10 +417,10 @@
         },
         "middle": {
           "frames_with_cars": 3,
-          "car_boxes": 64,
-          "object_size_px_median": 54.8,
-          "object_size_px_mean": 80.2,
-          "distance_m_median": 484.5,
+          "car_boxes": 86,
+          "object_size_px_median": 50.9,
+          "object_size_px_mean": 72.2,
+          "distance_m_median": 521.1,
           "distance_band": ">400m",
           "frames": [
             "000136",
@@ -434,10 +430,10 @@
         },
         "end": {
           "frames_with_cars": 2,
-          "car_boxes": 38,
-          "object_size_px_median": 46.0,
-          "object_size_px_mean": 51.2,
-          "distance_m_median": 577.0,
+          "car_boxes": 46,
+          "object_size_px_median": 47.5,
+          "object_size_px_mean": 53.0,
+          "distance_m_median": 558.9,
           "distance_band": ">400m",
           "frames": [
             "000271",
@@ -445,8 +441,8 @@
           ]
         }
       },
-      "size_ratio_change_start_end": 0.628,
-      "speed_px_per_frame_median": 9.54,
+      "size_ratio_change_start_end": 0.362,
+      "speed_px_per_frame_median": 9.35,
       "frame_step": 2,
       "frame_step_fraction": 0.5,
       "suggested_train_group": "B_medium",
@@ -483,8 +479,8 @@
       "videos": [],
       "tile_size": 768,
       "overlap": 0.2,
-      "train_imgsz": 1024,
-      "note": "reserved for tiny objects; 8968356 skipped (objects too small) \u2014 no active clips"
+      "train_imgsz": 640,
+      "note": "reserved for tiny objects; 8968356 skipped (objects too small) — no active clips"
     },
     "B_medium": {
       "videos": [
@@ -492,8 +488,8 @@
       ],
       "tile_size": 1024,
       "overlap": 0.2,
-      "train_imgsz": 1024,
-      "note": "mid-size objects; baseline tile 1024 \u2192 model 1024"
+      "train_imgsz": 640,
+      "note": "mid-size objects; tile 1024 on native frame → letterbox to train_imgsz"
     },
     "A_close": {
       "videos": [
@@ -504,23 +500,36 @@
       ],
       "tile_size": null,
       "overlap": null,
-      "train_imgsz": 1024,
-      "note": "large objects; full frame letterboxed to 1024, no tiling"
+      "train_imgsz": 640,
+      "note": "large objects; full frame letterboxed to train_imgsz, no tiling"
     }
   },
-  "train_imgsz": 1024,
+  "train_imgsz": 640,
   "model_name": "yolov8x-worldv2.pt",
   "raw_confidence_threshold": 0.05,
-  "probe_max_label_threshold": 0.5,
+  "probe_max_label_threshold": 0.2,
   "fallback_tiles": 12,
   "fallback_label_threshold": 0.1,
   "adaptive_label_threshold": "probe_max / target_tiles, floor=raw_confidence",
   "detection_class": "car",
-  "probe_class_aliases": {
-    "person": "car"
-  },
   "probe_model_classes": [
     "car",
+    "truck",
+    "bus",
+    "trailer",
+    "motorcycle",
+    "bicycle",
+    "person"
+  ],
+  "probe_keep_prompts": [
+    "car"
+  ],
+  "probe_drop_prompts": [
+    "truck",
+    "bus",
+    "trailer",
+    "motorcycle",
+    "bicycle",
     "person"
   ],
   "tile_candidates": [
@@ -536,6 +545,6 @@
   "frames_per_clip": 9,
   "frames_per_segment": 3,
   "frame_step_fraction": 0.5,
-  "preprocess_note": "car-only size/distance from start/middle/end samples; frame_step=floor(size x fraction/speed)",
-  "last_probe_elapsed_sec": 97.58
+  "preprocess_note": "car-only size/distance; drop-classes prompted but not measured; frame_step=floor(size x fraction/speed)",
+  "last_probe_elapsed_sec": 83.01
 }
