@@ -1,16 +1,15 @@
 # Round 1 — dataset ablation (manual / CVAT labels).
 # Fixed train protocol = PoC schedule: YOLO11s, staged head-then-backbone, --prototype.
-# Vary only the train pack. Score every run on native + scale-adapted eval packs.
+# Vary the train pack (and imgsz on the two strided_imgsz* cells).
 #
 # Prereq (once):
 #   python src/labeling/cvat/cvat_pull.py --verify --sync-labels
 #   python src/training/prepare_eval.py
-#   python src/training/prepare_eval.py --scale-adapt
 #
 # Run (no flags = full round from scratch):
 #   python src/training/experiments/run_dataset_round.py
 #   python src/training/experiments/run_dataset_round.py --resume
-#   python src/training/experiments/run_dataset_round.py --variant baseline_1
+#   python src/training/experiments/run_dataset_round.py --variant auto
 
 defaults:
   model: yolo11s.pt
@@ -28,15 +27,16 @@ defaults:
   eval_targets:
     - gt: manual
       pack: data/datasets/eval_manual
-    - gt: manual_adapted
-      pack: data/datasets/eval_manual_adapted
 
-# Order = run order. Each id must exist in config/datasets/variants.yaml
+# Order = run order. Each id must exist in config/datasets/variants.yaml.
+# Tiling × time, empty tiles on strided, clip balance, then imgsz on strided tiles.
+# Dropped (already failed): tile 640, overlap 0.1, mosaic_hsv.
 runs:
-  - baseline_1
-  - variant_2_no_tiling
-  - variant_3_tiling_fixed
-  - variant_4_low_overlap
-  - variant_5_aug
-  - variant_6_strided
-  - variant_7_negatives
+  - auto
+  - fullframe
+  - strided
+  - fullframe_strided
+  - strided_negatives
+  - strided_clip_balanced
+  - strided_imgsz768
+  - strided_imgsz1280

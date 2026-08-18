@@ -113,7 +113,6 @@ def run_eval_job(
         raise SystemExit(
             f"Missing eval pack {eval_pack}.\n"
             "Build: python src/training/prepare_eval.py"
-            + (" --scale-adapt" if "adapted" in eval_gt else "")
         )
     evaluate_prepared_pack(
         eval_pack,
@@ -131,7 +130,7 @@ def run_eval_job(
 
 
 def parse_eval_targets(defaults: dict[str, Any]) -> list[tuple[str, Path]]:
-    """[(gt_name, pack_dir), ...] — native + adapted by default."""
+    """[(gt_name, pack_dir), ...] from experiment defaults."""
     raw = defaults.get("eval_targets")
     if raw:
         out: list[tuple[str, Path]] = []
@@ -407,7 +406,6 @@ def write_round_timing(
     runs_dir.mkdir(parents=True, exist_ok=True)
     data = load_round_timing(runs_dir)
     data["round"] = round_name
-    data["updated_at"] = utcnow().isoformat(timespec="seconds")
     if note:
         data["note"] = note
     if session:
@@ -616,8 +614,6 @@ def write_round_summary(
     lines = [
         f"# {title}",
         "",
-        f"Generated: {datetime.now(timezone.utc).isoformat(timespec='seconds')}",
-        "",
     ]
     payload: list[dict[str, Any]] = []
     for gt_name in eval_names:
@@ -711,7 +707,7 @@ def run_train_job(
         "staged": staged,
         "train_backbone": train_backbone,
         "note": (
-            "head-only; backbone frozen (Group D ablation)"
+                "head-only; backbone frozen"
             if not train_backbone
             else (
                 "single-stage, backbone trainable"

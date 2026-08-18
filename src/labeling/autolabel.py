@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """YOLO-World autolabel demo on preprocess frame_step frames only.
 
-Not training GT. Writes under outputs/autolabel/ (never into labels/).
+Writes under outputs/autolabel/ (never into labels/).
 Requires: python src/data/preprocess_clips.py
 """
 from __future__ import annotations
@@ -55,31 +55,41 @@ import numpy as np
 from common.config import (
     CLIP_TILING_CONFIG_PATH,
     RAW_CONFIDENCE_THRESHOLD,
+    label_threshold_for_tiles,
     load_clip_tile_config,
     resolve_clip_tile_config,
 )
 from common.detect import MODEL_NAME, build_yolo_world, compute_slice_size, detect_frame_sahi, device
 
-# YOLO-World text prompts → collapsed to class 0 = vehicle.
-# Matches project definition: self-propelled unit with an engine.
-# Do NOT prompt for trailers, bicycles, pedestrians, animals, etc.
-VEHICLE_PROMPTS = [
+# YOLO-World prompts from README vehicle definition.
+# Keep = car/van/truck/bus → class 0. Drop = two-wheelers / people / trailers
+# (detected so they do not steal a vehicle box; never written as labels).
+KEEP_PROMPTS = [
     "car",
-    "truck",
+    "suv",
     "pickup",
-    "bus",
     "van",
+    "truck",
+    "bus",
+    "minibus",
+    "taxi",
+]
+DROP_PROMPTS = [
     "motorcycle",
     "scooter",
     "moped",
+    "trailer",
+    "caravan",
+    "bicycle",
+    "cyclist",
+    "person",
 ]
-TRACK_IOU_THRESHOLD = 0.3  # lightweight IoU tracking after SAHI
+YOLO_WORLD_PROMPTS = KEEP_PROMPTS + DROP_PROMPTS
+KEEP_NAMES = {name.lower() for name in KEEP_PROMPTS}
+DROP_NAMES = {name.lower() for name in DROP_PROMPTS}
+DROP_OVERLAP_IOU = 0.5  # keep-box overlapping a drop-box is not a vehicle
 DEVICE = device()
 
-MIN_TRACK_FRAMES = 3
-MAX_FILL_GAP_FRAMES = 2
-MAX_THRESHOLD_DIP_FRAMES = 2
-MAX_THRESHOLD_SPIKE_FRAMES = 2
 DEDUPE_COORD_TOLERANCE_PX = 2.0
 
 # Set to a small integer for a quick smoke run, or None for full step-subsampled run.
@@ -90,8 +100,9 @@ WRITE_DEBUG_VIDEO = True
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Demo autolabel with YOLO-World: only vehicle prompts, only frames "
-            "selected by preprocess frame_step. Outputs → outputs/autolabel/."
+            "Demo autolabel with YOLO-World: vehicle keep-prompts plus "
+            "motorcycle/bicycle/person/trailer drop-prompts (not written as labels). "
+            "Only preprocess frame_step frames. Outputs → outputs/autolabel/."
         ),
     )
     parser.add_argument(
@@ -162,25 +173,60 @@ def box_iou(box_a, box_b) -> float:
     return inter / union if union > 0 else 0.0
 
 
+def select_vehicle_detections(detections: list[dict]) -> list[dict]:
+    """Keep README vehicles; drop non-vehicles and keep-boxes that overlap a drop-box."""
+    vehicles = [det for det in detections if det["subclass_name"].lower() in KEEP_NAMES]
+    distractors = [det for det in detections if det["subclass_name"].lower() in DROP_NAMES]
+    if not distractors:
+        return vehicles
+    kept: list[dict] = []
+    for det in vehicles:
+        if any(box_iou(det["xyxy"], other["xyxy"]) >= DROP_OVERLAP_IOU for other in distractors):
+            continue
+        kept.append(det)
+    return kept
+
+
 def boxes_are_duplicate(box_a, box_b, tol_px: float = DEDUPE_COORD_TOLERANCE_PX) -> bool:
     if box_iou(box_a, box_b) >= 0.99:
         return True
     return all(abs(a - b) <= tol_px for a, b in zip(box_a, box_b))
 
 
-def copy_detection(det: dict, **extra) -> dict:
-    out = {
-        "xyxy": list(det["xyxy"]),
-        "confidence": det["confidence"],
-        "subclass_name": det.get("subclass_name", "vehicle"),
-        "track_id": det["track_id"],
+def apply_label_threshold(
+    detections_by_frame: dict[str, list[dict]],
+    frame_order: list[str],
+    label_threshold: float,
+) -> tuple[dict[str, list[dict]], int, int]:
+    """Per-frame conf filter + dedupe (no temporal tracking)."""
+    raw_deduped = dedupe_detections_by_frame(detections_by_frame, frame_order)
+    thresholded = {
+        frame_name: [
+            det for det in detections_by_frame.get(frame_name, [])
+            if det["confidence"] >= label_threshold
+        ]
+        for frame_name in frame_order
     }
-    out.update(extra)
-    return out
+    labels_by_frame, label_deduped = dedupe_overlapping_labels(thresholded)
+    return labels_by_frame, raw_deduped, label_deduped
 
 
-def duplicate_detection(det: dict) -> dict:
-    return copy_detection(det, filled_gap=True)
+def parse_predict_result(result) -> list[dict]:
+    detections = []
+    if result.boxes is None or len(result.boxes) == 0:
+        return detections
+
+    boxes = result.boxes.xyxy.cpu().numpy()
+    confs = result.boxes.conf.cpu().numpy()
+    cls_ids = result.boxes.cls.cpu().numpy().astype(int)
+
+    for i in range(len(boxes)):
+        detections.append({
+            "xyxy": [float(v) for v in boxes[i]],
+            "confidence": float(confs[i]),
+            "subclass_name": result.names[int(cls_ids[i])],
+        })
+    return detections
 
 
 def dedupe_frame_detections(detections: list[dict]) -> tuple[list[dict], int]:
@@ -214,258 +260,6 @@ def dedupe_detections_by_frame(detections_by_frame: dict[str, list[dict]], frame
         detections_by_frame[frame_name] = kept
         removed += frame_removed
     return removed
-
-
-def identify_stable_tracks(
-    detections_by_frame: dict[str, list[dict]],
-    frame_order: list[str],
-    label_confidence_threshold: float,
-    min_track_frames: int = MIN_TRACK_FRAMES,
-) -> tuple[set[int], dict]:
-    track_label_frames: dict[int, int] = {}
-    for frame_name in frame_order:
-        seen_tracks = set()
-        for det in detections_by_frame[frame_name]:
-            if det["confidence"] < label_confidence_threshold:
-                continue
-            track_id = det.get("track_id", -1)
-            if track_id is None or track_id < 0 or track_id in seen_tracks:
-                continue
-            seen_tracks.add(track_id)
-            track_label_frames[track_id] = track_label_frames.get(track_id, 0) + 1
-    stable_tracks = {
-        track_id for track_id, frame_count in track_label_frames.items()
-        if frame_count >= min_track_frames
-    }
-    return stable_tracks, {
-        "tracks_total": len(track_label_frames),
-        "tracks_stable": len(stable_tracks),
-        "min_track_frames": min_track_frames,
-    }
-
-
-def close_short_false_runs(flags: list[bool], max_gap: int) -> list[bool]:
-    result = flags[:]
-    i = 0
-    while i < len(result):
-        if result[i]:
-            i += 1
-            continue
-        j = i
-        while j < len(result) and not result[j]:
-            j += 1
-        gap_len = j - i
-        if gap_len <= max_gap and i > 0 and result[i - 1] and j < len(result) and result[j]:
-            for k in range(i, j):
-                result[k] = True
-        i = max(j, i + 1)
-    return result
-
-
-def open_short_true_runs(flags: list[bool], max_spike: int) -> list[bool]:
-    result = flags[:]
-    i = 0
-    while i < len(result):
-        if not result[i]:
-            i += 1
-            continue
-        j = i
-        while j < len(result) and result[j]:
-            j += 1
-        run_len = j - i
-        before_false = i == 0 or not result[i - 1]
-        after_false = j == len(result) or not result[j]
-        if run_len <= max_spike and before_false and after_false:
-            for k in range(i, j):
-                result[k] = False
-        i = max(j, i + 1)
-    return result
-
-
-def smooth_threshold_labels(
-    detections_by_frame: dict[str, list[dict]],
-    frame_order: list[str],
-    stable_tracks: set[int],
-    label_confidence_threshold: float,
-    max_dip_frames: int = MAX_THRESHOLD_DIP_FRAMES,
-    max_spike_frames: int = MAX_THRESHOLD_SPIKE_FRAMES,
-) -> tuple[dict[str, list[dict]], dict]:
-    track_timeline: dict[int, dict[int, dict]] = {}
-    for frame_idx, frame_name in enumerate(frame_order):
-        for det in detections_by_frame[frame_name]:
-            track_id = det.get("track_id", -1)
-            if track_id is None or track_id < 0 or track_id not in stable_tracks:
-                continue
-            current = track_timeline.setdefault(track_id, {}).get(frame_idx)
-            if current is None or det["confidence"] > current["confidence"]:
-                track_timeline[track_id][frame_idx] = det
-
-    labels_by_frame = {frame_name: [] for frame_name in frame_order}
-    before = 0
-    after = 0
-    dips_filled = 0
-    spikes_removed = 0
-
-    for frame_dets in track_timeline.values():
-        frame_indices = sorted(frame_dets)
-        if not frame_indices:
-            continue
-        start_idx, end_idx = frame_indices[0], frame_indices[-1]
-        span_indices = list(range(start_idx, end_idx + 1))
-        above = []
-        for frame_idx in span_indices:
-            det = frame_dets.get(frame_idx)
-            above.append(det is not None and det["confidence"] >= label_confidence_threshold)
-
-        before += sum(above)
-        smoothed = close_short_false_runs(above, max_dip_frames)
-        smoothed = open_short_true_runs(smoothed, max_spike_frames)
-        after += sum(smoothed)
-
-        for frame_idx, keep, was_above in zip(span_indices, smoothed, above):
-            if not keep:
-                if was_above:
-                    spikes_removed += 1
-                continue
-            det = frame_dets.get(frame_idx)
-            if det is None:
-                continue
-            out_det = copy_detection(det, filled_dip=True) if not was_above else det
-            if not was_above:
-                dips_filled += 1
-            labels_by_frame[frame_order[frame_idx]].append(out_det)
-
-    return labels_by_frame, {
-        "labels_before_threshold_smooth": before,
-        "labels_after_threshold_smooth": after,
-        "labels_dips_filled": dips_filled,
-        "labels_spikes_removed": spikes_removed,
-        "max_threshold_dip_frames": max_dip_frames,
-        "max_threshold_spike_frames": max_spike_frames,
-    }
-
-
-def filter_stable_tracked_labels(
-    detections_by_frame: dict[str, list[dict]],
-    frame_order: list[str],
-    label_confidence_threshold: float,
-    min_track_frames: int = MIN_TRACK_FRAMES,
-    max_dip_frames: int = MAX_THRESHOLD_DIP_FRAMES,
-    max_spike_frames: int = MAX_THRESHOLD_SPIKE_FRAMES,
-) -> tuple[dict[str, list[dict]], dict]:
-    stable_tracks, track_stats = identify_stable_tracks(
-        detections_by_frame, frame_order, label_confidence_threshold, min_track_frames,
-    )
-    labels_by_frame, smooth_stats = smooth_threshold_labels(
-        detections_by_frame, frame_order, stable_tracks, label_confidence_threshold,
-        max_dip_frames, max_spike_frames,
-    )
-    before_tracking = sum(
-        1 for frame_name in frame_order for det in detections_by_frame[frame_name]
-        if det["confidence"] >= label_confidence_threshold
-    )
-    after_tracking = sum(len(dets) for dets in labels_by_frame.values())
-    track_stats.update(smooth_stats)
-    track_stats.update({
-        "labels_before_tracking": before_tracking,
-        "labels_after_tracking": after_tracking,
-        "labels_dropped_by_tracking": before_tracking - after_tracking,
-    })
-    return labels_by_frame, track_stats
-
-
-def fill_track_gaps(
-    labels_by_frame: dict[str, list[dict]],
-    frame_order: list[str],
-    max_gap_frames: int = MAX_FILL_GAP_FRAMES,
-) -> tuple[dict[str, list[dict]], int]:
-    track_by_frame: dict[int, dict[int, dict]] = {}
-    for frame_idx, frame_name in enumerate(frame_order):
-        for det in labels_by_frame[frame_name]:
-            track_id = det.get("track_id", -1)
-            if track_id is None or track_id < 0:
-                continue
-            track_by_frame.setdefault(track_id, {})[frame_idx] = det
-
-    filled = {frame_name: list(detections) for frame_name, detections in labels_by_frame.items()}
-    fill_count = 0
-    for frame_dets in track_by_frame.values():
-        labeled_indices = sorted(frame_dets)
-        for left, right in zip(labeled_indices, labeled_indices[1:]):
-            gap = right - left - 1
-            if gap < 1 or gap > max_gap_frames:
-                continue
-            src_det = frame_dets[left]
-            for missing_idx in range(left + 1, right):
-                frame_name = frame_order[missing_idx]
-                present_ids = {det.get("track_id") for det in filled[frame_name]}
-                if src_det["track_id"] in present_ids:
-                    continue
-                filled[frame_name].append(duplicate_detection(src_det))
-                fill_count += 1
-    return filled, fill_count
-
-
-def assign_track_ids_iou(
-    detections_by_frame: dict[str, list[dict]],
-    frame_order: list[str],
-) -> None:
-    """Greedy IoU tracking for SAHI detections on train clips."""
-    next_track_id = 0
-    prev_tracks: list[tuple[int, list[float]]] = []
-
-    for frame_name in frame_order:
-        detections = detections_by_frame[frame_name]
-        used_prev = set()
-
-        for det in detections:
-            best_iou = TRACK_IOU_THRESHOLD
-            best_idx = -1
-            for idx, (track_id, prev_box) in enumerate(prev_tracks):
-                if idx in used_prev:
-                    continue
-                iou = box_iou(det["xyxy"], prev_box)
-                if iou > best_iou:
-                    best_iou = iou
-                    best_idx = idx
-
-            if best_idx >= 0:
-                det["track_id"] = prev_tracks[best_idx][0]
-                used_prev.add(best_idx)
-            else:
-                det["track_id"] = next_track_id
-                next_track_id += 1
-
-        prev_tracks = [(det["track_id"], det["xyxy"]) for det in detections]
-
-
-def reset_ultralytics_tracker(ultra_model) -> None:
-    """Drop predictor so the next model.track() re-inits ByteTrack for a new clip."""
-    ultra_model.predictor = None
-
-
-def parse_track_result(result) -> list[dict]:
-    detections = []
-    if result.boxes is None or len(result.boxes) == 0:
-        return detections
-
-    boxes = result.boxes.xyxy.cpu().numpy()
-    confs = result.boxes.conf.cpu().numpy()
-    cls_ids = result.boxes.cls.cpu().numpy().astype(int)
-    track_ids = result.boxes.id
-    if track_ids is None:
-        ids = [-1] * len(boxes)
-    else:
-        ids = track_ids.cpu().numpy().astype(int)
-
-    for i in range(len(boxes)):
-        detections.append({
-            "xyxy": [float(v) for v in boxes[i]],
-            "confidence": float(confs[i]),
-            "subclass_name": result.names[int(cls_ids[i])],
-            "track_id": int(ids[i]),
-        })
-    return detections
 
 
 def xyxy_to_yolo(box, width: int, height: int) -> str | None:
@@ -512,7 +306,8 @@ def save_labels(detections_by_frame: dict[str, list[dict]], out_dir: Path, width
 def cache_meta(tile_cfg: dict, slice_size: list[int] | None = None) -> dict:
     meta = {
         "model_name": MODEL_NAME,
-        "vehicle_prompts": list(VEHICLE_PROMPTS),
+        "vehicle_prompts": list(KEEP_PROMPTS),
+        "drop_prompts": list(DROP_PROMPTS),
         "model_confidence": RAW_CONFIDENCE_THRESHOLD,
         "target_tiles": tile_cfg["target_tiles"],
         "overlap_ratio": tile_cfg["overlap_ratio"],
@@ -520,20 +315,14 @@ def cache_meta(tile_cfg: dict, slice_size: list[int] | None = None) -> dict:
         "note": tile_cfg["note"],
     }
     if tile_cfg["uses_sahi"]:
-        meta.update({
-            "detection_mode": "sahi",
-            "tracker": "iou",
-            "slice_size": slice_size,
-        })
+        meta["detection_mode"] = "sahi"
+        meta["slice_size"] = slice_size
     else:
-        meta.update({
-            "detection_mode": "model.track",
-            "tracker": "bytetrack",
-        })
+        meta["detection_mode"] = "model.predict"
     return meta
 
 
-def run_eval_fullframe_track(
+def run_eval_fullframe_predict(
     ultra_model,
     frame_paths: list[Path],
     t0: float,
@@ -542,19 +331,17 @@ def run_eval_fullframe_track(
 ) -> tuple[dict[str, list[dict]], list[float]]:
     from common.image_enhance import inference_source
 
-    reset_ultralytics_tracker(ultra_model)
     raw_detections_by_frame = {}
     all_confidences = []
 
     for i, frame_path in enumerate(frame_paths):
-        result = ultra_model.track(
+        result = ultra_model.predict(
             inference_source(frame_path, enhance=enhance),
-            persist=True,
             conf=RAW_CONFIDENCE_THRESHOLD,
             verbose=False,
             device=DEVICE,
         )[0]
-        detections = parse_track_result(result)
+        detections = select_vehicle_detections(parse_predict_result(result))
         raw_detections_by_frame[frame_path.stem] = detections
         all_confidences.extend(det["confidence"] for det in detections)
 
@@ -583,8 +370,10 @@ def run_fixed_sahi_detect(
     all_confidences = []
 
     for i, frame_path in enumerate(frame_paths):
-        detections = detect_frame_sahi(
-            model, frame_path, slice_h, slice_w, overlap_ratio, enhance=enhance
+        detections = select_vehicle_detections(
+            detect_frame_sahi(
+                model, frame_path, slice_h, slice_w, overlap_ratio, enhance=enhance
+            )
         )
         raw_detections_by_frame[frame_path.stem] = detections
         all_confidences.extend(det["confidence"] for det in detections)
@@ -594,8 +383,6 @@ def run_fixed_sahi_detect(
             remaining = elapsed / (i + 1) * (len(frame_paths) - i - 1)
             print(f"  {i + 1}/{len(frame_paths)} frames, ~{remaining / 60:.1f} min left")
 
-    frame_order = [frame_path.stem for frame_path in frame_paths]
-    assign_track_ids_iou(raw_detections_by_frame, frame_order)
     tiling_stats = {
         "target_tiles": target_tiles,
         "overlap_ratio": overlap_ratio,
@@ -728,7 +515,7 @@ def process_clip(
     if LIMIT_FRAMES is not None:
         frame_paths = frame_paths[:LIMIT_FRAMES]
 
-    label_threshold = tile_cfg["label_confidence_threshold"]
+    label_threshold = label_threshold_for_tiles(tile_cfg["target_tiles"])
     enhance_note = ", CLAHE enhance ON" if enhance else ""
     step_note = (
         f"frame_step={frame_step} → {len(frame_paths)}/{len(all_frame_paths)} frames"
@@ -740,17 +527,17 @@ def process_clip(
         print(
             f"\n{split}/{clip_name}: {width}x{height}, "
             f"SAHI {tile_cfg['target_tiles']} tiles (overlap={tile_cfg['overlap_ratio']}, "
-            f"band={tile_cfg['distance_band']}, label_conf>={label_threshold}) + IoU track, "
+            f"band={tile_cfg['distance_band']}, label_conf>={label_threshold}), "
             f"{step_note}{enhance_note}"
         )
         if tile_cfg["note"]:
             print(f"  note: {tile_cfg['note']}")
     else:
-        detection_mode = "model.track"
+        detection_mode = "model.predict"
         slice_h = slice_w = None
         print(
             f"\n{split}/{clip_name}: {width}x{height}, "
-            f"full-frame model.track + ByteTrack (band={tile_cfg['distance_band']}, "
+            f"full-frame predict (band={tile_cfg['distance_band']}, "
             f"label_conf>={label_threshold}), "
             f"{step_note}{enhance_note}"
         )
@@ -775,41 +562,31 @@ def process_clip(
             "distance_band": tile_cfg["distance_band"],
             "slice_size": None,
         }
-        raw_detections_by_frame, all_confidences = run_eval_fullframe_track(
+        raw_detections_by_frame, all_confidences = run_eval_fullframe_predict(
             model.model, frame_paths, t0, enhance=enhance
         )
 
     frame_order = [frame_path.stem for frame_path in frame_paths]
-    raw_deduped = dedupe_detections_by_frame(raw_detections_by_frame, frame_order)
-    kept_detections_by_frame, track_stats = filter_stable_tracked_labels(
+    labels_by_frame, raw_deduped, label_deduped = apply_label_threshold(
         raw_detections_by_frame,
         frame_order,
         label_threshold,
     )
-    kept_detections_by_frame, filled_gaps = fill_track_gaps(
-        kept_detections_by_frame,
-        frame_order,
+    n_labels = sum(len(dets) for dets in labels_by_frame.values())
+    n_above_conf = sum(
+        1 for frame_name in frame_order
+        for det in raw_detections_by_frame[frame_name]
+        if det["confidence"] >= label_threshold
     )
-    kept_detections_by_frame, label_deduped = dedupe_overlapping_labels(kept_detections_by_frame)
-    track_stats["raw_labels_deduped"] = raw_deduped
-    track_stats["labels_deduped"] = label_deduped
-    track_stats["labels_filled_gaps"] = filled_gaps
-    track_stats["labels_after_gap_fill"] = sum(len(dets) for dets in kept_detections_by_frame.values())
     print(
-        f"  tracking ({detection_mode}): "
-        f"{track_stats['labels_after_tracking']}/{track_stats['labels_before_tracking']} labels kept, "
-        f"{track_stats['tracks_stable']}/{track_stats['tracks_total']} stable tracks "
-        f"(>={MIN_TRACK_FRAMES} frames), "
-        f"+{track_stats['labels_dips_filled']} dips, "
-        f"-{track_stats['labels_spikes_removed']} spikes, "
-        f"+{filled_gaps} gap-filled, "
-        f"-{label_deduped} deduped"
+        f"  labels: {n_labels} written (>={label_threshold} conf, "
+        f"-{label_deduped} deduped, -{raw_deduped} raw dupes)"
     )
 
     labels_dir = LABELS_DIR / split / clip_name
     cache_dir = DEBUG_DIR / clip_name / "cache"
 
-    label_files = save_labels(kept_detections_by_frame, labels_dir, width, height)
+    label_files = save_labels(labels_by_frame, labels_dir, width, height)
     cache_files = save_raw_detections_cache(
         raw_detections_by_frame,
         cache_dir,
@@ -849,14 +626,18 @@ def process_clip(
         "frame_step": frame_step,
         "frames_total_extracted": len(all_frame_paths),
         "frames_processed": len(frame_paths),
-        "vehicle_prompts": list(VEHICLE_PROMPTS),
+        "vehicle_prompts": list(KEEP_PROMPTS),
+        "drop_prompts": list(DROP_PROMPTS),
         "started_at": started_at,
         "finished_at": finished_at,
         "elapsed_seconds": round(elapsed_sec, 2),
         "elapsed_human": format_duration(elapsed_sec),
         "seconds_per_frame": round(elapsed_sec / len(frame_paths), 3) if frame_paths else 0.0,
         "enhance_clahe": bool(enhance),
-        **track_stats,
+        "labels_above_conf": n_above_conf,
+        "labels_written": n_labels,
+        "raw_labels_deduped": raw_deduped,
+        "labels_deduped": label_deduped,
     })
     print(f"  kept={stats['kept']}/{stats['total_detections']} ({stats['pct_dropped']}% dropped)")
     print(f"  finished in {stats['elapsed_human']} ({stats['seconds_per_frame']} sec/frame)")
@@ -899,11 +680,11 @@ def main() -> None:
     print(
         f"Demo autolabel → {OUTPUT_ROOT}\n"
         f"Loading {MODEL_NAME} on {DEVICE}, "
-        f"prompts={VEHICLE_PROMPTS}, "
+        f"keep={KEEP_PROMPTS}, drop={DROP_PROMPTS}, "
         f"raw_confidence={RAW_CONFIDENCE_THRESHOLD}, "
-        f"label_confidence_threshold + frame_step from {CLIP_TILING_CONFIG_PATH.name}"
+        f"label_conf=max(0.05, 0.20/target_tiles) from clip target_tiles"
     )
-    model, _ = build_yolo_world(VEHICLE_PROMPTS)
+    model, _ = build_yolo_world(YOLO_WORLD_PROMPTS)
 
     run_started_at = datetime.now().isoformat(timespec="seconds")
     run_t0 = time.perf_counter()
@@ -928,20 +709,19 @@ def main() -> None:
             {
                 "demo": True,
                 "note": (
-                    "YOLO-World pseudo-labels on frame_step subsample only; "
-                    "not training GT. Class 0 = vehicle (self-propelled with engine)."
+                    "YOLO-World pseudo-labels on frame_step subsample only. "
+                    "Class 0 = vehicle (car/van/truck/bus; not two-wheelers)."
                 ),
-                "vehicle_prompts": list(VEHICLE_PROMPTS),
+                "vehicle_prompts": list(KEEP_PROMPTS),
+                "drop_prompts": list(DROP_PROMPTS),
                 "output_root": str(OUTPUT_ROOT),
                 "run_started_at": run_started_at,
                 "run_finished_at": run_finished_at,
                 "run_elapsed_seconds": round(run_elapsed_sec, 2),
                 "run_elapsed_human": format_duration(run_elapsed_sec),
                 "raw_confidence_threshold": RAW_CONFIDENCE_THRESHOLD,
-                "min_track_frames": MIN_TRACK_FRAMES,
-                "max_fill_gap_frames": MAX_FILL_GAP_FRAMES,
-                "max_threshold_dip_frames": MAX_THRESHOLD_DIP_FRAMES,
-                "max_threshold_spike_frames": MAX_THRESHOLD_SPIKE_FRAMES,
+                "label_conf_formula": "max(0.05, 0.20 / target_tiles)",
+                "tracking": "none (frame_step subsample; per-frame conf + dedupe only)",
                 "clip_tiling_config_path": str(CLIP_TILING_CONFIG_PATH),
                 "frame_step_override": args.frame_step,
                 "clip_tile_config": tile_config,
@@ -953,7 +733,6 @@ def main() -> None:
         encoding="utf-8",
     )
     print(f"\nDone in {format_duration(run_elapsed_sec)}. Stats: {stats_path}")
-    print("Training GT stays in labels/ (manual / CVAT). These outputs are demo-only.")
 
 
 if __name__ == "__main__":
