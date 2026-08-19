@@ -105,6 +105,16 @@ On the locked Round 2 pack and Round 1 imgsz, tune **train setup** in four steps
 
 Config: `model_round.yaml` · Runner: `run_model_round.py --all`
 
+### Out of scope (cancelled factors)
+
+- **Learning rate** — Fixed `lr0=0.01` (Stage 2: `0.001`). Best run (**2+5**) converged cleanly to **87.7%** mean A+B; longer Stage 2 (10/15 ep) at the same LR just drifted — an epoch budget issue, not an LR issue. Also `optimizer=auto` adjusts LR internally, making a clean grid search unreliable without disabling it first. Skipped in favor of higher-impact experiments.
+
+- **NMS variants** — Default hard NMS, IoU 0.7; not varied. Our failure mode is partial/edge cars (nested boxes), fixed in postprocessing — not dense overlap, which is what soft-NMS/IoU tuning targets. Traffic here is spatially sparse, so this wasn't expected to help.
+
+- **Neck (P2)** — Stock YOLO11s, no P2 head. P2 helps with sub-small objects; scale was already handled via imgsz 1280 + ~1024px tiling, so vehicles stay large in-frame (Band A: ~130–380px wide, well above COCO-small). Full-frame 1280 run confirms this — Band A dropped (58%) because cars got smaller, not because of a missing P2 head.
+
+- **Mosaic** — Off (`mosaic=0`). Frames are continuous aerial video; mosaic stitches unrelated crops and breaks motion/road geometry. Frame diversity is already handled by `frame_step` subsampling.
+
 ### Run (once per machine, then R1 → R2 → R3)
 
 **Prereq** — CVAT labels on disk, eval pack, Round 1 reference pack (`auto` = AUTO tiling, every `frame_step` frame; same recipe family as `baseline_v1` but built from `variants.yaml`, not `prepare_baseline.py`):
