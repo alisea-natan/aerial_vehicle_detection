@@ -1,0 +1,35 @@
+# Round 1 — letterbox imgsz on a fixed train pack (default: auto baseline).
+# Same tiles on disk; only train/predict imgsz changes. Run before dataset_round.
+#
+# Prereq (once):
+#   python src/labeling/cvat/cvat_pull.py --verify --sync-labels
+#   python src/training/prepare_eval.py
+#   python src/training/datasets/generate_variant.py --variant auto
+#
+# Run:
+#   python src/training/experiments/run_imgsz_round.py
+#   python src/training/experiments/run_imgsz_round.py --resume
+#   python src/training/experiments/run_imgsz_round.py --variant 768
+
+defaults:
+  train_pack: auto
+  model: yolo11s.pt
+  warmup_epochs: 2
+  epochs: 5
+  freeze: 11
+  lr0: 0.01
+  patience: 3
+  seed: 42
+  train_augmentation: poc
+  labels_root: labels
+  datasets_root: data/datasets
+  runs_dir: outputs/experiments/imgsz_round
+  eval_targets:
+    - gt: manual
+      pack: data/datasets/eval_manual
+
+runs:
+  - 640
+  - 768
+  - 1024
+  - 1280

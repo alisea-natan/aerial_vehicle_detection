@@ -54,7 +54,7 @@ Precision by split: valid **98%**, test (eval) **81%**.
 
 ## Autolabel (PoC bootstrap only)
 
-Not training GT. Writes `outputs/autolabel/` only. Per-frame conf + dedupe on `frame_step` subsample — no tracking (see main README §2).
+Not training GT. Writes `outputs/autolabel/` only. YOLO-World **imgsz 1280**. Per-frame conf + dedupe on `frame_step` subsample — no tracking (see main README §2).
 
 ```bash
 python src/labeling/autolabel.py

@@ -54,6 +54,7 @@ import numpy as np
 
 from common.config import (
     CLIP_TILING_CONFIG_PATH,
+    AUTOLABEL_IMGSZ,
     RAW_CONFIDENCE_THRESHOLD,
     label_threshold_for_tiles,
     load_clip_tile_config,
@@ -313,6 +314,7 @@ def cache_meta(tile_cfg: dict, slice_size: list[int] | None = None) -> dict:
         "overlap_ratio": tile_cfg["overlap_ratio"],
         "distance_band": tile_cfg["distance_band"],
         "note": tile_cfg["note"],
+        "imgsz": AUTOLABEL_IMGSZ,
     }
     if tile_cfg["uses_sahi"]:
         meta["detection_mode"] = "sahi"
@@ -338,6 +340,7 @@ def run_eval_fullframe_predict(
         result = ultra_model.predict(
             inference_source(frame_path, enhance=enhance),
             conf=RAW_CONFIDENCE_THRESHOLD,
+            imgsz=AUTOLABEL_IMGSZ,
             verbose=False,
             device=DEVICE,
         )[0]
@@ -527,7 +530,8 @@ def process_clip(
         print(
             f"\n{split}/{clip_name}: {width}x{height}, "
             f"SAHI {tile_cfg['target_tiles']} tiles (overlap={tile_cfg['overlap_ratio']}, "
-            f"band={tile_cfg['distance_band']}, label_conf>={label_threshold}), "
+            f"band={tile_cfg['distance_band']}, imgsz={AUTOLABEL_IMGSZ}, "
+            f"label_conf>={label_threshold}), "
             f"{step_note}{enhance_note}"
         )
         if tile_cfg["note"]:
@@ -537,7 +541,7 @@ def process_clip(
         slice_h = slice_w = None
         print(
             f"\n{split}/{clip_name}: {width}x{height}, "
-            f"full-frame predict (band={tile_cfg['distance_band']}, "
+            f"full-frame predict (band={tile_cfg['distance_band']}, imgsz={AUTOLABEL_IMGSZ}, "
             f"label_conf>={label_threshold}), "
             f"{step_note}{enhance_note}"
         )
@@ -679,12 +683,12 @@ def main() -> None:
 
     print(
         f"Demo autolabel → {OUTPUT_ROOT}\n"
-        f"Loading {MODEL_NAME} on {DEVICE}, "
+        f"Loading {MODEL_NAME} on {DEVICE}, imgsz={AUTOLABEL_IMGSZ}, "
         f"keep={KEEP_PROMPTS}, drop={DROP_PROMPTS}, "
         f"raw_confidence={RAW_CONFIDENCE_THRESHOLD}, "
         f"label_conf=max(0.05, 0.20/target_tiles) from clip target_tiles"
     )
-    model, _ = build_yolo_world(YOLO_WORLD_PROMPTS)
+    model, _ = build_yolo_world(YOLO_WORLD_PROMPTS, image_size=AUTOLABEL_IMGSZ)
 
     run_started_at = datetime.now().isoformat(timespec="seconds")
     run_t0 = time.perf_counter()
@@ -720,6 +724,7 @@ def main() -> None:
                 "run_elapsed_seconds": round(run_elapsed_sec, 2),
                 "run_elapsed_human": format_duration(run_elapsed_sec),
                 "raw_confidence_threshold": RAW_CONFIDENCE_THRESHOLD,
+                "imgsz": AUTOLABEL_IMGSZ,
                 "label_conf_formula": "max(0.05, 0.20 / target_tiles)",
                 "tracking": "none (frame_step subsample; per-frame conf + dedupe only)",
                 "clip_tiling_config_path": str(CLIP_TILING_CONFIG_PATH),

@@ -1,4 +1,4 @@
-# Round 2 — train setup on the Round 1 pack (protocol → family → size → epochs).
+# Round 3 — train setup on the Round 2 pack (protocol → family → size → epochs).
 #
 # One factor per group. No LR grid (optimizer=auto often ignores lr0).
 # Decision: native mAP@0.5, mean of bands A and B.
@@ -9,10 +9,10 @@
 #   python src/training/experiments/run_model_round.py --group F --winner PROTO
 
 defaults:
-  dataset: strided_imgsz768
+  dataset: strided_clip_balanced  # Round 2 winner
   datasets_root: data/datasets
   model: yolo11s.pt
-  imgsz: 768
+  imgsz: 1280   # Round 1 winner
   lr0: 0.01
   patience: 7
   seed: 42

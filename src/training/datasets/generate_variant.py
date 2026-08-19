@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Build dataset packs under data/datasets/<variant_id>/.
 
-Does not train — Round 1 is ``src/training/experiments/run_dataset_round.py``.
+Does not train — Round 2 is ``src/training/experiments/run_dataset_round.py``.
 
-Default: CVAT ``labels/``, frame_step, imgsz 1024 (config/datasets/variants.yaml).
+Default: CVAT ``labels/``, frame_step, imgsz 640 (config/datasets/variants.yaml).
 
   python src/training/datasets/generate_variant.py --list
-  python src/training/datasets/generate_variant.py --variant baseline_1
+  python src/training/datasets/generate_variant.py --variant auto
   python src/training/datasets/generate_variant.py --all
 """
 from __future__ import annotations
@@ -34,7 +34,6 @@ import math
 import random
 import shutil
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from pathlib import Path
 
 import yaml
@@ -110,7 +109,7 @@ def _plan_for_clip(clip_name: str, spec: VariantSpec, payload: dict) -> SlicePla
         tile_size=base.tile_size,
         overlap=overlap,
         uses_tiling=base.uses_tiling,
-        train_imgsz=int(base.train_imgsz),
+        train_imgsz=spec.imgsz,
     )
 
 
@@ -128,6 +127,54 @@ def _filter_strided(
         if (idx - 1) % stride == 0:
             out.append((clip_name, image_path, label_path))
     return out
+
+
+def _even_subsample(rows: list, target: int) -> list:
+    """Keep ``target`` items evenly spaced (clip coverage, not a prefix)."""
+    n = len(rows)
+    if n <= target or target <= 0:
+        return rows
+    if target == 1:
+        return [rows[n // 2]]
+    idxs = [round(i * (n - 1) / (target - 1)) for i in range(target)]
+    seen: set[int] = set()
+    out: list = []
+    for i in idxs:
+        if i in seen:
+            continue
+        seen.add(i)
+        out.append(rows[i])
+    return out
+
+
+def _filter_clip_balanced(
+    frames: list[tuple[str, Path, Path]],
+    stride: int,
+) -> tuple[list[tuple[str, Path, Path]], dict]:
+    """Global stride, then cap each clip to the median clip's frame count.
+
+    Stops the densest train video from owning the dataloader.
+    """
+    base = _filter_strided(frames, stride)
+    by_clip: dict[str, list[tuple[str, Path, Path]]] = {}
+    order: list[str] = []
+    for row in base:
+        if row[0] not in by_clip:
+            order.append(row[0])
+            by_clip[row[0]] = []
+        by_clip[row[0]].append(row)
+    counts = [len(v) for v in by_clip.values()]
+    if not counts:
+        return base, {"stride": stride, "target": 0, "per_clip": {}}
+    target = sorted(counts)[len(counts) // 2]
+    per_clip: dict[str, dict[str, int]] = {}
+    out: list[tuple[str, Path, Path]] = []
+    for clip in order:
+        rows = by_clip[clip]
+        kept = rows if len(rows) <= target else _even_subsample(rows, target)
+        per_clip[clip] = {"before": len(rows), "after": len(kept)}
+        out.extend(kept)
+    return out, {"stride": stride, "target": target, "per_clip": per_clip}
 
 
 def _tile_origins(frame_w: int, frame_h: int, tile: int, overlap: float) -> list[tuple[int, int]]:
@@ -425,7 +472,7 @@ def write_data_yaml(dataset_dir: Path, *, imgsz: int, train_stats: dict, val_sta
 def build_variant(spec: VariantSpec, *, recreate: bool = True) -> Path:
     out = spec.out_dir
     if spec.dataset_action == "reuse":
-        src_id = spec.reuse_from or "baseline_1"
+        src_id = spec.reuse_from or "auto"
         src = out.parent / src_id
         if not (src / "data.yaml").is_file():
             raise SystemExit(
@@ -437,7 +484,7 @@ def build_variant(spec: VariantSpec, *, recreate: bool = True) -> Path:
                 out.unlink()
             else:
                 shutil.rmtree(out)
-        # Symlink pack so variant_5 shares tiles with baseline_1
+        # Symlink pack so a reuse variant shares tiles with reuse_from
         out.symlink_to(src.resolve(), target_is_directory=True)
         manifest = {
             "variant_id": spec.id,
@@ -446,7 +493,6 @@ def build_variant(spec: VariantSpec, *, recreate: bool = True) -> Path:
             "reuse_from": src_id,
             "dataset_dir": str(out.relative_to(PROJECT_ROOT)),
             "train_augmentation": spec.train_augmentation,
-            "created_at": datetime.now(timezone.utc).isoformat(),
             "note": "Online aug only — tiles identical to reuse_from",
         }
         # Write manifest beside symlink target? Prefer a small sidecar next to link name.
@@ -472,10 +518,20 @@ def build_variant(spec: VariantSpec, *, recreate: bool = True) -> Path:
     if not frames:
         raise SystemExit(f"No train labels under {spec.labels_root / 'train'}")
 
+    sample_meta = None
     if spec.sampling == "strided":
         before = len(frames)
         frames = _filter_strided(frames, spec.stride)
         print(f"Strided sampling stride={spec.stride}: {before} → {len(frames)} frames")
+    elif spec.sampling == "clip_balanced":
+        before = len(frames)
+        frames, sample_meta = _filter_clip_balanced(frames, spec.stride)
+        print(
+            f"Clip-balanced sampling stride={spec.stride} "
+            f"median_target={sample_meta['target']}: {before} → {len(frames)} frames"
+        )
+        for clip, row in (sample_meta.get("per_clip") or {}).items():
+            print(f"  {clip}: {row['before']} → {row['after']}")
     elif spec.sampling != "full":
         raise SystemExit(f"Unknown sampling strategy: {spec.sampling}")
 
@@ -525,7 +581,6 @@ def build_variant(spec: VariantSpec, *, recreate: bool = True) -> Path:
     manifest = {
         "variant_id": spec.id,
         "description": spec.description,
-        "created_at": datetime.now(timezone.utc).isoformat(),
         "dataset_dir": str(out.relative_to(PROJECT_ROOT)),
         "labels_root": str(spec.labels_root.relative_to(PROJECT_ROOT))
         if spec.labels_root.is_relative_to(PROJECT_ROOT)
@@ -544,7 +599,8 @@ def build_variant(spec: VariantSpec, *, recreate: bool = True) -> Path:
         "train_augmentation_note": "Applied in dataset_round at train time; tiles on disk are unaugmented",
         "sampling": {
             "strategy": spec.sampling,
-            "stride": spec.stride if spec.sampling == "strided" else None,
+            "stride": spec.stride if spec.sampling in {"strided", "clip_balanced"} else None,
+            "clip_balanced": sample_meta,
         },
         "imgsz": spec.imgsz,
         "val_fraction": spec.val_fraction,
@@ -600,7 +656,8 @@ def main() -> None:
             spec = resolve_variant(vid, cfg, labels_root=labels_root)
             print(
                 f"{vid}: {spec.description} [{spec.dataset_action}] "
-                f"aug={spec.train_augmentation} frame_step={spec.frame_step_only}"
+                f"aug={spec.train_augmentation} imgsz={spec.imgsz} "
+                f"sampling={spec.sampling} frame_step={spec.frame_step_only}"
             )
         return
 
@@ -610,7 +667,7 @@ def main() -> None:
     if not selected:
         raise SystemExit("Pass --variant ID, --all, or --list")
 
-    # Build order: dependencies first (baseline_1 before variant_5)
+    # Build order: yaml order (reuse_from packs listed before reuse variants)
     ordered: list[str] = []
     for vid in ids:
         if vid in selected:

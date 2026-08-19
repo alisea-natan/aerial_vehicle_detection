@@ -37,7 +37,9 @@ from common.config import (
     CLIP_TILING_CONFIG_PATH,
     FRAMES_DIR,
     LABELS_DIR,
+    POC_CHECKPOINT,
     PROJECT_ROOT,
+    PROTOTYPE_CHECKPOINT,
     TRAIN_IMGSZ,
     TRAIN_OVERLAP_RATIO,
     build_split_map,
@@ -60,7 +62,9 @@ EVAL_PACKS = {
     "autolabel": DATASETS_ROOT / "eval_autolabel",
     "manual": DATASETS_ROOT / "eval_manual",
 }
-DEFAULT_WEIGHTS = PROJECT_ROOT / "outputs" / "runs" / "yolo11s_vehicle" / "weights" / "best.pt"
+
+DEFAULT_WEIGHTS = PROTOTYPE_CHECKPOINT
+POC_WEIGHTS = POC_CHECKPOINT
 VEHICLE_CLASS = "vehicle"
 PRED_CONF_HIGH = 0.5
 PRED_COLOR_HIGH = (0, 200, 0)  # BGR green — conf > PRED_CONF_HIGH

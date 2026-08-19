@@ -57,11 +57,8 @@ yolo11s.pt                        # pretrained base (download via Ultralytics)
 *.pth
 *.onnx
 *.engine
-# Fine-tuned deliverable — copy after train:
-#   cp outputs/runs/yolo11s_vehicle/weights/best.pt checkpoints/yolo11s_vehicle_best.pt
-!checkpoints/
-checkpoints/*
-!checkpoints/yolo11s_vehicle_best.pt
+# Fine-tuned deliverables (local only — never commit)
+checkpoints/
 
 # Ultralytics run folders (if created outside outputs/)
 runs/
@@ -79,8 +76,6 @@ mlflow_server/
 
 # --- Dataset packs: local only (never commit blobs) ---
 data/datasets/**
-!data/datasets/README.md
-!data/datasets/.gitignore
 data/dataset/
 
 data/raw_export/

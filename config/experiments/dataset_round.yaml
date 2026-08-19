@@ -1,6 +1,6 @@
-# Round 1 — dataset ablation (manual / CVAT labels).
-# Fixed train protocol = PoC schedule: YOLO11s, staged head-then-backbone, --prototype.
-# Vary the train pack (and imgsz on the two strided_imgsz* cells).
+# Round 2 — dataset pack ablation (manual / CVAT labels).
+# Fixed train protocol = 2+5 YOLO11s. Fixed imgsz = Round 1 winner (default 640).
+# Prereq: Round 1 done (or accept default imgsz 640 on auto).
 #
 # Prereq (once):
 #   python src/labeling/cvat/cvat_pull.py --verify --sync-labels
@@ -13,7 +13,7 @@
 
 defaults:
   model: yolo11s.pt
-  imgsz: 1024
+  imgsz: 1280   # Round 1 winner (auto pack)
   warmup_epochs: 2   # Stage 1: head only, backbone frozen (freeze=11)
   epochs: 5          # Stage 2: full model, backbone unfrozen
   freeze: 11
@@ -28,9 +28,7 @@ defaults:
     - gt: manual
       pack: data/datasets/eval_manual
 
-# Order = run order. Each id must exist in config/datasets/variants.yaml.
-# Tiling × time, empty tiles on strided, clip balance, then imgsz on strided tiles.
-# Dropped (already failed): tile 640, overlap 0.1, mosaic_hsv.
+# Order = run order. Pack recipe only — imgsz is Round 1, not varied here.
 runs:
   - auto
   - fullframe
@@ -38,5 +36,3 @@ runs:
   - fullframe_strided
   - strided_negatives
   - strided_clip_balanced
-  - strided_imgsz768
-  - strided_imgsz1280

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 
@@ -18,8 +19,7 @@ def load_ultralytics_model(weights: str | Path):
 
 
 # YOLO26 / RT-DETR: GatherND abort on MPS val+predict.
-# P2 head at imgsz=1024: DFL decode needs >65536 output channels; MPS refuses.
-# Train stays on MPS; skip in-train val and run predict/eval on CPU.
+# Train stays on MPS; skip in-train val and run predict/eval on CPU for those families.
 MPS_FRAGILE_FAMILIES = frozenset({"yolo26", "rtdetr"})
 
 
@@ -37,11 +37,6 @@ def model_family(model: str) -> str:
     return "yolo"
 
 
-def is_p2_architecture(model: str) -> bool:
-    """True for P2 yaml names and Group E run paths (``head_p2``, ``*-p2.yaml``)."""
-    return "-p2" in Path(str(model)).as_posix().lower().replace("_", "-")
-
-
 def mps_available() -> bool:
     import torch
 
@@ -51,7 +46,7 @@ def mps_available() -> bool:
 def skip_in_train_val(model: str, device: str) -> bool:
     if device != "mps":
         return False
-    return model_family(model) in MPS_FRAGILE_FAMILIES or is_p2_architecture(model)
+    return model_family(model) in MPS_FRAGILE_FAMILIES
 
 
 def predict_device(model_or_weights: str, train_device: str | None = None) -> str:
@@ -64,6 +59,27 @@ def predict_device(model_or_weights: str, train_device: str | None = None) -> st
     return dev
 
 
+_SIZE_PT = re.compile(r"(yolo(?:v8|11|26))([nslmx])(\.pt)$", re.I)
+
+
+def model_size_letter(model: str) -> str | None:
+    """n/s/m/l/x from an Ultralytics YOLO checkpoint name, else None."""
+    match = _SIZE_PT.search(Path(str(model)).name)
+    return match.group(2).lower() if match else None
+
+
+def with_model_size(model: str, letter: str) -> str:
+    """Swap compound scale on a YOLO .pt name (``yolo11s.pt`` → ``yolo11m.pt``)."""
+    letter = str(letter).lower().strip()
+    if letter not in {"n", "s", "m", "l", "x"}:
+        raise SystemExit(f"Unknown YOLO size letter {letter!r}")
+    name = Path(str(model)).name
+    match = _SIZE_PT.search(name)
+    if not match:
+        raise SystemExit(f"Cannot set size {letter!r} on {model!r}")
+    return f"{match.group(1)}{letter}{match.group(3)}"
+
+
 def default_freeze(model: str) -> int:
     """Stage-1 backbone freeze count. 0 = do not freeze (RT-DETR)."""
     family = model_family(model)
@@ -72,34 +88,3 @@ def default_freeze(model: str) -> int:
     if family == "yolov8":
         return 10
     return 11  # YOLO11 / YOLO26 backbone 0–10
-
-
-def default_lr0(model: str, base_lr0: float) -> float:
-    """RT-DETR uses AdamW-scale LR; YOLO keeps the round default (0.01)."""
-    if model_family(model) == "rtdetr":
-        return 0.0001
-    return float(base_lr0)
-
-
-def yaml_architecture(model: str) -> str:
-    """Scratch-init yaml for a .pt checkpoint (same compound scale)."""
-    name = Path(model).name
-    if name.endswith(".pt"):
-        return name[:-3] + ".yaml"
-    return name
-
-
-def p2_architecture(model: str) -> str:
-    """P2 small-object head yaml (Ultralytics does not publish official *-p2.pt).
-
-    ``YOLO('yolov8s-p2.yaml')`` builds P2/4–P5/32; ``train(pretrained=True)``
-    copies matching COCO layers from the s-scale checkpoint.
-    """
-    family = model_family(model)
-    if family == "yolo26":
-        return "yolo26s-p2.yaml"
-    if family == "yolov8":
-        return "yolov8s-p2.yaml"
-    if family == "yolo11":
-        return str(Path("config") / "models" / "yolo11s-p2.yaml")
-    raise SystemExit(f"No P2 architecture for {model!r} (family={family})")

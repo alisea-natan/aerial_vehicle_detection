@@ -47,6 +47,7 @@ from common.config import (
     PROJECT_ROOT,
     TRAIN_IMGSZ,
     build_split_map,
+    checkpoint_name_for_dataset,
     clip_skip_reason,
     effective_slice_size,
     is_clip_skipped,
@@ -231,7 +232,7 @@ def patch_ultralytics_mps_unique() -> None:
 def patch_ultralytics_honor_val_false() -> None:
     """Ultralytics still calls validate() on the last epoch when val=False.
 
-    YOLO26 end2end and P2 heads at imgsz=1024 hit MPS limits on val/predict
+    YOLO26 end2end heads at imgsz=1024 hit MPS limits on val/predict
     (GatherND abort; DFL conv with >65536 output channels). When we pass
     val=False, skip that path entirely (including final_eval).
     """
@@ -260,7 +261,7 @@ def patch_ultralytics_honor_val_false() -> None:
     validate._vd_honor_val_false = True  # type: ignore[attr-defined]
     BaseTrainer.validate = validate
     BaseTrainer.final_eval = final_eval
-    print("Ultralytics: val=False now skips last-epoch and final val (needed on Apple MPS / YOLO26 / P2)")
+    print("Ultralytics: val=False now skips last-epoch and final val (needed on Apple MPS / YOLO26)")
 
 
 def parse_args() -> argparse.Namespace:
@@ -1754,7 +1755,7 @@ def train_model(
     aug: dict[str, float] | None = None,
     stage1_run_name: str | None = None,
     stage2_run_name: str | None = None,
-    deliverable_name: str = "yolo11s_vehicle_best.pt",
+    deliverable_name: str = "yolo11s_prototype_best.pt",
     write_checkpoint: bool = True,
     pretrained: bool = True,
     staged: bool = True,
@@ -1871,7 +1872,7 @@ def train_model(
         deliverable = PROJECT_ROOT / "checkpoints" / deliverable_name
         deliverable.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(best_weights, deliverable)
-        print(f"Git-tracked copy: {deliverable}")
+        print(f"Local checkpoint: {deliverable}")
     return best_weights
 
 
@@ -1991,6 +1992,7 @@ def main() -> None:
         freeze=args.freeze,
         lr0=args.lr0,
         patience=patience,
+        deliverable_name=checkpoint_name_for_dataset(dataset_dir),
     )
     print(f"Done. Best weights: {weights}")
 

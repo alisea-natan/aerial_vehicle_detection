@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Round 1 — dataset ablation (CVAT labels, PoC YOLO11s schedule).
+"""Round 2 — dataset ablation (CVAT labels, PoC YOLO11s schedule).
 
 No flags: full round from scratch (all packs).
 ``--resume``: skip finished, continue incomplete.
@@ -36,7 +36,7 @@ import time
 import traceback
 from pathlib import Path
 
-from common.config import PROJECT_ROOT
+from common.config import PROJECT_ROOT, TRAIN_IMGSZ
 from training.datasets.specs import resolve_labels_root, resolve_variant
 from training.experiments.common import (
     abs_runs_dir,
@@ -81,7 +81,7 @@ def parse_args() -> argparse.Namespace:
         help="Skip finished variants; continue incomplete train/eval only.",
     )
     parser.add_argument("--model", default=str(d.get("model") or "yolo11s.pt"))
-    parser.add_argument("--imgsz", type=int, default=int(d.get("imgsz") or 1024))
+    parser.add_argument("--imgsz", type=int, default=int(d.get("imgsz") or TRAIN_IMGSZ))
     parser.add_argument("--epochs", type=int, default=int(d.get("epochs") or 5))
     parser.add_argument("--warmup-epochs", type=int, default=int(d.get("warmup_epochs") or 2))
     parser.add_argument("--freeze", type=int, default=int(d.get("freeze") or 11))
@@ -287,7 +287,7 @@ def main() -> None:
             try:
                 variant_started = utcnow()
                 variant_t0 = time.perf_counter()
-                train_imgsz = spec.imgsz
+                train_imgsz = int(defaults.get("imgsz") or args.imgsz)
                 predict_kw = {"imgsz": train_imgsz}
                 train_result: dict
                 if args.resume and status == "train_done":
@@ -360,7 +360,8 @@ def main() -> None:
         release_torch_memory()
         raise
 
-    _flush_summary()
+    if not is_round_worker():
+        _flush_summary()
 
 
 if __name__ == "__main__":

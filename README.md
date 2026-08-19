@@ -53,8 +53,6 @@ flowchart LR
 
 Single clip: add `--clip NAME` where supported.
 
-Generated frames, autolabel boxes, dataset packs, and run folders stay on disk (gitignored). In the repo: `config/clip_tiling.json`, `outputs/probe_frames/` (if saved), and `checkpoints/yolo11s_vehicle_best.pt`.
-
 ### Inference sizes (`src/common/config.py`)
 
 
@@ -87,6 +85,8 @@ Probe prompts:
 4. Detail pass: **car-only** sizes & distances per segment; `distance_varies` if bands differ or start↔end size changes ≥30%.
 5. Motion: match cars on consecutive frames → `speed_px_per_frame`.
 6. `frame_step = floor(object_size_px_median × 0.5 / speed)` (min 1). Suggests `train_groups` from size.
+
+Frame steps are used to prevent the model from relearned on identical-looking cars. We assume a car will appear at a sufficiently different angle once it has moved half of its body length.
 
 Fallback if no car: **12 tiles** @ threshold 0.1.
 
@@ -199,7 +199,7 @@ PoC uses `--prototype`: short run, but Stage 2 still fine-tunes the **backbone**
 python src/training/prepare_baseline.py --from-autolabel   # → data/datasets/baseline_v0/
 python -u src/training/train.py --dataset-dir data/datasets/baseline_v0 --prototype
 # runs → outputs/runs/yolo11s_vehicle_stage1/ then …/yolo11s_vehicle/
-# best → outputs/runs/yolo11s_vehicle/weights/best.pt (also copied to checkpoints/)
+# best → outputs/runs/yolo11s_vehicle/weights/best.pt (also copied to checkpoints/yolo11s_poc_best.pt)
 ```
 
 Override any schedule piece with `--warmup-epochs`, `--epochs`, `--patience` (omit `--prototype` for the longer 5+20 default).
@@ -216,7 +216,7 @@ Pack: 403 train / 71 val images (holdout from train videos; autolabel GT), **img
 | ------------------------- | --------------------- | --------------------------------------------------------------- |
 | 1 — head only, 2 ep       | 3m 36s (0.060 h)      | mAP50 **0.374**, P 0.56, R 0.34                                 |
 | 2 — full (backbone), 5 ep | 12m 54s (0.215 h)     | mAP50 **0.410**, mAP50-95 **0.184**, P 0.62, R 0.38             |
-| **Total**                 | **16m 31s (0.275 h)** | deliverable: `checkpoints/yolo11s_vehicle_best.pt`              |
+| **Total**                 | **16m 31s (0.275 h)** | deliverable: `checkpoints/yolo11s_poc_best.pt` (local)              |
 
 
 Stage 2 per-epoch val mAP50: 0.34 → 0.29 → 0.36 → **0.41** → 0.39 (`best.pt` = ep4; Ultralytics fitness, not max mAP50).
@@ -271,3 +271,7 @@ Weights: `outputs/runs/yolo11s_vehicle/weights/best.pt`. Autolabel GT. Pack: **8
 ### Prediction postprocess (nested boxes)
 
 Cars often enter the frame from the edge, so only half the vehicle is visible. The model then predicts both a full-car box and a half-car box nested inside it. IoU-NMS keeps both (inner/outer IoU is too low). After NMS we drop a box if ≥80% of its area sits inside a larger one. PoC tables above include this step. Overlay videos: `outputs/eval_videos/`.
+
+---
+
+**Next:** manual-label prototype (CVAT GT, pack ablations, experiment rounds) → **[PROTOTYPE.md](PROTOTYPE.md)**.

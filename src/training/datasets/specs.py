@@ -8,7 +8,7 @@ from typing import Any
 
 import yaml
 
-from common.config import AUTOLABEL_LABELS_DIR, LABELS_DIR, PROJECT_ROOT
+from common.config import AUTOLABEL_LABELS_DIR, LABELS_DIR, PROJECT_ROOT, TRAIN_IMGSZ
 
 VARIANTS_PATH = PROJECT_ROOT / "config" / "datasets" / "variants.yaml"
 
@@ -27,7 +27,7 @@ class VariantSpec:
     keep_negative_tiles: bool
     negative_ratio: float
     train_augmentation: str  # applied in dataset_round; tiles on disk are unaugmented
-    sampling: str  # full | strided
+    sampling: str  # full | strided | clip_balanced
     stride: int
     log_multi_tile_bboxes: bool
     imgsz: int
@@ -95,7 +95,15 @@ def resolve_variant(
         from_autolabel=from_autolabel and labels_root is None and labels_override is None,
     )
 
-    mode = str(tiling.get("mode") or "auto").lower()
+    raw_mode = tiling.get("mode")
+    if raw_mode is False:
+        mode = "off"
+    elif raw_mode is True:
+        mode = "on"
+    elif raw_mode is None:
+        mode = "auto"
+    else:
+        mode = str(raw_mode).lower()
     tile_size = tiling.get("tile_size", None)
     if tile_size is not None:
         tile_size = int(tile_size)
@@ -136,7 +144,7 @@ def resolve_variant(
         sampling=str(sampling.get("strategy") or "full").lower(),
         stride=max(1, int(sampling.get("stride") or 1)),
         log_multi_tile_bboxes=bool(metrics.get("log_multi_tile_bboxes", False)),
-        imgsz=int(defaults.get("imgsz") or 1024),
+        imgsz=int(raw.get("imgsz", defaults.get("imgsz") or TRAIN_IMGSZ)),
         val_fraction=float(defaults.get("val_fraction") or 0.15),
         seed=int(defaults.get("seed") or 42),
         frame_step_only=bool(

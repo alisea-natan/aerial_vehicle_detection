@@ -14,6 +14,7 @@ from common.config import (
     PROBE_DROP_PROMPTS,
     PROBE_KEEP_PROMPTS,
     RAW_CONFIDENCE_THRESHOLD,
+    ULTRALYTICS_DEFAULT_IMGSZ,
     overlap_for_tiles,
 )
 from sahi.predict import get_sliced_prediction
@@ -78,7 +79,11 @@ def parse_sahi_result(result, *, default_subclass: str = "") -> list[dict]:
     return detections
 
 
-def build_yolo_world(classes: list[str]) -> tuple["AutoDetectionModel", str]:
+def build_yolo_world(
+    classes: list[str],
+    *,
+    image_size: int | None = None,
+) -> tuple["AutoDetectionModel", str]:
     from sahi import AutoDetectionModel
 
     dev = device()
@@ -87,6 +92,7 @@ def build_yolo_world(classes: list[str]) -> tuple["AutoDetectionModel", str]:
         model_path=MODEL_NAME,
         confidence_threshold=RAW_CONFIDENCE_THRESHOLD,
         device=dev,
+        image_size=image_size,
     )
     model.model.set_classes(classes)
     # SAHI snapshots COCO names at load (0=person). Refresh after set_classes
@@ -181,6 +187,7 @@ def detect_frame_probe(
         result = ultra_model.predict(
             source,
             conf=RAW_CONFIDENCE_THRESHOLD,
+            imgsz=ULTRALYTICS_DEFAULT_IMGSZ,
             verbose=False,
             device=device_name,
         )[0]

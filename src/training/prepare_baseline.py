@@ -3,7 +3,7 @@
 
 Default (human / CVAT GT → baseline_v1):
   labels/ + data/frames/
-  train_groups tiling from config/clip_tiling.json (~1024)
+  train_groups tiling from config/clip_tiling.json (~1024 px crops, letterbox to train_imgsz)
   only frames on each clip's frame_step
   no group balance / rotation oversample
 
@@ -40,15 +40,16 @@ from common.config import LABELS_DIR, PROJECT_ROOT, TRAIN_IMGSZ, build_split_map
 from training.train import BASELINE_DATASET_DIR, prepare_dataset
 
 AUTOLABEL_LABELS = PROJECT_ROOT / "outputs" / "autolabel" / "labels"
+BASELINE_CFG = PROJECT_ROOT / "config" / "baseline_prepare.yaml"
 DATASETS_ROOT = PROJECT_ROOT / "data" / "datasets"
 
 
 def _load_baseline_params() -> dict:
-    path = PROJECT_ROOT / "params.yaml"
+    path = BASELINE_CFG
     if not path.is_file():
         return {}
     payload = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    return dict(payload.get("baseline") or {})
+    return dict(payload)
 
 
 def parse_args() -> argparse.Namespace:

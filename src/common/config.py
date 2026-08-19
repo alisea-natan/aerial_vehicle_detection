@@ -55,6 +55,21 @@ TRAIN_OVERLAP_RATIO = 0.2
 MIN_USABLE_OBJECT_PX = 32.0
 AUTOLABEL_IMGSZ = 1280  # YOLO-World autolabel only
 
+CHECKPOINTS_DIR = PROJECT_ROOT / "checkpoints"
+POC_CHECKPOINT_NAME = "yolo11s_poc_best.pt"
+PROTOTYPE_CHECKPOINT_NAME = "yolo11s_prototype_best.pt"
+POC_CHECKPOINT = CHECKPOINTS_DIR / POC_CHECKPOINT_NAME
+PROTOTYPE_CHECKPOINT = CHECKPOINTS_DIR / PROTOTYPE_CHECKPOINT_NAME
+POC_DATASET_NAME = "baseline_v0"
+
+
+def checkpoint_name_for_dataset(dataset_dir: Path | str) -> str:
+    """PoC autolabel pack → poc checkpoint; CVAT / variant packs → prototype."""
+    name = Path(dataset_dir).name
+    if name == POC_DATASET_NAME:
+        return POC_CHECKPOINT_NAME
+    return PROTOTYPE_CHECKPOINT_NAME
+
 
 @dataclass(frozen=True)
 class TrainGroupTiling:

@@ -1,13 +1,10 @@
 #!/usr/bin/env python3
-"""Round 2 — model & optimization.
+"""Round 3 — protocol → family → size → epoch curve.
 
-Default: Group A (architecture + coarse LR), 9 runs.
-Later groups B–E need ``--winner`` from Group A.
-
-  python src/training/experiments/run_model_round.py
-  python src/training/experiments/run_model_round.py --resume
+  python src/training/experiments/run_model_round.py --all
+  python src/training/experiments/run_model_round.py --all --resume
   python src/training/experiments/run_model_round.py --pick-winner
-  python src/training/experiments/run_model_round.py --group B --winner yolo11s_lr_x2
+  python src/training/experiments/run_model_round.py --group F --winner proto_frozen_e20
 """
 from __future__ import annotations
 
@@ -35,7 +32,7 @@ import traceback
 from pathlib import Path
 from typing import Any
 
-from common.config import PROJECT_ROOT
+from common.config import PROJECT_ROOT, TRAIN_IMGSZ
 from training.evaluate import BAND_LABELS, EVAL_BAND_A, EVAL_BAND_B
 from training.experiments.common import (
     abs_runs_dir,
@@ -60,13 +57,15 @@ from training.experiments.common import (
 )
 from training.model_load import (
     default_freeze,
-    default_lr0,
     model_family,
-    p2_architecture,
-    yaml_architecture,
+    model_size_letter,
+    with_model_size,
 )
 
 ROUND_CFG = PROJECT_ROOT / "config" / "experiments" / "model_round.yaml"
+NEXT_GROUP = {"P": "F", "F": "S", "S": "E"}
+GROUP_ORDER = ("P", "F", "S", "E")
+FAMILY_S_WEIGHTS = {"yolov8": "yolov8s.pt", "yolo11": "yolo11s.pt"}
 
 
 def parse_args() -> argparse.Namespace:
@@ -76,15 +75,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--list", action="store_true")
     parser.add_argument(
         "--group",
-        default="A",
-        help="Round-2 group: A (default), B, C, D, or E.",
+        default="P",
+        help="P protocol (default), F family, S size, E epoch curve. Ignored with --all.",
+    )
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Run P→F→S→E. After each group, pick the winner (mean native mAP@0.5) and expand the next.",
     )
     parser.add_argument("--variant", action="append", default=None, help="Run these ids only.")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument(
         "--dataset",
-        default=str(d.get("dataset") or "variant_6_strided"),
-        help="Fixed dataset pack (Round 1 winner).",
+        default=str(d.get("dataset") or "auto"),
+        help="Fixed dataset pack (Round 2 winner).",
     )
     parser.add_argument(
         "--runs-dir",
@@ -101,18 +105,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--winner",
         default=None,
-        help="Group A variant id — required for groups B–E.",
+        help="Previous-group variant id — required for groups F, S, E.",
     )
     parser.add_argument(
         "--pick-winner",
         action="store_true",
-        help="Rank finished Group A YOLO runs (native mAP@0.5 A+B) and print the rule.",
-    )
-    parser.add_argument(
-        "--tie-candidate",
-        action="append",
-        default=None,
-        help="With --group C, extra Group A ids for the NMS / no-NMS / Soft-NMS eval.",
+        help="Rank finished runs in --group (native mAP@0.5 A+B) and print the next command.",
     )
     return parser.parse_args()
 
@@ -126,32 +124,24 @@ def _abs_model(model: str) -> str:
     return model
 
 
-def _variant_lr0(raw: dict[str, Any], defaults: dict[str, Any]) -> float:
-    model = str(raw.get("model") or defaults.get("model") or "yolo11s.pt")
-    if raw.get("lr0") is not None:
-        return float(raw["lr0"])
-    base = default_lr0(model, float(defaults.get("lr0") or 0.01))
-    return base * float(raw.get("lr_mult", 1.0))
-
-
-def _materialize_group_a(raw: dict[str, Any], defaults: dict[str, Any]) -> dict[str, Any]:
+def _materialize_static(raw: dict[str, Any], defaults: dict[str, Any]) -> dict[str, Any]:
     model = str(raw["model"])
     staged = bool(raw.get("staged", True))
-    freeze = int(raw.get("freeze", default_freeze(model)))
+    train_backbone = bool(raw.get("train_backbone", True))
     return {
         **raw,
         "model": model,
-        "imgsz": int(raw.get("imgsz", defaults.get("imgsz") or 1024)),
-        "epochs": int(raw.get("epochs", defaults.get("epochs") or 15)),
-        "warmup_epochs": int(raw.get("warmup_epochs", defaults.get("warmup_epochs") or 5)),
-        "freeze": freeze,
-        "lr0": _variant_lr0(raw, defaults),
+        "imgsz": int(raw.get("imgsz", defaults.get("imgsz") or TRAIN_IMGSZ)),
+        "epochs": int(raw.get("epochs", defaults.get("epochs") or 20)),
+        "warmup_epochs": int(raw.get("warmup_epochs", defaults.get("warmup_epochs") or 0)),
+        "freeze": int(raw.get("freeze", default_freeze(model))),
+        "lr0": float(raw.get("lr0", defaults.get("lr0") or 0.01)),
         "patience": int(raw.get("patience", defaults.get("patience") or 7)),
         "train_augmentation": str(
             raw.get("train_augmentation", defaults.get("train_augmentation") or "poc")
         ),
-        "pretrained": True,
-        "train_backbone": True,
+        "pretrained": bool(raw.get("pretrained", True)),
+        "train_backbone": train_backbone,
         "staged": staged,
         "eval_only": False,
         "predict_kw": dict(raw.get("predict_kw") or {}),
@@ -162,173 +152,106 @@ def _load_winner_row(runs_dir: Path, winner_id: str) -> dict[str, Any]:
     result = load_result_json(result_json_path(runs_dir, f"md_{winner_id}"))
     if not result:
         raise SystemExit(
-            f"No result for winner {winner_id!r}. Finish Group A first "
+            f"No result for winner {winner_id!r}. Finish the previous group first "
             f"(python src/training/experiments/run_model_round.py --resume)."
         )
     return result
 
 
-def expand_group_b(winner_id: str, winner: dict[str, Any], cfg: dict[str, Any]) -> dict[str, dict]:
-    defaults = cfg.get("defaults") or {}
-    mults = [float(x) for x in (cfg.get("fine_lr_mults") or [0.8, 1.0, 1.25])]
-    base_lr = float(winner.get("lr0") or defaults.get("lr0") or 0.01)
-    out: dict[str, dict] = {}
-    for mult in mults:
-        tag = str(mult).replace(".", "p")
-        vid = f"{winner_id}_lr_{tag}"
-        out[vid] = {
-            "group": "B",
-            "description": f"Fine LR ×{mult} around {winner_id} (lr0={base_lr * mult:.6g})",
-            "model": winner["model"],
-            "imgsz": int(winner.get("imgsz") or defaults.get("imgsz") or 1024),
-            "epochs": int(defaults.get("epochs") or 15),
-            "warmup_epochs": int(defaults.get("warmup_epochs") or 5),
-            "freeze": int(winner.get("freeze") or default_freeze(str(winner["model"]))),
-            "lr0": base_lr * mult,
-            "patience": int(defaults.get("patience") or 7),
-            "train_augmentation": str(winner.get("train_augmentation") or "poc"),
-            "pretrained": True,
-            "train_backbone": True,
-            "staged": True,
-            "eval_only": False,
-            "predict_kw": {},
-        }
-    return out
-
-
-def expand_group_c(
-    winner_id: str,
-    winner: dict[str, Any],
-    extra_ids: list[str],
-    runs_dir: Path,
-) -> dict[str, dict]:
-    """Eval-only: hard NMS vs no NMS vs Gaussian Soft-NMS on frozen weights."""
-    sources = [(winner_id, winner)]
-    for vid in extra_ids:
-        if vid == winner_id:
-            continue
-        sources.append((vid, _load_winner_row(runs_dir, vid)))
-
-    out: dict[str, dict] = {}
-    for src_id, row in sources:
-        weights = row.get("best_weights")
-        specs = [
-            ("nms_on", {"nms": "hard", "iou": 0.7}, "hard NMS (iou=0.7)"),
-            ("nms_off", {"nms": "off"}, "no NMS"),
-            (
-                "nms_soft",
-                {"nms": "soft", "iou": 0.7, "soft_nms_sigma": 0.5, "soft_nms_method": "gaussian"},
-                "Soft-NMS Gaussian σ=0.5",
-            ),
-        ]
-        for suffix, predict_kw, desc in specs:
-            vid = f"{src_id}_{suffix}"
-            out[vid] = {
-                "group": "C",
-                "description": f"{src_id}: {desc}",
-                "model": row.get("model") or winner["model"],
-                "eval_only": True,
-                "source_weights": weights,
-                "predict_kw": predict_kw,
-                "pretrained": True,
-                "staged": True,
-            }
-    return out
-
-
-def expand_group_d(winner_id: str, winner: dict[str, Any], cfg: dict[str, Any]) -> dict[str, dict]:
-    defaults = cfg.get("defaults") or {}
-    model = str(winner["model"])
-    imgsz = int(winner.get("imgsz") or defaults.get("imgsz") or 1024)
-    freeze = int(winner.get("freeze") or default_freeze(model))
-    lr0 = float(winner.get("lr0") or defaults.get("lr0") or 0.01)
-    patience = int(defaults.get("patience") or 7)
-    aug = str(winner.get("train_augmentation") or "poc")
-    full_warm = int(defaults.get("full_warmup_epochs") or 5)
-    full_ep = int(defaults.get("full_epochs") or 20)
-    shared = {
-        "group": "D",
-        "imgsz": imgsz,
-        "patience": patience,
-        "train_augmentation": aug,
-        "lr0": lr0,
+def _protocol_from_winner(winner: dict[str, Any], defaults: dict[str, Any]) -> dict[str, Any]:
+    model = str(winner.get("model") or defaults.get("model") or "yolo11s.pt")
+    return {
+        "imgsz": int(winner.get("imgsz") or defaults.get("imgsz") or TRAIN_IMGSZ),
+        "epochs": int(winner.get("epochs") or 20),
+        "warmup_epochs": int(winner.get("warmup_epochs") or 0),
+        "freeze": int(winner.get("freeze") or default_freeze(model)),
+        "lr0": float(winner.get("lr0") or defaults.get("lr0") or 0.01),
+        "patience": int(winner.get("patience") or defaults.get("patience") or 7),
+        "train_augmentation": str(winner.get("train_augmentation") or "poc"),
+        "pretrained": bool(winner.get("pretrained", True)),
+        "staged": bool(winner.get("staged", True)),
+        "train_backbone": bool(winner.get("train_backbone", True)),
         "eval_only": False,
         "predict_kw": {},
     }
-    return {
-        f"{winner_id}_bb_full": {
-            **shared,
-            "description": "COCO-pretrained, full fine-tune (staged)",
-            "model": model,
-            "warmup_epochs": full_warm,
-            "epochs": full_ep,
-            "freeze": freeze,
-            "pretrained": True,
-            "staged": True,
-            "train_backbone": True,
-        },
-        f"{winner_id}_bb_frozen": {
-            **shared,
-            "description": "COCO-pretrained, frozen backbone, head only",
-            "model": model,
-            "warmup_epochs": 0,
-            "epochs": full_warm + full_ep,
-            "freeze": freeze,
-            "pretrained": True,
-            "staged": False,
-            "train_backbone": False,
-        },
-        f"{winner_id}_bb_scratch": {
-            **shared,
-            "description": "From-scratch (yaml, random init)",
-            "model": yaml_architecture(model),
-            "warmup_epochs": 0,
-            "epochs": full_warm + full_ep,
-            "freeze": 0,
-            "pretrained": False,
-            "staged": False,
-            "train_backbone": True,
-        },
-    }
+
+
+def expand_group_f(winner_id: str, winner: dict[str, Any], cfg: dict[str, Any]) -> dict[str, dict]:
+    """YOLOv8s vs YOLO11s; skip the family that is already the winner (usually 11s)."""
+    proto = _protocol_from_winner(winner, cfg.get("defaults") or {})
+    winner_family = model_family(str(winner.get("model") or ""))
+    out: dict[str, dict] = {}
+    for family, weights in FAMILY_S_WEIGHTS.items():
+        vid = f"fam_{family}s"
+        if family == winner_family:
+            print(f"Group F: skip {vid} — already scored as {winner_id}")
+            continue
+        out[vid] = {
+            **proto,
+            "group": "F",
+            "description": f"{weights} with protocol from {winner_id}",
+            "model": weights,
+            "freeze": default_freeze(weights),
+        }
+    if not out:
+        print(f"Group F: skip — {winner_id} already covers both families.")
+    return out
+
+
+def expand_group_s(winner_id: str, winner: dict[str, Any], cfg: dict[str, Any]) -> dict[str, dict]:
+    proto = _protocol_from_winner(winner, cfg.get("defaults") or {})
+    model = str(winner["model"])
+    letters = [str(x).lower() for x in (cfg.get("size_letters") or ["n", "s", "m"])]
+    current = model_size_letter(model) or "s"
+    out: dict[str, dict] = {}
+    for letter in letters:
+        vid = f"size_{letter}"
+        if letter == current:
+            print(f"Group S: skip {vid} — already scored as {winner_id} ({model})")
+            continue
+        sized = with_model_size(model, letter)
+        out[vid] = {
+            **proto,
+            "group": "S",
+            "description": f"{sized} ({letter}) with protocol from {winner_id}",
+            "model": sized,
+            "freeze": default_freeze(sized),
+        }
+    if not out:
+        print(f"Group S: skip — {winner_id} already covers {letters}.")
+    return out
 
 
 def expand_group_e(winner_id: str, winner: dict[str, Any], cfg: dict[str, Any]) -> dict[str, dict]:
-    defaults = cfg.get("defaults") or {}
-    model = str(winner["model"])
-    imgsz = int(winner.get("imgsz") or defaults.get("imgsz") or 1024)
-    freeze = int(winner.get("freeze") or default_freeze(model))
-    lr0 = float(winner.get("lr0") or defaults.get("lr0") or 0.01)
-    patience = int(defaults.get("patience") or 7)
-    aug = str(winner.get("train_augmentation") or "poc")
-    full_warm = int(defaults.get("full_warmup_epochs") or 5)
-    full_ep = int(defaults.get("full_epochs") or 20)
-    shared = {
-        "group": "E",
-        "imgsz": imgsz,
-        "warmup_epochs": full_warm,
-        "epochs": full_ep,
-        "freeze": freeze,
-        "lr0": lr0,
-        "patience": patience,
-        "train_augmentation": aug,
-        "pretrained": True,
-        "train_backbone": True,
-        "staged": True,
-        "eval_only": False,
-        "predict_kw": {},
-    }
-    return {
-        f"{winner_id}_head_std": {
-            **shared,
-            "description": "Standard head (winner architecture, full budget)",
-            "model": model,
-        },
-        f"{winner_id}_head_p2": {
-            **shared,
-            "description": "P2 small-object head",
-            "model": p2_architecture(model),
-        },
-    }
+    """Epoch curve. Frozen: total head epochs. Staged: Stage-2 lengths, same warmup."""
+    proto = _protocol_from_winner(winner, cfg.get("defaults") or {})
+    staged = bool(proto["train_backbone"]) and bool(proto["staged"])
+    if staged:
+        lengths = [int(x) for x in (cfg.get("epoch_curve_unfreeze") or [5, 10, 15])]
+        current = int(proto["epochs"])
+        kind = "unfreeze"
+    else:
+        lengths = [int(x) for x in (cfg.get("epoch_curve_frozen") or [5, 10, 20])]
+        current = int(proto["epochs"])
+        kind = "frozen"
+    out: dict[str, dict] = {}
+    for n_ep in lengths:
+        vid = f"ep_{kind}_{n_ep}"
+        if n_ep == current:
+            print(f"Group E: skip {vid} — already scored as {winner_id} ({n_ep} ep)")
+            continue
+        row = {
+            **proto,
+            "group": "E",
+            "description": f"{winner.get('model')} {kind} {n_ep} ep (from {winner_id})",
+            "model": winner["model"],
+            "epochs": n_ep,
+            "patience": 0,
+        }
+        out[vid] = row
+    if not out:
+        print(f"Group E: skip — {winner_id} already covers {kind} {lengths}.")
+    return out
 
 
 def resolve_group_variants(
@@ -337,31 +260,33 @@ def resolve_group_variants(
     cfg: dict[str, Any],
     winner_id: str | None,
     runs_dir: Path,
-    tie_candidates: list[str],
 ) -> dict[str, dict[str, Any]]:
     group = group.upper()
     defaults = cfg.get("defaults") or {}
     static = dict(cfg.get("variants") or {})
-    if group == "A":
+    if group == "P":
         out = {}
         for vid, raw in static.items():
-            if str(raw.get("group") or "A").upper() != "A":
+            if str(raw.get("group") or "P").upper() != "P":
                 continue
-            out[vid] = _materialize_group_a(dict(raw), defaults)
-        order = list((cfg.get("groups") or {}).get("A", {}).get("runs") or out.keys())
+            out[vid] = _materialize_static(dict(raw), defaults)
+        order = list((cfg.get("groups") or {}).get("P", {}).get("runs") or out.keys())
         return {vid: out[vid] for vid in order if vid in out}
+    if group in {"A", "B", "C", "D"}:
+        raise SystemExit(
+            f"Group {group} was the old LR/NMS/P2 grid. Use P → F → S → E "
+            f"(see config/experiments/model_round.yaml)."
+        )
     if not winner_id:
-        raise SystemExit(f"Group {group} requires --winner <Group A variant id>")
+        raise SystemExit(f"Group {group} requires --winner <previous group id>")
     winner = _load_winner_row(runs_dir, winner_id)
-    if group == "B":
-        return expand_group_b(winner_id, winner, cfg)
-    if group == "C":
-        return expand_group_c(winner_id, winner, tie_candidates, runs_dir)
-    if group == "D":
-        return expand_group_d(winner_id, winner, cfg)
+    if group == "F":
+        return expand_group_f(winner_id, winner, cfg)
+    if group == "S":
+        return expand_group_s(winner_id, winner, cfg)
     if group == "E":
         return expand_group_e(winner_id, winner, cfg)
-    raise SystemExit(f"Unknown group {group!r}. Use A, B, C, D, or E.")
+    raise SystemExit(f"Unknown group {group!r}. Use P, F, S, or E.")
 
 
 def _native_bands(row: dict[str, Any]) -> dict[str, Any]:
@@ -381,37 +306,73 @@ def _score(bands: dict[str, Any], metric: str = "map50") -> float | None:
     return (float(a) + float(b)) / 2.0
 
 
-def pick_winner(runs_dir: Path, cfg: dict[str, Any]) -> None:
+def pick_winner(
+    runs_dir: Path,
+    cfg: dict[str, Any],
+    *,
+    group: str,
+    winner_id: str | None,
+    require_complete: bool = True,
+) -> dict[str, Any]:
     defaults = cfg.get("defaults") or {}
     delta = float(defaults.get("winner_delta") or 0.015)
     metric = str(defaults.get("decision_metric") or "map50")
-    variants = resolve_group_variants(
-        group="A", cfg=cfg, winner_id=None, runs_dir=runs_dir, tie_candidates=[]
-    )
-    ranked: list[tuple[str, float, dict, str]] = []
-    missing = []
-    for vid, raw in variants.items():
+    group = group.upper()
+    eval_targets = parse_eval_targets(defaults)
+
+    def _rank_id(vid: str, model: str | None = None) -> tuple[str, float, dict, str] | None:
         status, existing = variant_progress(
             runs_dir=runs_dir,
             variant_id=vid,
             run_name=f"md_{vid}",
-            eval_targets=parse_eval_targets(defaults),
+            eval_targets=eval_targets,
             skip_eval=False,
         )
         if status != "complete" or not existing:
-            missing.append(vid)
-            continue
+            return None
         bands = _native_bands(existing)
         score = _score(bands, metric)
         if score is None:
-            missing.append(vid)
-            continue
-        ranked.append((vid, score, bands, model_family(str(raw["model"]))))
+            return None
+        fam = model_family(str(model or existing.get("model") or vid))
+        return (vid, score, bands, fam)
+
+    ranked: list[tuple[str, float, dict, str]] = []
+    missing: list[str] = []
+
+    if group == "P":
+        variants = resolve_group_variants(
+            group="P", cfg=cfg, winner_id=None, runs_dir=runs_dir
+        )
+        for vid, raw in variants.items():
+            row = _rank_id(vid, str(raw.get("model") or ""))
+            if row is None:
+                missing.append(vid)
+            else:
+                ranked.append(row)
+    else:
+        if not winner_id:
+            raise SystemExit(f"--pick-winner --group {group} needs --winner <id from previous group>")
+        carry = _rank_id(winner_id)
+        if carry is None:
+            raise SystemExit(f"Winner {winner_id!r} is not finished; cannot rank Group {group}.")
+        ranked.append(carry)
+        variants = resolve_group_variants(
+            group=group, cfg=cfg, winner_id=winner_id, runs_dir=runs_dir
+        )
+        for vid, raw in variants.items():
+            row = _rank_id(vid, str(raw.get("model") or ""))
+            if row is None:
+                missing.append(vid)
+            else:
+                ranked.append(row)
 
     if missing:
-        print("Incomplete Group A (need --resume):", ", ".join(missing))
+        print(f"Incomplete Group {group} (need --resume):", ", ".join(missing))
+        if require_complete:
+            raise SystemExit(f"Incomplete Group {group}: {', '.join(missing)}")
     if not ranked:
-        raise SystemExit("No finished Group A evals to rank.")
+        raise SystemExit(f"No finished Group {group} evals to rank.")
 
     ranked.sort(key=lambda r: r[1], reverse=True)
     a_lbl = BAND_LABELS[EVAL_BAND_A]
@@ -423,31 +384,158 @@ def pick_winner(runs_dir: Path, cfg: dict[str, Any]) -> None:
         b = (bands.get(EVAL_BAND_B) or {}).get(metric)
         print(f"  {vid}: mean={100 * score:.1f}%  A={100 * float(a):.1f}%  B={100 * float(b):.1f}%")
 
-    if len(ranked) < 1:
-        raise SystemExit("No Group A runs finished.")
     top_id, top_score, _, _ = ranked[0]
     print(f"\nTop: {top_id} ({100 * top_score:.1f}%)")
+    tie = False
+    second_id = None
+    gap = None
     if len(ranked) >= 2:
         second_id, second_score, _, _ = ranked[1]
         gap = top_score - second_score
-        print(f"Second:   {second_id} ({100 * second_score:.1f}%)  gap={100 * gap:.1f} pts")
-        if gap >= delta:
-            print(
-                f"Gap ≥ {100 * delta:.1f} pts → take {top_id} into Groups B, C, D, E. "
-                f"Skip Group C for the second model."
-            )
-            print(f"  python src/training/experiments/run_model_round.py --group B --winner {top_id}")
-            print(f"  python src/training/experiments/run_model_round.py --group C --winner {top_id}")
-        else:
-            print(
-                f"Gap < {100 * delta:.1f} pts (noise) → run Group C on both, then pick one for D/E."
-            )
-            print(
-                f"  python src/training/experiments/run_model_round.py --group C "
-                f"--winner {top_id} --tie-candidate {second_id}"
-            )
+        print(f"Second: {second_id} ({100 * second_score:.1f}%)  gap={100 * gap:.1f} pts")
+        if gap < delta:
+            tie = True
+            print(f"Gap < {100 * delta:.1f} pts — treat as a tie; inspect P/FA before locking.")
+    nxt = NEXT_GROUP.get(group)
+    if nxt:
+        print(
+            f"\nNext: python src/training/experiments/run_model_round.py "
+            f"--group {nxt} --winner {top_id}"
+        )
     else:
-        print(f"  python src/training/experiments/run_model_round.py --group B --winner {top_id}")
+        print("\nEpoch curve is the last group. Lock the top id as the deliverable candidate.")
+    return {
+        "id": top_id,
+        "mean_map50": top_score,
+        "tie": tie,
+        "second": second_id,
+        "gap": gap,
+        "ranked": [{"id": vid, "mean_map50": score} for vid, score, _, _ in ranked],
+    }
+
+
+def winners_path(runs_dir: Path) -> Path:
+    return abs_runs_dir(runs_dir) / "winners.json"
+
+
+def write_winners(runs_dir: Path, chain: dict[str, Any], *, dataset: str) -> Path:
+    path = winners_path(runs_dir)
+    payload = {
+        "dataset": dataset,
+        "decision_metric": "map50",
+        "rule": "native mAP@0.5, mean of bands A and B",
+        "updated_at": utcnow().isoformat(timespec="seconds"),
+        "groups": chain,
+        "final": (chain.get("E") or {}).get("id"),
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    print(f"Winners → {path}")
+    return path
+
+
+def _predict_kw(raw: dict[str, Any]) -> dict[str, Any]:
+    kw = dict(raw.get("predict_kw") or {})
+    if kw.get("imgsz") is None and raw.get("imgsz") is not None:
+        kw["imgsz"] = int(raw["imgsz"])
+    return kw
+
+
+def supervise_group(
+    *,
+    args: argparse.Namespace,
+    group: str,
+    winner_id: str | None,
+    selected: list[str],
+    eval_targets: list[tuple[str, Path]],
+) -> None:
+    skip: set[str] = set()
+    if args.resume:
+        for vid in selected:
+            status, _ = variant_progress(
+                runs_dir=args.runs_dir,
+                variant_id=vid,
+                run_name=f"md_{vid}",
+                eval_targets=eval_targets,
+                skip_eval=args.skip_eval,
+            )
+            if status == "complete":
+                skip.add(vid)
+    extra = [
+        "--group",
+        group,
+        "--dataset",
+        args.dataset,
+        "--runs-dir",
+        str(args.runs_dir),
+    ]
+    if args.resume:
+        extra.append("--resume")
+    if args.skip_eval:
+        extra.append("--skip-eval")
+    if args.batch is not None:
+        extra.extend(["--batch", str(args.batch)])
+    if winner_id:
+        extra.extend(["--winner", winner_id])
+    supervise_round_variants(
+        script=Path(__file__).resolve(),
+        variant_ids=selected,
+        extra_args=extra,
+        skip_ids=skip,
+        runs_dir=args.runs_dir,
+        log_prefix="md_",
+        session_label=f"model_{group}",
+    )
+    all_rows = collect_all_model_results(args.runs_dir, eval_targets)
+    if all_rows:
+        write_round_summary(
+            args.runs_dir,
+            all_rows,
+            title=f"Model round — dataset={args.dataset}",
+        )
+
+
+def run_all_groups(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
+    eval_targets = parse_eval_targets(cfg.get("defaults") or {})
+    prev: str | None = None
+    chain: dict[str, Any] = {}
+    for group in GROUP_ORDER:
+        print(f"\n######## Round 3 / Group {group} ########")
+        variants = resolve_group_variants(
+            group=group,
+            cfg=cfg,
+            winner_id=prev,
+            runs_dir=args.runs_dir,
+        )
+        selected = list(variants.keys())
+        if not selected:
+            print(f"Group {group}: nothing new to train; keep {prev}")
+        elif args.dry_run:
+            for vid, raw in variants.items():
+                print(f"  [dry-run] {vid}: {raw.get('description')}")
+            print("[dry-run] F/S/E expand from the P winner after it is scored.")
+            return
+        else:
+            supervise_group(
+                args=args,
+                group=group,
+                winner_id=prev,
+                selected=selected,
+                eval_targets=eval_targets,
+            )
+        picked = pick_winner(
+            args.runs_dir,
+            cfg,
+            group=group,
+            winner_id=prev,
+            require_complete=True,
+        )
+        prev = str(picked["id"])
+        chain[group] = picked
+        write_winners(args.runs_dir, chain, dataset=args.dataset)
+    final = (chain.get("E") or chain.get("S") or chain.get("F") or chain.get("P") or {}).get("id")
+    print(f"\nRound 3 complete. Deliverable candidate: {final}")
+    print("Chain: " + " → ".join(f"{g}={chain[g]['id']}" for g in GROUP_ORDER if g in chain))
 
 
 def collect_all_model_results(
@@ -480,10 +568,32 @@ def main() -> None:
     cfg = load_yaml(ROUND_CFG)
     defaults = dict(cfg.get("defaults") or {})
     eval_targets = parse_eval_targets(defaults)
-    group = str(args.group or "A").upper()
+    group = str(args.group or "P").upper()
+
+    if args.all and args.list:
+        print(f"dataset={args.dataset}  chain={' → '.join(GROUP_ORDER)}")
+        variants = resolve_group_variants(
+            group="P", cfg=cfg, winner_id=None, runs_dir=args.runs_dir
+        )
+        print("Group P:")
+        for vid, raw in variants.items():
+            print(f"  {vid}: {raw.get('description', '')} model={raw.get('model')}")
+        print("Groups F, S, E expand from the previous winner (mean native mAP@0.5).")
+        return
 
     if args.pick_winner:
-        pick_winner(args.runs_dir, cfg)
+        pick_winner(
+            args.runs_dir,
+            cfg,
+            group=group,
+            winner_id=args.winner,
+        )
+        return
+
+    if args.all:
+        if is_round_worker():
+            raise SystemExit("--all is the parent driver; workers must pass --group / --variant")
+        run_all_groups(args, cfg)
         return
 
     variants = resolve_group_variants(
@@ -491,13 +601,19 @@ def main() -> None:
         cfg=cfg,
         winner_id=args.winner,
         runs_dir=args.runs_dir,
-        tie_candidates=list(args.tie_candidate or []),
     )
     if args.list:
         print(f"Group {group}  dataset={args.dataset}")
+        if not variants:
+            print("  (nothing new to train)")
+            return
         for vid, raw in variants.items():
             extra = " eval-only" if raw.get("eval_only") else f" model={raw.get('model')}"
             print(f"  {vid}: {raw.get('description', '')}{extra}")
+        return
+
+    if not variants:
+        print(f"Group {group}: nothing new to train. Previous winner {args.winner} stands.")
         return
 
     selected = list(args.variant or [])
@@ -516,52 +632,13 @@ def main() -> None:
         )
 
     if not args.dry_run and not is_round_worker():
-        skip: set[str] = set()
-        if args.resume:
-            for vid in selected:
-                status, _ = variant_progress(
-                    runs_dir=args.runs_dir,
-                    variant_id=vid,
-                    run_name=f"md_{vid}",
-                    eval_targets=eval_targets,
-                    skip_eval=args.skip_eval,
-                )
-                if status == "complete":
-                    skip.add(vid)
-        extra = [
-            "--group",
-            group,
-            "--dataset",
-            args.dataset,
-            "--runs-dir",
-            str(args.runs_dir),
-        ]
-        if args.resume:
-            extra.append("--resume")
-        if args.skip_eval:
-            extra.append("--skip-eval")
-        if args.batch is not None:
-            extra.extend(["--batch", str(args.batch)])
-        if args.winner:
-            extra.extend(["--winner", args.winner])
-        for cand in args.tie_candidate or []:
-            extra.extend(["--tie-candidate", cand])
-        supervise_round_variants(
-            script=Path(__file__).resolve(),
-            variant_ids=selected,
-            extra_args=extra,
-            skip_ids=skip,
-            runs_dir=args.runs_dir,
-            log_prefix="md_",
-            session_label=f"model_{group}",
+        supervise_group(
+            args=args,
+            group=group,
+            winner_id=args.winner,
+            selected=selected,
+            eval_targets=eval_targets,
         )
-        all_rows = collect_all_model_results(args.runs_dir, eval_targets)
-        if all_rows:
-            write_round_summary(
-                args.runs_dir,
-                all_rows,
-                title=f"Model round — dataset={args.dataset}",
-            )
         return
 
     results: list[dict] = []
@@ -613,7 +690,7 @@ def main() -> None:
                 continue
 
             try:
-                predict_kw = dict(raw.get("predict_kw") or {})
+                predict_kw = _predict_kw(raw)
                 variant_started = utcnow()
                 variant_t0 = time.perf_counter()
                 if raw.get("eval_only"):
