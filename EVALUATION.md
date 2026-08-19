@@ -1,8 +1,8 @@
-# Prototype — manual labels, pack ablations, experiment rounds
+# Evaluation — manual labels, pack ablations, experiment rounds
 
-**Read [README.md](README.md) first.** That doc covers preprocess, autolabel PoC, train/eval mechanics, metrics, and postprocess. This doc adds only the **manual-label path**: CVAT GT in `labels/`, ablation packs, three experiment rounds, and lock-in.
+**Read [PoC.md](PoC.md) first.** That doc covers preprocess, autolabel PoC, train/eval mechanics, metrics, and postprocess. Task spec (class `0 = vehicle`): **[README.md](README.md)**. This doc adds only the **manual-label path**: CVAT GT in `labels/`, ablation packs, three experiment rounds, and lock-in.
 
-Shared with README (not repeated here): vehicle definition, `clip_tiling.json` / distance bins / `frame_step`, `train_groups` tiling, eval bands A/B, `--prototype` 2+5 schedule, aug, nested-box NMS drop, metric columns, `prepare_eval` cap-64 sampling.
+Shared with PoC.md (not repeated here): `clip_tiling.json` / distance bins / `frame_step`, `train_groups` tiling, eval bands A/B, `--prototype` 2+5 schedule, aug, nested-box NMS drop, metric columns, `prepare_eval` cap-64 sampling.
 
 All round tables = **eval** on `eval_manual` (eval clips A/B), not in-train val. **Decision metric:** mean A+B mAP@0.5.
 
@@ -17,7 +17,7 @@ labels/{train|eval}/{clip}/{frame_stem}.txt     ← CVAT (cvat_pull --sync-label
 data/frames/{clip}/{frame_stem}.jpg             ← must match stems
 ```
 
-Empty `.txt` = no vehicles. Use README `frame_step` as annotation density guide.
+Empty `.txt` = no vehicles. Use PoC.md `frame_step` as annotation density guide.
 
 ```bash
 python src/labeling/cvat/cvat_pull.py --verify --sync-labels
@@ -46,7 +46,7 @@ CVAT manual labels persist across each frame of video since tracking simplifies 
 
 The comparison reveals that clip `8457857` disproportionately drives the results, motivating us to better balance clip selection across diverse visual conditions (e.g., angle and distance) rather than relying on unique labels alone.
 The size comparison also shows significant variations between manual and automated box dimensions for 4 out of the 6 clips.
-`8968356` skipped (README).
+`8968356` skipped ([PoC.md](PoC.md)).
 
 ---
 
@@ -60,7 +60,7 @@ Round 2  train pack   →  lock defaults.dataset in model_round.yaml
 Round 3  model setup  →  lock recipe in §6
 ```
 
-Base train for Rounds 1–2: YOLO11s, README `--prototype` (2 ep freeze + 5 ep unfreeze). Round 3 relaxes protocol on the locked pack + imgsz.
+Base train for Rounds 1–2: YOLO11s, PoC `--prototype` (2 ep freeze + 5 ep unfreeze). Round 3 relaxes protocol on the locked pack + imgsz.
 
 ### Round 1 — imgsz
 
@@ -369,7 +369,7 @@ Source: `outputs/experiments/model_round/proto_short_2p5/eval_manual/eval_metric
 | FA/min | 3130 / 257 | 2340 / 42 |
 | mean mAP@0.5 | 59.5% | **87.7%** |
 
-PoC numbers: README eval run (autolabel GT, imgsz 640, 2+5, conf 0.25).
+PoC numbers: PoC.md eval run (autolabel GT, imgsz 640, 2+5, conf 0.25).
 
 **Re-score PoC on same command shape (reference only):**
 
