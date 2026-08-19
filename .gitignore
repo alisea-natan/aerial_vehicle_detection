@@ -21,7 +21,7 @@ env/
 /*.pdf
 
 # --- macOS ---
-.DS_Store
+**/.DS_Store
 
 # --- Extracted frames only (large; run extract_frames.py) ---
 data/frames/**
@@ -48,6 +48,7 @@ outputs/eval_videos/*
 !outputs/eval_videos/*_predictions.mp4
 !outputs/probe_frames/
 !outputs/probe_frames/**
+outputs/probe_frames/**/.DS_Store
 
 # --- Model weights ---
 weights/                          # CLIP etc. (large, download locally)
