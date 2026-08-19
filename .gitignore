@@ -1,3 +1,9 @@
+# --- Guides (local docs / PDF export) ---
+guides/
+
+# --- Legacy: local guide PDF tooling (no package.json in repo anymore) ---
+node_modules/
+
 # --- Python / IDE ---
 __pycache__/
 .pytest_cache/
@@ -8,9 +14,13 @@ __pycache__/
 # --- Secrets / local env ---
 .env
 .env.*
+!.env.example
 .venv/
 venv/
 env/
+
+# --- PDFs in repo root ---
+/*.pdf
 
 # --- macOS ---
 .DS_Store
@@ -18,11 +28,18 @@ env/
 # --- Extracted frames only (large; run extract_frames.py) ---
 data/frames/**
 
-# --- Pseudo-labels (regenerate: autolabel_yworld.py) ---
+# --- Labels (local; replaced by new CVAT export — not pushed to git) ---
 labels/
 
-# --- Probe / label debug artifacts (regenerate: probe_clips.py, autolabel) ---
+# --- Probe / label debug artifacts (regenerate: probe_clips.py) ---
 debug/
+
+# --- Manual labeling: generated packs (rebuild). Keep downloaded exports you use. ---
+labelling/Vehicle.v1i.yolov8/
+labelling/cvat/
+labelling/roboflow/roboflow/
+labelling/roboflow/roboflow_upload/
+labelling/roboflow/roboflow_ui_upload_8457857/
 
 # --- Training & evaluation outputs (regenerate: train.py, evaluate.py) ---
 outputs/*
@@ -35,18 +52,45 @@ outputs/eval_videos/*
 # --- Model weights ---
 weights/                          # CLIP etc. (large, download locally)
 yolov8x-worldv2.pt                # 140 MB pseudo-labeler (download)
+yolo11s.pt                        # pretrained base (download via Ultralytics)
 *.pt
 *.pth
 *.onnx
 *.engine
-# Fine-tuned deliverable (~6 MB) — copy after train:
-#   cp outputs/runs/yolov8n_vehicle/weights/best.pt checkpoints/yolov8n_vehicle_best.pt
+# Fine-tuned deliverable — copy after train:
+#   cp outputs/runs/yolo11s_vehicle/weights/best.pt checkpoints/yolo11s_vehicle_best.pt
 !checkpoints/
 checkpoints/*
-!checkpoints/yolov8n_vehicle_best.pt
+!checkpoints/yolo11s_vehicle_best.pt
 
 # Ultralytics run folders (if created outside outputs/)
 runs/
+
+# --- Local-only ad-hoc scripts at repo root (not committed) ---
+# Tracked: config/experiments/ (round settings) and src/training/experiments/ (runners).
+# Pack blobs stay gitignored under data/datasets/; outputs under outputs/.
+/experiments/
+
+# --- MLflow (local tracking; not in git) ---
+mlruns/
+mlflow.db
+.mlflow/
+mlflow_server/
+
+# --- Dataset packs: local only (never commit blobs) ---
+data/datasets/**
+!data/datasets/README.md
+!data/datasets/.gitignore
+data/dataset/
+
+data/raw_export/
+data/raw_base/
+data/cvat/
+config/cvat_tasks.json
+
+# --- Autolabel demo outputs ---
+outputs/autolabel/
+
 
 # --- Matplotlib / cache dirs ---
 .matplotlib/

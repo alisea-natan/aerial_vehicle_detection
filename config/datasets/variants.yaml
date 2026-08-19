@@ -1,0 +1,118 @@
+# Dataset pack variants (local blobs under data/datasets/ — not git).
+# Settings in this file ARE git-tracked.
+#
+# Manual-label defaults: CVAT labels/, frame_step, imgsz 1024.
+# Train protocol (yolo11s --prototype) lives in config/experiments/dataset_round.yaml.
+#
+#   python src/training/datasets/generate_variant.py --list
+#   python src/training/datasets/generate_variant.py --all
+
+auto:
+  source: "config/clip_tiling.json train_groups"
+  tile_size: 1024
+  overlap: 0.2
+  by_group:
+    A_close:
+      tile_size: null
+      overlap: 0.0
+      train_imgsz: 1024
+    B_medium:
+      tile_size: 1024
+      overlap: 0.2
+      train_imgsz: 1024
+    C_far:
+      tile_size: 768
+      overlap: 0.2
+      train_imgsz: 1024
+
+defaults:
+  imgsz: 1024
+  val_fraction: 0.15
+  seed: 42
+  min_visible_ratio: 0.3
+  keep_negative_tiles: false
+  frame_step_only: true
+  labels_root: labels
+  out_root: data/datasets
+  # Online aug at train time (dataset_round). Tiles on disk are never augmented.
+  train_augmentation: poc
+
+variants:
+  baseline_1:
+    description: "Reference — AUTO tiling, frame_step, CVAT labels, drop empty tiles"
+    dataset: build
+    tiling:
+      mode: auto
+      min_visible_ratio: 0.3
+      keep_negative_tiles: false
+    sampling:
+      strategy: full
+
+  variant_2_no_tiling:
+    description: "Full frame only; letterbox to imgsz at train time"
+    dataset: build
+    tiling:
+      mode: off
+      min_visible_ratio: 0.3
+      keep_negative_tiles: false
+    sampling:
+      strategy: full
+
+  variant_3_tiling_fixed:
+    description: "Fixed tile 640 / overlap 0.1 (not AUTO) for all clips"
+    dataset: build
+    tiling:
+      mode: fixed
+      tile_size: 640
+      overlap: 0.1
+      min_visible_ratio: 0.3
+      keep_negative_tiles: false
+    sampling:
+      strategy: full
+
+  variant_4_low_overlap:
+    description: "AUTO tile sizes; overlap forced to 0.1; log multi-tile bbox duplicates"
+    dataset: build
+    tiling:
+      mode: auto
+      overlap_override: 0.1
+      min_visible_ratio: 0.3
+      keep_negative_tiles: false
+    sampling:
+      strategy: full
+    metrics:
+      log_multi_tile_bboxes: true
+
+  variant_5_aug:
+    description: "Same tiles as baseline_1; mosaic_hsv instead of PoC aug (train time only)"
+    dataset: reuse
+    reuse_from: baseline_1
+    train_augmentation: mosaic_hsv
+    tiling:
+      mode: auto
+      min_visible_ratio: 0.3
+      keep_negative_tiles: false
+    sampling:
+      strategy: full
+
+  variant_6_strided:
+    description: "AUTO tiling; keep every 5th frame_step frame per clip"
+    dataset: build
+    tiling:
+      mode: auto
+      min_visible_ratio: 0.3
+      keep_negative_tiles: false
+    sampling:
+      strategy: strided
+      stride: 5
+
+  variant_7_negatives:
+    description: "AUTO tiling; keep empty tiles at 15% of positive count"
+    dataset: build
+    tiling:
+      mode: auto
+      min_visible_ratio: 0.3
+      keep_negative_tiles: true
+      negative_ratio: 0.15
+    sampling:
+      strategy: full

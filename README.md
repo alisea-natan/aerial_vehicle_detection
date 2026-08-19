@@ -1,396 +1,294 @@
-# Aerial Vehicle Detection — PoC Pipeline
+# Aerial Vehicle Detection
 
-End-to-end pipeline for pseudo-labeling drone footage and fine-tuning a lightweight detector. Written as a working report: what was built, why, and where the trade-offs are.
+PoC: detect vehicles on top-down drone video — **config → autolabel → train YOLO11s → evaluate**.
 
-```
-vehicle_detection/
-├── README.md
-├── requirements.txt
-├── .gitignore
-├── .gitattributes                  # Git LFS rules for videos
-├── yolov8x-worldv2.pt              # gitignored — download locally (probe + autolabel)
-├── config/
-│   └── clip_tiling.json            # per-clip tiles, overlap, threshold (from probe)
-├── checkpoints/
-│   └── yolov8n_vehicle_best.pt     # git-tracked (~23 MB, copied by train.py)
-├── data/
-│   ├── train/*.mp4                 # Git LFS
-│   ├── eval/*.mp4                  # Git LFS
-│   └── frames/                     # gitignored — extract_frames.py
-├── labels/                         # gitignored — autolabel_yworld.py
-│   ├── train/{clip}/*.txt
-│   └── eval/{clip}/*.txt
-├── debug/                          # gitignored — probe_clips.py, autolabel
-│   ├── tile_probe.json
-│   ├── label_stats.json
-│   └── {clip}/                     # cache/, labels_debug.mp4, confidence_hist.png
-├── outputs/                        # mostly gitignored
-│   ├── dataset/                    # gitignored — SAHI train/val slices
-│   ├── eval_videos/*_predictions.mp4  # Git LFS — evaluate.py overlays
-│   ├── eval_metrics.json           # evaluate.py metrics (JSON)
-│   └── metrics_table.md            # evaluate.py metrics (table)
-└── src/
-    ├── extract_frames.py           # 1. video → frames
-    ├── probe_clips.py              # 2. probe tiles → clip_tiling.json
-    ├── autolabel_yworld.py         # 3. pseudo-labels + debug outputs
-    ├── train.py                    # 4. fine-tune YOLOv8n
-    ├── evaluate.py                 # 5. metrics + prediction videos
-    ├── config.py                   # paths, split map, tiling helpers
-    └── detect.py                   # YOLO-World, SAHI, distance
+Experiments, ablations, and manual-label QA → **[GUIDELINE.md](GUIDELINE.md)**.
+
+## What counts as a vehicle
+
+Single class `0 = vehicle`: a **self-propelled unit with an engine**. Trailers and other non-powered attachments are **not** vehicles.
+
+| Label as `vehicle` | Do **not** label as `vehicle` |
+| ------------------ | ----------------------------- |
+| Cars, SUVs, pickups, vans | Trailers, semi-trailers, caravans (alone or hitched) |
+| Trucks, lorries — **powered unit only** | Cyclists / bicycle riders (person + bicycle; no engine) |
+| Buses, minibuses | Standalone bicycles |
+| Motorcycles, scooters, mopeds | Pedestrians, animals, strollers, hand carts |
+| Similar self-propelled road units (taxi, etc.) | Aircraft, drones, boats, trains (out of scope) |
+
+If a truck tows a trailer: box the **tractor only**. Leave non-vehicles unlabeled.
+
+Autolabel prompts follow the same rule (no trailer / bike / pedestrian prompts).
+
+## Setup
+
+```bash
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
 ```
 
-**Legend:** plain paths = committed to git · `Git LFS` = large videos · `gitignored` = local only, regenerate from scripts.
+Python **3.12**. Run from the repo root.
 
----
-
-
-
-## 1. Task
-
-**Goal:** detect vehicles on top-down drone frames at different ranges (close / mid / far) and produce a model that can be evaluated per distance band.
-
-**Input:** `.mp4` clips in `data/train/` and `data/eval/`.
-
-**Output:**
-
-- YOLO pseudo-labels in `labels/`
-- fine-tuned YOLOv8n weights in `outputs/runs/`
-- per-band metrics in `outputs/` (after training)
-
-The hard part is not “finding a detector” — it is the **domain gap**. Off-the-shelf models (including YOLO-World) are trained mostly on ground-level imagery. Here, a car is a tiny rectangle from above and is sometimes tagged as `person`.
-
----
-
-
-
-## 2. Pipeline overview
-
-Blue rectangles = **scripts** (actions). Green / amber rounded = **files** (results).
+## Pipeline
 
 ```mermaid
-flowchart TB
-    classDef script fill:#dbeafe,stroke:#1d4ed8,color:#1e3a8a
-    classDef data fill:#dcfce7,stroke:#15803d,color:#14532d
-    classDef output fill:#fef9c3,stroke:#ca8a04,color:#713f12
-
-    V(data/train · eval .mp4):::data
-
-    S1[extract_frames.py]:::script
-    F(data/frames/):::data
-
-    S2[probe_clips.py]:::script
-    CFG(config/clip_tiling.json):::data
-
-    S3[autolabel_yworld.py]:::script
-    LAB(labels/):::data
-    DBG(debug/):::data
-
-    S4[train.py]:::script
-    WT(outputs/runs/best.pt):::output
-
-    S5[evaluate.py]:::script
-    MET(outputs/metrics · eval_videos/):::output
-
-    V --> S1 --> F
-    F --> S2 --> CFG
-    CFG --> S3
-    S3 --> LAB
-    S3 --> DBG
-    LAB --> S4 --> WT
-    WT --> S5
-    S5 --> MET
+flowchart LR
+    V[videos] --> E[extract_frames]
+    E --> P[preprocess_clips]
+    P --> C[clip_tiling.json]
+    C --> A[autolabel YOLO-World]
+    A --> T[train YOLO11s]
+    C --> T
+    T --> W[best.pt]
+    W --> Ev[evaluate]
 ```
 
+| Step | Command |
+| ---- | ------- |
+| 1. Frames | `python src/data/extract_frames.py` |
+| 2. Config | `python src/data/preprocess_clips.py` → `config/clip_tiling.json` |
+| 3. Autolabel | `python src/labeling/autolabel.py` → `outputs/autolabel/` |
+| 4. Dataset | `python src/training/prepare_baseline.py --from-autolabel` → `data/datasets/baseline_v0/` |
+| 4b. Eval pack (optional, once) | `python src/training/prepare_eval.py --from-autolabel` → `data/datasets/eval_autolabel/` |
+| 5. Train | `python -u src/training/train.py --dataset-dir data/datasets/baseline_v0 --prototype` |
+| 6. Eval | `python src/training/evaluate.py` |
 
+Single clip: add `--clip NAME` where supported.
 
-Probe decides tiles + confidence per clip. Autolabel uses that config. Train fits YOLOv8n on pseudo-labels. Evaluate reports metrics and writes prediction videos.
+## Where things are saved
 
-### How to run (defaults vs options)
+| Artifact | Path |
+| -------- | ---- |
+| Source videos | `data/train/*.mp4`, `data/eval/*.mp4` |
+| Extracted frames | `data/frames/{clip}/*.jpg` (+ `metadata.json`) |
+| Preprocess config | `config/clip_tiling.json` |
+| Preprocess probe report | `debug/preprocess_probe.json` |
+| Autolabel YOLO txt | `outputs/autolabel/labels/{train\|eval}/{clip}/*.txt` |
+| Autolabel images / debug | `outputs/autolabel/` (+ `debug/label_stats.json`) |
+| Dataset packs | `data/datasets/baseline_v0/`, `eval_autolabel/`, `eval_autolabel_adapted/` |
+| Train runs | `outputs/runs/…/weights/best.pt` |
+| Deliverable weights | `checkpoints/` (copy when ready) |
+| Eval metrics | `outputs/eval_autolabel/`, `outputs/eval_autolabel_adapted/` |
 
-Run from the repo root. For clip-scoped scripts, `NAME` is the video stem (e.g. `266987`) or a `.mp4` filename.
-
-
-| Script                | No extra args                                                                                                     | `--clip NAME` | Other useful flags                                                                                                       |
-| --------------------- | ----------------------------------------------------------------------------------------------------------------- | ------------- | ------------------------------------------------------------------------------------------------------------------------ |
-| `extract_frames.py`   | All `.mp4` in `data/train/` and `data/eval/` → `data/frames/{clip}/`                                              | One clip only | —                                                                                                                        |
-| `probe_clips.py`      | All frame folders under `data/frames/` → updates `config/clip_tiling.json`                                        | One clip only | `--frames N` (default 5 middle frames)                                                                                   |
-| `autolabel_yworld.py` | All clips with frames **and** a matching `.mp4` in `data/train` or `data/eval`                                    | One clip only | —                                                                                                                        |
-| `train.py`            | Build dataset if missing, train 15 epochs, full-frame val, copy `best.pt` → `checkpoints/yolov8n_vehicle_best.pt` | —             | `--prepare-only` (dataset only, no training); `--recreate-dataset` (force rebuild `outputs/dataset/`)                    |
-| `evaluate.py`         | Default eval clips per band (`13722965…`, `266987`), default weights, metrics + prediction videos                 | —             | `--no-video` (metrics only); `--weights PATH`; `--clips A B`; `--conf FLOAT` (else per-clip threshold from probe config) |
-
-
-**Typical full run** (all clips, end to end):
-
-```bash
-python src/extract_frames.py
-python src/probe_clips.py
-python src/autolabel_yworld.py
-python src/train.py
-python src/evaluate.py
-```
-
-**Single-clip iteration** (to re-label one video):
-
-```bash
-python src/extract_frames.py --clip NAME
-python src/probe_clips.py --clip NAME
-python src/autolabel_yworld.py --clip NAME
-```
+Manual / CVAT paths → **[GUIDELINE.md](GUIDELINE.md)**.
 
 ---
 
+## 1. Config generation (`clip_tiling.json`)
 
-
-## 3. Probe: distance, tiles & confidence
-
-`probe_clips.py` runs after frame extraction and before labeling. For each clip it finds the **minimum SAHI tile count** that detects a car, estimates **distance**, and sets the **label confidence threshold**. Output: `config/clip_tiling.json`.
+`python src/data/preprocess_clips.py` (alias: `probe_clips.py`) probes each clip with **YOLO-World** and writes `config/clip_tiling.json`. Autolabel, train, and eval all read that file (tiles, `frame_step`, distance band, skip).
 
 ### How it works
 
-1. Take 5 middle frames from the clip.
-2. Try tile candidates: `1 → 2 → 3 → 4 → 6 → 8 → 12`. Stop at the **first** level with a `car` hit (`person` counts as `car` during probe only).
-3. On the hit frame, take the **largest** `car`/`person` detection and estimate distance from it.
-4. Write per-clip config (tiles, overlap, threshold, `distance_m`, band).
+1. Sample **3 frames from start, middle, end** of each clip (9 frames total).
+2. Try tile candidates `1 → 2 → 3 → 4 → 6 → 8 → 12`. First **car** hit (`person` → car during probe only) = `probe_min_tiles`.
+3. `target_tiles` = next candidate (+1 headroom). Threshold / overlap follow `target_tiles`.
+4. Detail pass: car-only sizes & distances per segment; `distance_varies` if bands differ or start↔end size changes ≥30%.
+5. Motion: match cars on consecutive frames → `speed_px_per_frame`.
+6. `frame_step = floor(object_size_px_median × 0.5 / speed)` (min 1). Suggests `train_groups` from size.
 
-If no tile level finds a car: **fallback** to 12 tiles @ threshold 0.1. Detailed log: `debug/tile_probe.json`.
+Fallback if no car: **12 tiles** @ threshold 0.1.
 
-### Distance
+### Distance (metres from a standard car)
 
-Pinhole model with **assumed passenger-car length (4.5 m)** — only detections tagged `car` or `person` are used:
+There is no altimeter on these stock clips. Range is inferred from **bbox size** under a pinhole camera, assuming a **standard passenger-car length of 4.5 m** (the long side of the box ≈ that length in top-down view):
 
 ```
 distance_m = 4.5 m × focal_px / bbox_long_side_px
 ```
 
-Probe accepts only `car` and `person` (aliased to `car`). A `truck`, `bus`, or other class is **not** used for this estimate even if YOLO-World sees it elsewhere in the pipeline.
+`focal_px` comes from an assumed **24 mm** lens. Sensor defaults: 1-inch (4K / 1080p) or 1/2.3″ (SD). Override per clip with `calibration/{clip}.json` (`focal_length_mm`, sensor size, or `vertical_fov_deg`).
 
-- `focal_px` from inferred camera model (resolution tier → sensor size, 24 mm focal default — common for DJI)
-- Optional per-clip override: `calibration/{clip_name}.json`
+Clip-level `distance_m` is the **largest** probed car (else the median of all car boxes). That value is then binned:
 
-One estimate per clip from the largest `car`/`person` box on the probe hit frame. Approximate — useful for band assignment, not precise geolocation. A clip can span different ranges across its duration.
+| `distance_m` | Stored band | Eval column |
+| -----------: | ----------- | ----------- |
+| &lt; 200 | `<200m` | **0–200 m** |
+| 200–400 | `>200m` | **200–400 m** |
+| ≥ 400 | `>400m` | (no eval clip in this PoC) |
 
-Distance assigns a **band** and is stored as `distance_m`; it is not a hard filter during labeling.
+So the 200 m / 400 m cuts are **not** GPS altitude — they are “how far would this box be if it were a 4.5 m car.” Eval uses one clip per band (`13722965…` ≈ 95 m, `266987` ≈ 295 m).
 
-### Tiles
-
-More tiles → smaller slices → larger objects per tile. Far / small cars need more tiles.
-
+### Tiles & confidence
 
 | Tiles | Typical band | Overlap |
 | ----- | ------------ | ------- |
-| 1     | <200 m       | 0       |
-| 2–7   | >200 m       | 0.10    |
-| ≥8    | >400 m       | 0.05    |
-
-
-
-
-### Confidence threshold
+| 1     | &lt;200 m    | 0       |
+| 2–7   | &gt;200 m    | 0.10    |
+| ≥8    | &gt;400 m    | 0.05    |
 
 ```
-tiles = 1   →  0.50
-tiles > 1   →  max(0.05, 0.50 / tiles)
+tiles = 1   →  conf 0.50
+tiles > 1   →  conf max(0.05, 0.50 / tiles)
 ```
 
-Examples: 2 tiles → 0.25, 4 → 0.125, 12 → 0.05 (floor).
+Autolabel uses these `target_tiles` / overlap / conf. Train/eval crops use `train_groups` (object-size bands), not the probe tile count:
+
+| Median car long-side | Group | Crop |
+| -------------------- | ----- | ---- |
+| ≥ 80 px | `A_close` | full frame, letterbox to 1024 |
+| 32–80 px | `B_medium` | tile 1024 @ 0.2 overlap |
+| &lt; 32 px | `C_far` | skipped (`MIN_USABLE_OBJECT_PX`) |
 
 ### Probe-only alias
 
-YOLO-World often tags top-down cars as `person` (known COCO quirk). During **probe only**, `person → car` is accepted for tile search and the 4.5 m distance estimate. At autolabel time all vehicle types (`truck`, `bus`, …) are detected, but probe distance/bands still come from `car`/`person` only.
-
-### Probe results per clip
-
-
-| Split | Clip                          | Tiles | Threshold | Est. distance (probe) | Band   |
-| ----- | ----------------------------- | ----- | --------- | --------------------- | ------ |
-| eval  | `13722965_2160_3840_30fps`    | 1     | 0.50      | ~118 m                | <200 m |
-| eval  | `266987` *                    | 2     | 0.25      | ~379 m                | >200 m |
-| train | `3405804-uhd_3840_2160_30fps` | 1     | 0.50      | ~134 m                | <200 m |
-| train | `8457857-uhd_3840_2160_24fps` | 1     | 0.50      | ~203 m                | >200 m |
-| train | `8968356-hd_1920_1080_30fps`  | 2     | 0.25      | ~371 m                | >200 m |
-| train | `5382494-uhd_3840_2160_24fps` | 2     | 0.25      | ~729 m                | >400 m |
-
-
- `266987.mp4` added to eval manually — original spec had only one eval clip at <200 m.
-
----
-
-
-
-## 5. Why YOLO-World for pseudo-labeling
-
-YOLO-World (`yolov8x-worldv2.pt`) is the pseudo-labeler for probe and autolabel.
-
-**Why not a plain YOLO or a VLM detector?**
-
-
-| Option               | Issue for this task                                                       |
-| -------------------- | ------------------------------------------------------------------------- |
-| Fixed-class YOLO     | Needs labeled aerial data upfront                                         |
-| Grounding DINO / OWL | Slower; heavier for thousands of frames                                   |
-| **YOLO-World**       | Open-vocabulary, works on aerials out of the box, faster than DINO or OWL |
-
-
-Vehicle classes queried at label time: `car`, `truck`, `pickup`, `bus`, `van`, `motorcycle`. Final YOLO labels are a single class `vehicle` (id=0); subclass name is kept only in the debug cache.
-
-**Caveat:** quality on top-down drone footage is still limited. Fine-tuning YOLOv8n on these pseudo-labels is the step that adapts the model to our domain.
-
----
-
-
-
-## 6. Labeling workflow
-
-`autolabel_yworld.py` reads `config/clip_tiling.json` and processes every frame in the clip.
-
-**Runtime:** full labeling pass on all 6 clips — **51 min 30 sec** (wall time, MPS).
-
-### Detection mode (from probe)
-
-
-| `target_tiles` | Mode                                                                              |
-| -------------- | --------------------------------------------------------------------------------- |
-| 1              | Full-frame `model.track` + ByteTrack                                              |
-| >1             | SAHI sliced inference (slice size from `compute_slice_size`, overlap from config) |
-
-
-Raw detections are cached per frame in `debug/{clip}/cache/`.
-
-### Label post-processing
-
-Post-processing is track-based — confidence alone is not enough on noisy aerial footage.
-
-
-| Step                    | What it does                                                                                                       |
-| ----------------------- | ------------------------------------------------------------------------------------------------------------------ |
-| **Per-frame dedup**     | Drop overlapping boxes on the same frame (IoU ≥ 0.99 or ≤2 px tolerance)                                           |
-| **IoU tracking**        | Link detections across frames (`TRACK_IOU_THRESHOLD = 0.3`)                                                        |
-| **Stable track filter** | Keep only tracks seen on ≥3 frames (`MIN_TRACK_FRAMES`)                                                            |
-| **Dip fill**            | Short runs below threshold inside a stable track are **filled** back in (≤2 frames)                                |
-| **Spike removal**       | Short above-threshold blips on otherwise empty tracks are **removed** (≤2 frames)                                  |
-| **Gap fill**            | Missing frames between two labeled frames on the same track are **filled** by copying the left bbox (≤2 frame gap) |
-| **Final dedup**         | Remove overlapping labels after gap fill                                                                           |
-| **Confidence cut**      | Apply per-clip threshold from `clip_tiling.json`                                                                   |
-
-
-
-
-### Outputs
-
-
-| Path                               | Content                          |
-| ---------------------------------- | -------------------------------- |
-| `labels/{split}/{clip}/*.txt`      | YOLO format, class `0`           |
-| `debug/{clip}/cache/*.json`        | Raw detections + tiling metadata |
-| `debug/{clip}/labels_debug.mp4`    | Visual QA video                  |
-| `debug/{clip}/confidence_hist.png` | Confidence distribution          |
-| `debug/label_stats.json`           | Aggregated stats across clips    |
-
-
-
-
-### Label counts
-
-After running `autolabel_yworld.py`:
-
-
-| Split | Clips | Labeled frames |
-| ----- | ----- | -------------- |
-| train | 4     | ~2465          |
-| eval  | 2     | ~1830          |
-
-
----
-
-
-
-## 7. Training
-
-`train.py` fine-tunes **YOLOv8n** on pseudo-labels — a straightforward fit, no custom architecture.
-
-
-| Setting     | Value                                                                              |
-| ----------- | ---------------------------------------------------------------------------------- |
-| Base model  | `yolov8n.pt`                                                                       |
-| Epochs      | 15 (PoC)                                                                           |
-| Train input | SAHI slices 512×512, overlap 0.2                                                   |
-| Val input   | Same 512×512 tiles (dataset only; `val=False` during train)                        |
-| Negatives   | Train: up to 2 empty tiles/frame; val: labeled tiles only                          |
-| Class       | `vehicle` (single class)                                                           |
-| Weights     | `outputs/runs/.../best.pt` → copied to `checkpoints/yolov8n_vehicle_best.pt` (git) |
-
-
-**Known limitation — fixed 512×512 tiles:** train and eval use one grid size for all clips. Autolabel did **not** use this: `target_tiles=1` clips were labeled **full-frame**; `target_tiles=2` used **~1018×1018** (1080p) or **~2036×2036** (4K). We kept 512 for **speed**, uniform YOLO `imgsz`, and disk — a deliberate shortcut, not matched to probe tiling. Better follow-up: per-clip `compute_slice_size` or a single size closer to labeling (~1024).
-
-**Observed run (M1 Pro, MPS, 512 tiles):** 15 epochs in **~1 h 34 min** (1.56 h wall time). Fused model: **73 layers**, **~3.0M parameters**, **8.1 GFLOPs**.
-
-**Train / val / eval alignment**
-
-
-| Stage                            | Input                                                      |
-| -------------------------------- | ---------------------------------------------------------- |
-| Train (`train.py`)               | fixed 512×512 tiles                                        |
-| Val (`train.py`)                 | tiled val set on disk; **per-epoch val off** (`val=False`) |
-| Reported metrics (`evaluate.py`) | 512×512 tiles → merged to full frame                       |
-
-
-`best.pt` is the last epoch checkpoint when `val=False`. Use `evaluate.py` for reported band metrics.
-
-See **§2** for `train.py` flags (`--prepare-only`, `--recreate-dataset`).
-
----
-
-
-
-## 8. Evaluation & metrics
-
-`evaluate.py` compares the fine-tuned detector against pseudo-labels in `labels/eval/`, **one clip per distance band**.
-
-**Inference:** each frame is sliced into **512×512 tiles with 0.2 overlap** (same as `train.py`), detections mapped back to full-frame coordinates, NMS-merged, matched at IoU 0.5. Same **512 mismatch vs autolabel** as training (see §7).
-
-Each eval video is treated as a **single fixed band** from probe (`clip_tiling.json`) — e.g. the whole `13722965…` clip is 0–200 m, the whole `266987` clip is 200–400 m. Metrics do **not** recompute distance per frame or per car.
-
-**Reference clips:**
-
-
-| Band      | Clip                       | Probe band |
-| --------- | -------------------------- | ---------- |
-| 0–200 m   | `13722965_2160_3840_30fps` | <200 m     |
-| 200–400 m | `266987` *(see §3)*        | >200 m     |
-
-
-Matching at IoU 0.5. GT is pseudo-labels, not human annotation — metrics measure agreement with the YOLO-World labeling pipeline, not absolute ground truth.
-
-**Prediction videos:** for each eval clip, `evaluate.py` writes an overlay to `outputs/eval_videos/{clip}_predictions.mp4` (**Git LFS**, committed with the repo). Metrics use only labeled frames; the video runs over all extracted frames. See **§2** for `--no-video`, `--weights`, `--clips`, `--conf`.
+During **preprocess only**, `person → car` for tile search / size / distance (aerial YOLO-World often tags top-down cars as people). Autolabel does **not** use that alias — it uses vehicle text prompts.
 
 ```bash
-python src/evaluate.py              # metrics + videos (default clips & weights)
-python src/evaluate.py --no-video   # metrics only, faster
+python src/data/preprocess_clips.py
 ```
 
+Rough object sizes from preprocess (also drive `frame_step` and the skip):
 
+| Clip (short) | Median px | Typical `frame_step` | Band |
+| ------------ | --------: | -------------------: | ---- |
+| `13722965…` (eval, close) | ~369 | 19 | 0–200 m |
+| `3405804…` | ~137 | 18 | &lt;200 m |
+| `266987` (eval, mid) | ~133 | 3 | 200–400 m |
+| `8457857…` | ~108 | 5 | &lt;200 m |
+| `5382494…` | ~53 | 9–14 | &lt;200 m |
+| `8968356…` (**skipped**) | ~17 | — | — |
 
-### Results
+### Rejected video (decision after probe)
 
-Fine-tuned `yolov8n_vehicle` on M1 Pro (MPS). **512×512** tiled train + eval (`evaluate.py`, 2026-07-09). Known tile-size mismatch vs autolabel (§7).
+Preprocess **always probes every clip**. If median car size is **&lt; 32 px** (`MIN_USABLE_OBJECT_PX`), it writes `"skip": true` into `clip_tiling.json`. Downstream steps (autolabel / train / eval) then honor that flag.
 
+**Why we skip instead of training a far band:** under limited PoC time we do not want to spend labeling and training budget on a domain that matches **neither** the rest of train nor eval. Clip **`8968356-hd_1920_1080_30fps`** (~17 px on 1080p) is that case — tiny blobs, different scale from close/mid clips, and tiling cannot invent missing pixels. Far group `C_far` stays empty on purpose. Force a skipped clip later with `--include-skipped` on autolabel/train if needed.
 
-| Metric                      | 0–200 m | 200–400 m |
-| --------------------------- | ------- | --------- |
-| Detection rate TP/(TP+FN)   | 12.1%   | 19.4%     |
-| Precision TP/(TP+FP)        | 7.7%    | 58.6%     |
-| False alarms / min          | 6137.25 | 311.53    |
-| Time to first detection (s) | 0.03    | 2.20      |
-| [mAP@0.5](mailto:mAP@0.5)   | 3.3%    | 12.7%     |
+---
 
+## 2. Autolabel (YOLO-World)
 
-0–200 m band: higher recall than full-frame eval (~2.6%) but very low precision (many duplicate FPs across overlapping 512 tiles). 200–400 m band: more balanced. GT = pseudo-labels only.
+### Why YOLO-World
 
-Full report: `outputs/metrics_table.md`, `outputs/eval_metrics.json`.
+Open-vocabulary detector (`yolov8x-worldv2.pt`) with **vehicle text prompts** (car, truck, bus, … — no trailers / bikes / pedestrians). It fits this PoC because:
 
-## 9. Ideas for improvement
+1. **Same model** already drives preprocess (tiles / size / `frame_step`).
+2. No labeled data needed up front — bootstrap boxes for every `frame_step` frame.
+3. Single class `0 = vehicle` after collapsing prompts.
 
-- **Probe-aligned tile size** — Replace fixed 512×512 with  common size ~1024 so train/eval match autolabel SAHI/grid. Or improve validation as validation videos are bigger on pixels-per-car than our train videos.
-- **Confirmed-only train tiles** — Keep empty tiles (negatives) and tiles where every label is confirmed via cache confidence + stable track; drop tiles with borderline or slice-boundary boxes.
-- **Confidence-weighted training** — Keep uncertain tiles but down-weight their loss by confidence and track metadata instead of dropping them outright.
+Output: `outputs/autolabel/` (labels + images). Used as training labels for this PoC.
 
+```bash
+python src/labeling/autolabel.py                  # all non-skipped clips
+python src/labeling/autolabel.py --clip 266987   # one clip
+```
+
+Example wall time (full run): **Done in 10m 45s.** Stats: `outputs/autolabel/debug/label_stats.json`.
+
+---
+
+## 3. Train YOLO11s & metrics
+
+Fine-tune **YOLO11s** (`yolo11s.pt`) in two stages. Crops follow `train_groups` in `clip_tiling.json` (letterbox to `train_imgsz`, typically 1024). Aug: HSV + flips + degrees=180; mosaic off for the main run.
+
+| Stage | What trains | Default (full) | `--prototype` (fast PoC) |
+| ----- | ----------- | -------------: | -----------------------: |
+| 1 | Detect **head** only (backbone frozen, `freeze=11`) | 5 epochs | **2** epochs |
+| 2 | **Full model** (backbone + head unfrozen, lower LR) | 20 epochs | **5** epochs |
+| | Early-stop patience on val | 7 | **3** |
+
+PoC uses `--prototype`: short run, but Stage 2 still fine-tunes the **backbone**.
+
+**PoC path (autolabel):**
+
+```bash
+python src/training/prepare_baseline.py --from-autolabel   # → data/datasets/baseline_v0/
+python -u src/training/train.py --dataset-dir data/datasets/baseline_v0 --prototype
+# runs → outputs/runs/yolo11s_vehicle_stage1/ then …/yolo11s_vehicle/
+# best → outputs/runs/yolo11s_vehicle/weights/best.pt (also copied to checkpoints/)
+```
+
+Override any schedule piece with `--warmup-epochs`, `--epochs`, `--patience` (omit `--prototype` for the longer 5+20 default).
+
+`prepare_baseline.py` tiles with `frame_step` + `train_groups`, no prepare-time balance/rotations.
+
+### Prototype run (2026-08-12, MPS M1 Pro)
+
+Command: `--dataset-dir data/datasets/baseline_v0 --prototype`  
+Pack: 403 train / 71 val images (holdout from train videos; autolabel GT), imgsz 1024, batch 8.
+
+| Stage | Wall time | Val (best / end) |
+| ----- | --------: | ---------------- |
+| 1 — head only, 2 ep | ~2.7 min (0.045 h) | mAP50 **0.537**, P 0.61, R 0.57 |
+| 2 — full (backbone), 5 ep | ~10 min (0.167 h) | best @ ep4: mAP50 **0.748**, mAP50-95 **0.398**, P 0.75, R 0.67 |
+| **Total** | **~13 min** | deliverable: `checkpoints/yolo11s_vehicle_best.pt` |
+
+Stage 2 per-epoch val mAP50: 0.72 → 0.70 → 0.60 → **0.75** → 0.77 (best checkpoint is ep4 by Ultralytics fitness / mAP50-95).
+
+**Fixed eval pack** (same tiling, eval clips only — reuse for every experiment):
+
+```bash
+python src/training/prepare_eval.py --from-autolabel   # → data/datasets/eval_autolabel/
+```
+
+After `frame_step`, each clip is capped at **64** evenly spaced frames by default (`--max-frames-per-clip`). That thins long/fast clips (e.g. `266987` step=3 → hundreds of near-duplicates) without changing preprocess or other videos under the cap. Use `--max-frames-per-clip 0` for no cap.
+
+**Scale-adapted eval pack** (diagnostic — make close cars *look* smaller to the model): native close-band cars are ~49 px in-network after letterbox vs ~23–30 px on train. Whole-image resize does **not** help (letterbox cancels it). Instead we **pad** onto a larger gray canvas so letterbox actually shrinks cars toward the train band median:
+
+```bash
+python src/training/prepare_eval.py --from-autolabel              # native first
+python src/training/prepare_eval.py --from-autolabel --scale-adapt  # copy native, pad only oversized clips
+# → data/datasets/eval_autolabel_adapted/ (same stems; mid-band unchanged)
+```
+
+What `--scale-adapt` does:
+
+| Step | Detail |
+| ---- | ------ |
+| Source | **Copies** `eval_autolabel/` (or `eval_manual/`) — same frames/stems |
+| Reference | Median vehicle short-side **after letterbox to imgsz** from `baseline_v0/train` (per distance band) |
+| Per clip | `shrink = clamp(train_net_px / eval_net_px, 0.25, 1.0)` — **only shrink** |
+| Changed clips | Center-paste onto larger canvas (pad 114); labels remapped |
+| Unchanged clips | Byte-copied (e.g. mid-range `266987`) → **identical mid-band scores** |
+
+### Evaluate
+
+Scores the prepared pack (not live re-tiling). Default GT = native autolabel pack:
+
+```bash
+python src/training/evaluate.py                          # → outputs/eval_autolabel/
+python src/training/evaluate.py --gt autolabel           # same (native scale)
+python src/training/evaluate.py --gt autolabel_adapted   # scale-matched diagnostic
+```
+
+IoU 0.5 match on pack images (already tiled/cropped). Bands are the preprocess distance bins (4.5 m car → metres; see §1):
+
+| Band | Clip | Probe `distance_m` |
+| ---- | ---- | -----------------: |
+| 0–200 m | `13722965_2160_3840_30fps` | ~95 m |
+| 200–400 m | `266987` | ~295 m |
+
+### Eval runs (2026-08-12, MPS — after prototype train)
+
+Weights: `outputs/runs/yolo11s_vehicle/weights/best.pt`. Autolabel GT. Both packs share the **same 85 stems** (frame_step + cap 64); adapt only pads the close clip.
+
+**Native** (`eval_autolabel/`). Wall time **~16 s**.
+
+| Metric | 0–200 m | 200–400 m |
+| ------ | ------- | --------- |
+| Detection rate | 50.0% | 67.9% |
+| Precision | 21.7% | 66.7% |
+| False alarms / min | 5179.59 | 899.97 |
+| Time to first det (s) | 0.03 | 0.03 |
+| mAP@0.5 | 12.2% | 48.2% |
+| mAP@0.5:0.95 | 6.9% | 10.7% |
+
+**Scale-adapted** (`eval_autolabel_adapted/`, pad close clip only). Wall time **~20 s**.
+
+| Metric | 0–200 m | 200–400 m |
+| ------ | ------- | --------- |
+| Detection rate | 87.2% | 67.9% |
+| Precision | 31.8% | 66.7% |
+| False alarms / min | 5363.27 | 899.97 |
+| Time to first det (s) | 0.03 | 0.03 |
+| mAP@0.5 | 42.5% | 48.2% |
+| mAP@0.5:0.95 | 24.7% | 10.7% |
+
+Mid-band matches exactly (unchanged video). Close-band gains are from scale pad. Reports: `outputs/eval_autolabel/`, `outputs/eval_autolabel_adapted/`.
+
+---
+
+## Further reading
+
+**[GUIDELINE.md](GUIDELINE.md)** — CVAT labels, dataset ablations, experiment rounds.

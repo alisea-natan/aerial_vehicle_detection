@@ -1,10 +1,24 @@
 # Pinned for reproducible PoC results.
+# Python: use 3.12 (see .python-version). Supported range for these pins: >=3.10, <=3.14.
+# Create venv: python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt
 opencv-python==4.13.0.92
 ultralytics==8.4.62
-sahi==0.12.1
+sahi==0.12.5
 matplotlib==3.10.7
 numpy==2.2.6
 lap==0.5.13
 PyYAML==6.0.3
 torch==2.12.0
 torchvision==0.27.0
+
+# YOLO-World / Ultralytics text encoder (OpenAI CLIP fork).
+# ultralytics installs this on first World-model use; pin so fresh venvs work offline-ish.
+clip @ git+https://github.com/ultralytics/CLIP.git@488e81a6711eea7346872b46ea928b367da8889d
+ftfy==6.3.1
+regex==2026.7.19
+
+# Load .env (CVAT_*, ROBOFLOW_*, …)
+python-dotenv==1.1.1
+
+# Optional: CVAT export (src/labeling/cvat/cvat_pull.py). Pin near your server (2.70.x).
+cvat-sdk==2.70.0

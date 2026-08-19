@@ -8,7 +8,7 @@ import re
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from config import PROJECT_ROOT, PROBE_CLASS_ALIASES, RAW_CONFIDENCE_THRESHOLD, overlap_for_tiles
+from common.config import PROJECT_ROOT, PROBE_CLASS_ALIASES, RAW_CONFIDENCE_THRESHOLD, overlap_for_tiles
 from sahi.predict import get_sliced_prediction
 
 if TYPE_CHECKING:
@@ -28,7 +28,10 @@ DEFAULT_FOCAL_LENGTH_MM = 24.0
 def device() -> str:
     import torch
 
-    return "mps" if torch.backends.mps.is_available() else "cpu"
+    # Prefer MPS when the backend is built and usable (not deprecated torch.has_mps).
+    if torch.backends.mps.is_built() and torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
 
 
 def compute_slice_size(width: int, height: int, target_tiles: int) -> tuple[int, int]:
@@ -128,9 +131,13 @@ def detect_frame_sahi(
     overlap_ratio: float,
     *,
     default_subclass: str = "vehicle",
+    enhance: bool = False,
 ) -> list[dict]:
+    from common.image_enhance import inference_source
+
+    source = inference_source(image_path, enhance=enhance)
     result = get_sliced_prediction(
-        str(image_path),
+        source,
         model,
         slice_height=slice_h,
         slice_width=slice_w,
@@ -154,10 +161,15 @@ def detect_frame_probe(
     label_threshold: float,
     detection_class: str,
     device_name: str,
+    *,
+    enhance: bool = False,
 ) -> list[dict]:
+    from common.image_enhance import inference_source
+
+    source = inference_source(frame_path, enhance=enhance)
     if target_tiles <= 1:
         result = ultra_model.predict(
-            str(frame_path),
+            source,
             conf=RAW_CONFIDENCE_THRESHOLD,
             verbose=False,
             device=device_name,
@@ -169,7 +181,7 @@ def detect_frame_probe(
     overlap = overlap_for_tiles(target_tiles)
     slice_h, slice_w = compute_slice_size(width, height, target_tiles)
     result = get_sliced_prediction(
-        str(frame_path),
+        source,
         model,
         slice_height=slice_h,
         slice_width=slice_w,

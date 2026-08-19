@@ -1,5 +1,26 @@
 #!/usr/bin/env python3
-"""Pseudo-label frames with YOLO-World (step 3: needs config from probe_clips.py)."""
+"""YOLO-World autolabel demo on preprocess frame_step frames only.
+
+Not training GT. Writes under outputs/autolabel/ (never into labels/).
+Requires: python src/data/preprocess_clips.py
+"""
+from __future__ import annotations
+
+import sys
+from pathlib import Path as _Path
+
+def _ensure_src_on_path() -> None:
+    """Allow `python src/<pkg>/….py` without PYTHONPATH."""
+    p = _Path(__file__).resolve().parent
+    while p != p.parent:
+        if (p / "common").is_dir() and (p / "labeling").is_dir():
+            s = str(p)
+            if s not in sys.path:
+                sys.path.insert(0, s)
+            return
+        p = p.parent
+
+_ensure_src_on_path()
 
 import argparse
 import json
@@ -8,32 +29,50 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from config import PROJECT_ROOT, build_split_map, iter_autolabel_clips
 
-DEBUG_DIR_REL = Path("debug")
-PLOT_CACHE_DIR = PROJECT_ROOT / DEBUG_DIR_REL / ".matplotlib_cache"
-PLOT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-os.environ.setdefault("MPLCONFIGDIR", str(PLOT_CACHE_DIR))
-os.environ.setdefault("XDG_CACHE_HOME", str(PLOT_CACHE_DIR))
+from common.config import (
+    PROJECT_ROOT,
+    build_split_map,
+    iter_autolabel_clips,
+    reject_if_clip_skipped,
+)
 
-FRAMES_DIR = Path("data/frames")
-LABELS_DIR = Path("labels")
+OUTPUT_ROOT = PROJECT_ROOT / "outputs" / "autolabel"
+LABELS_DIR = OUTPUT_ROOT / "labels"
+DEBUG_DIR = OUTPUT_ROOT / "debug"
+PLOT_CACHE_DIR = DEBUG_DIR / ".matplotlib_cache"
+
+
+def _configure_plot_cache() -> None:
+    PLOT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    os.environ.setdefault("MPLCONFIGDIR", str(PLOT_CACHE_DIR))
+    os.environ.setdefault("XDG_CACHE_HOME", str(PLOT_CACHE_DIR))
+
 
 import cv2
 import numpy as np
-from sahi import AutoDetectionModel
 
-from config import (
+from common.config import (
     CLIP_TILING_CONFIG_PATH,
     RAW_CONFIDENCE_THRESHOLD,
     load_clip_tile_config,
     resolve_clip_tile_config,
 )
-from detect import MODEL_NAME, build_yolo_world, compute_slice_size, detect_frame_sahi, device
+from common.detect import MODEL_NAME, build_yolo_world, compute_slice_size, detect_frame_sahi, device
 
-# --- final-run YOLO-World config ---
-VEHICLE_CLASSES = ["car", "truck", "pickup", "bus", "van", "motorcycle"]
-# VEHICLE_CLASSES = ["car roof", "top-down view of a car", "truck from above", "vehicle from above", "bus roof", "motorcycle from above"]
+# YOLO-World text prompts → collapsed to class 0 = vehicle.
+# Matches project definition: self-propelled unit with an engine.
+# Do NOT prompt for trailers, bicycles, pedestrians, animals, etc.
+VEHICLE_PROMPTS = [
+    "car",
+    "truck",
+    "pickup",
+    "bus",
+    "van",
+    "motorcycle",
+    "scooter",
+    "moped",
+]
 TRACK_IOU_THRESHOLD = 0.3  # lightweight IoU tracking after SAHI
 DEVICE = device()
 
@@ -43,21 +82,68 @@ MAX_THRESHOLD_DIP_FRAMES = 2
 MAX_THRESHOLD_SPIKE_FRAMES = 2
 DEDUPE_COORD_TOLERANCE_PX = 2.0
 
-# Set to a small integer for a quick smoke run, or None for final pre-labeling.
+# Set to a small integer for a quick smoke run, or None for full step-subsampled run.
 LIMIT_FRAMES: int | None = None
 WRITE_DEBUG_VIDEO = True
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Pseudo-label vehicle frames with YOLO-World.",
+        description=(
+            "Demo autolabel with YOLO-World: only vehicle prompts, only frames "
+            "selected by preprocess frame_step. Outputs → outputs/autolabel/."
+        ),
     )
     parser.add_argument(
         "--clip",
         default=None,
         help="Process a single clip (video stem / folder name under data/frames).",
     )
+    parser.add_argument(
+        "--frame-step",
+        type=int,
+        default=None,
+        help="Override frame_step from clip_tiling.json (default: use preprocess value).",
+    )
+    parser.add_argument(
+        "--include-skipped",
+        action="store_true",
+        help="Also process clips marked skip=true in clip_tiling.json.",
+    )
+    parser.add_argument(
+        "--enhance",
+        action="store_true",
+        help="Experimental: CLAHE contrast boost before YOLO-World (see src/common/image_enhance.py).",
+    )
     return parser.parse_args()
+
+
+def select_frames_by_step(frame_paths: list[Path], frame_step: int) -> list[Path]:
+    """Keep every Nth extracted frame (N = frame_step from preprocess)."""
+    step = max(1, int(frame_step))
+    return frame_paths[::step]
+
+
+def resolve_frame_step(
+    clip_name: str,
+    tile_cfg: dict,
+    override: int | None,
+) -> int:
+    if override is not None:
+        if override < 1:
+            raise SystemExit(f"--frame-step must be >= 1, got {override}")
+        return int(override)
+    step = tile_cfg.get("frame_step")
+    if step is None:
+        raise SystemExit(
+            f"Clip {clip_name!r} has no frame_step in {CLIP_TILING_CONFIG_PATH}.\n"
+            f"Run: python src/data/preprocess_clips.py --clip {clip_name}\n"
+            "Or pass --frame-step N for a one-off demo."
+        )
+    step_i = int(step)
+    if step_i < 1:
+        raise SystemExit(f"Invalid frame_step={step!r} for clip {clip_name!r}")
+    return step_i
 
 
 def box_iou(box_a, box_b) -> float:
@@ -426,7 +512,7 @@ def save_labels(detections_by_frame: dict[str, list[dict]], out_dir: Path, width
 def cache_meta(tile_cfg: dict, slice_size: list[int] | None = None) -> dict:
     meta = {
         "model_name": MODEL_NAME,
-        "vehicle_classes": VEHICLE_CLASSES,
+        "vehicle_prompts": list(VEHICLE_PROMPTS),
         "model_confidence": RAW_CONFIDENCE_THRESHOLD,
         "target_tiles": tile_cfg["target_tiles"],
         "overlap_ratio": tile_cfg["overlap_ratio"],
@@ -451,14 +537,18 @@ def run_eval_fullframe_track(
     ultra_model,
     frame_paths: list[Path],
     t0: float,
+    *,
+    enhance: bool = False,
 ) -> tuple[dict[str, list[dict]], list[float]]:
+    from common.image_enhance import inference_source
+
     reset_ultralytics_tracker(ultra_model)
     raw_detections_by_frame = {}
     all_confidences = []
 
     for i, frame_path in enumerate(frame_paths):
         result = ultra_model.track(
-            str(frame_path),
+            inference_source(frame_path, enhance=enhance),
             persist=True,
             conf=RAW_CONFIDENCE_THRESHOLD,
             verbose=False,
@@ -477,12 +567,14 @@ def run_eval_fullframe_track(
 
 
 def run_fixed_sahi_detect(
-    model: AutoDetectionModel,
+    model,  # SAHI AutoDetectionModel / YOLO-World wrapper
     frame_paths: list[Path],
     width: int,
     height: int,
     tile_cfg: dict,
     t0: float,
+    *,
+    enhance: bool = False,
 ) -> tuple[dict[str, list[dict]], list[float], dict]:
     target_tiles = tile_cfg["target_tiles"]
     overlap_ratio = tile_cfg["overlap_ratio"]
@@ -491,7 +583,9 @@ def run_fixed_sahi_detect(
     all_confidences = []
 
     for i, frame_path in enumerate(frame_paths):
-        detections = detect_frame_sahi(model, frame_path, slice_h, slice_w, overlap_ratio)
+        detections = detect_frame_sahi(
+            model, frame_path, slice_h, slice_w, overlap_ratio, enhance=enhance
+        )
         raw_detections_by_frame[frame_path.stem] = detections
         all_confidences.extend(det["confidence"] for det in detections)
 
@@ -615,22 +709,30 @@ def summarize(all_detections: list[dict], label_threshold: float) -> dict:
 
 
 def process_clip(
-    model: AutoDetectionModel,
+    model,
     split: str,
     clip_dir: Path,
-    root: Path,
     tile_config: dict[str, dict],
+    *,
+    frame_step_override: int | None = None,
+    enhance: bool = False,
 ) -> dict:
     clip_name = clip_dir.name
     metadata = json.loads((clip_dir / "metadata.json").read_text(encoding="utf-8"))
     width, height = metadata["width"], metadata["height"]
 
-    frame_paths = sorted(clip_dir.glob("*.jpg"))
+    all_frame_paths = sorted(clip_dir.glob("*.jpg"))
+    tile_cfg = resolve_clip_tile_config(clip_name, tile_config)
+    frame_step = resolve_frame_step(clip_name, tile_cfg, frame_step_override)
+    frame_paths = select_frames_by_step(all_frame_paths, frame_step)
     if LIMIT_FRAMES is not None:
         frame_paths = frame_paths[:LIMIT_FRAMES]
 
-    tile_cfg = resolve_clip_tile_config(clip_name, tile_config)
     label_threshold = tile_cfg["label_confidence_threshold"]
+    enhance_note = ", CLAHE enhance ON" if enhance else ""
+    step_note = (
+        f"frame_step={frame_step} → {len(frame_paths)}/{len(all_frame_paths)} frames"
+    )
 
     if tile_cfg["uses_sahi"]:
         detection_mode = "sahi"
@@ -639,7 +741,7 @@ def process_clip(
             f"\n{split}/{clip_name}: {width}x{height}, "
             f"SAHI {tile_cfg['target_tiles']} tiles (overlap={tile_cfg['overlap_ratio']}, "
             f"band={tile_cfg['distance_band']}, label_conf>={label_threshold}) + IoU track, "
-            f"{len(frame_paths)} frames"
+            f"{step_note}{enhance_note}"
         )
         if tile_cfg["note"]:
             print(f"  note: {tile_cfg['note']}")
@@ -650,7 +752,7 @@ def process_clip(
             f"\n{split}/{clip_name}: {width}x{height}, "
             f"full-frame model.track + ByteTrack (band={tile_cfg['distance_band']}, "
             f"label_conf>={label_threshold}), "
-            f"{len(frame_paths)} frames"
+            f"{step_note}{enhance_note}"
         )
         if tile_cfg["note"]:
             print(f"  note: {tile_cfg['note']}")
@@ -660,7 +762,7 @@ def process_clip(
 
     if tile_cfg["uses_sahi"]:
         raw_detections_by_frame, all_confidences, tiling_stats = run_fixed_sahi_detect(
-            model, frame_paths, width, height, tile_cfg, t0
+            model, frame_paths, width, height, tile_cfg, t0, enhance=enhance
         )
         print(
             f"  tiling: {tiling_stats['target_tiles']} tiles, "
@@ -674,7 +776,7 @@ def process_clip(
             "slice_size": None,
         }
         raw_detections_by_frame, all_confidences = run_eval_fullframe_track(
-            model.model, frame_paths, t0
+            model.model, frame_paths, t0, enhance=enhance
         )
 
     frame_order = [frame_path.stem for frame_path in frame_paths]
@@ -704,8 +806,8 @@ def process_clip(
         f"-{label_deduped} deduped"
     )
 
-    labels_dir = root / LABELS_DIR / split / clip_name
-    cache_dir = root / DEBUG_DIR_REL / clip_name / "cache"
+    labels_dir = LABELS_DIR / split / clip_name
+    cache_dir = DEBUG_DIR / clip_name / "cache"
 
     label_files = save_labels(kept_detections_by_frame, labels_dir, width, height)
     cache_files = save_raw_detections_cache(
@@ -721,7 +823,7 @@ def process_clip(
     save_confidence_histogram(
         all_confidences,
         clip_name,
-        root / DEBUG_DIR_REL / clip_name / "confidence_hist.png",
+        DEBUG_DIR / clip_name / "confidence_hist.png",
         label_threshold,
     )
     if WRITE_DEBUG_VIDEO:
@@ -729,7 +831,7 @@ def process_clip(
             raw_detections_by_frame,
             frame_paths,
             metadata,
-            root / DEBUG_DIR_REL / clip_name / "labels_debug.mp4",
+            DEBUG_DIR / clip_name / "labels_debug.mp4",
             label_threshold,
         )
 
@@ -744,12 +846,16 @@ def process_clip(
         "tile_config": tile_cfg,
         "slice_size": tiling_stats.get("slice_size"),
         "tiling_stats": tiling_stats,
+        "frame_step": frame_step,
+        "frames_total_extracted": len(all_frame_paths),
         "frames_processed": len(frame_paths),
+        "vehicle_prompts": list(VEHICLE_PROMPTS),
         "started_at": started_at,
         "finished_at": finished_at,
         "elapsed_seconds": round(elapsed_sec, 2),
         "elapsed_human": format_duration(elapsed_sec),
         "seconds_per_frame": round(elapsed_sec / len(frame_paths), 3) if frame_paths else 0.0,
+        "enhance_clahe": bool(enhance),
         **track_stats,
     })
     print(f"  kept={stats['kept']}/{stats['total_detections']} ({stats['pct_dropped']}% dropped)")
@@ -758,50 +864,75 @@ def process_clip(
 
 
 def main() -> None:
+    _configure_plot_cache()
     args = parse_args()
     clip_filter = args.clip
     if clip_filter and clip_filter.endswith(".mp4"):
         clip_filter = Path(clip_filter).stem
 
-    root = PROJECT_ROOT
-    split_map = build_split_map(root)
-    clips = iter_autolabel_clips(split_map, clip_filter=clip_filter)
+    split_map = build_split_map(PROJECT_ROOT)
+    if clip_filter:
+        reject_if_clip_skipped(clip_filter, allow_skipped=args.include_skipped)
+    clips = iter_autolabel_clips(
+        split_map,
+        clip_filter=clip_filter,
+        include_skipped=args.include_skipped,
+    )
     if not clips:
         if clip_filter:
             raise SystemExit(
                 f"No frames found for clip {clip_filter!r}. "
                 "Expected data/frames/{clip}/ with metadata.json and .jpg frames."
             )
-        raise SystemExit("No clips found. Expected data/frames/* plus matching .mp4 stems in data/train or data/eval.")
+        raise SystemExit(
+            "No clips found. Expected data/frames/* plus matching .mp4 stems "
+            "in data/train or data/eval."
+        )
 
     tile_config = load_clip_tile_config()
     if not tile_config:
         raise SystemExit(
             f"No clip tiling config at {CLIP_TILING_CONFIG_PATH}. "
-            "Run: python src/probe_clips.py"
+            "Run: python src/data/preprocess_clips.py"
         )
 
     print(
+        f"Demo autolabel → {OUTPUT_ROOT}\n"
         f"Loading {MODEL_NAME} on {DEVICE}, "
+        f"prompts={VEHICLE_PROMPTS}, "
         f"raw_confidence={RAW_CONFIDENCE_THRESHOLD}, "
-        f"per-clip label_confidence_threshold from config"
+        f"label_confidence_threshold + frame_step from {CLIP_TILING_CONFIG_PATH.name}"
     )
-    model, _ = build_yolo_world(VEHICLE_CLASSES)
+    model, _ = build_yolo_world(VEHICLE_PROMPTS)
 
     run_started_at = datetime.now().isoformat(timespec="seconds")
     run_t0 = time.perf_counter()
     clip_stats = {}
     for split, clip_dir in clips:
         key = f"{split}/{clip_dir.name}"
-        clip_stats[key] = process_clip(model, split, clip_dir, root, tile_config)
+        clip_stats[key] = process_clip(
+            model,
+            split,
+            clip_dir,
+            tile_config,
+            frame_step_override=args.frame_step,
+            enhance=args.enhance,
+        )
 
     run_elapsed_sec = time.perf_counter() - run_t0
     run_finished_at = datetime.now().isoformat(timespec="seconds")
-    stats_path = root / DEBUG_DIR_REL / "label_stats.json"
+    stats_path = DEBUG_DIR / "label_stats.json"
     stats_path.parent.mkdir(parents=True, exist_ok=True)
     stats_path.write_text(
         json.dumps(
             {
+                "demo": True,
+                "note": (
+                    "YOLO-World pseudo-labels on frame_step subsample only; "
+                    "not training GT. Class 0 = vehicle (self-propelled with engine)."
+                ),
+                "vehicle_prompts": list(VEHICLE_PROMPTS),
+                "output_root": str(OUTPUT_ROOT),
                 "run_started_at": run_started_at,
                 "run_finished_at": run_finished_at,
                 "run_elapsed_seconds": round(run_elapsed_sec, 2),
@@ -812,14 +943,17 @@ def main() -> None:
                 "max_threshold_dip_frames": MAX_THRESHOLD_DIP_FRAMES,
                 "max_threshold_spike_frames": MAX_THRESHOLD_SPIKE_FRAMES,
                 "clip_tiling_config_path": str(CLIP_TILING_CONFIG_PATH),
+                "frame_step_override": args.frame_step,
                 "clip_tile_config": tile_config,
                 "clips": clip_stats,
             },
             indent=2,
-        ) + "\n",
+        )
+        + "\n",
         encoding="utf-8",
     )
     print(f"\nDone in {format_duration(run_elapsed_sec)}. Stats: {stats_path}")
+    print("Training GT stays in labels/ (manual / CVAT). These outputs are demo-only.")
 
 
 if __name__ == "__main__":
