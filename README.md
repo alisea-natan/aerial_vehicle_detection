@@ -39,7 +39,7 @@ Frames live under `data/frames/{clip}/`. Manual GT: `labels/{train|eval}/{clip}/
 | --- | ---- |
 | **[PoC.md](PoC.md)** | Bootstrap: preprocess, YOLO-World autolabel, first YOLO11s train/eval (autolabel GT, imgsz 640) |
 | **[EVALUATION.md](EVALUATION.md)** | CVAT GT, pack / imgsz / model rounds, locked recipe |
-| **[RASPBERRY_PI.md](RASPBERRY_PI.md)** | Edge: prune / quantize / live camera on Pi 5 (skeleton; same mAP@0.5 goal) |
+| **[OPTIMISATION.md](OPTIMISATION.md)** | Edge: shared prune/imgsz, then Pi 5 (OpenVINO) and NVIDIA Windows (TensorRT) |
 
 ```mermaid
 flowchart LR
