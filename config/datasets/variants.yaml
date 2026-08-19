@@ -1,7 +1,7 @@
 # Dataset pack variants (local blobs under data/datasets/ — not git).
 # Settings in this file ARE git-tracked.
 #
-# Manual-label defaults: CVAT labels/, frame_step, imgsz 1024.
+# Manual-label defaults: CVAT labels/, frame_step, imgsz 640 (Ultralytics default).
 # Train protocol (yolo11s --prototype) lives in config/experiments/dataset_round.yaml.
 #
 #   python src/training/datasets/generate_variant.py --list
@@ -15,18 +15,18 @@ auto:
     A_close:
       tile_size: null
       overlap: 0.0
-      train_imgsz: 1024
+      train_imgsz: 640
     B_medium:
       tile_size: 1024
       overlap: 0.2
-      train_imgsz: 1024
+      train_imgsz: 640
     C_far:
       tile_size: 768
       overlap: 0.2
-      train_imgsz: 1024
+      train_imgsz: 640
 
 defaults:
-  imgsz: 1024
+  imgsz: 640
   val_fraction: 0.15
   seed: 42
   min_visible_ratio: 0.3
@@ -37,9 +37,12 @@ defaults:
   # Online aug at train time (dataset_round). Tiles on disk are never augmented.
   train_augmentation: poc
 
+# Round 2 ablation packs. Names are the recipe, not a count.
+# Tiling {auto, off} × sampling {full, strided}, empty tiles, clip balance.
+# imgsz is Round 1 (config/experiments/imgsz_round.yaml), not a pack variant.
 variants:
-  baseline_1:
-    description: "Reference — AUTO tiling, frame_step, CVAT labels, drop empty tiles"
+  auto:
+    description: "Reference — AUTO tiling, every frame_step frame, drop empty tiles"
     dataset: build
     tiling:
       mode: auto
@@ -48,54 +51,17 @@ variants:
     sampling:
       strategy: full
 
-  variant_2_no_tiling:
+  fullframe:
     description: "Full frame only; letterbox to imgsz at train time"
     dataset: build
     tiling:
-      mode: off
+      mode: "off"   # quoted — bare `off` parses as YAML boolean false → auto
       min_visible_ratio: 0.3
       keep_negative_tiles: false
     sampling:
       strategy: full
 
-  variant_3_tiling_fixed:
-    description: "Fixed tile 640 / overlap 0.1 (not AUTO) for all clips"
-    dataset: build
-    tiling:
-      mode: fixed
-      tile_size: 640
-      overlap: 0.1
-      min_visible_ratio: 0.3
-      keep_negative_tiles: false
-    sampling:
-      strategy: full
-
-  variant_4_low_overlap:
-    description: "AUTO tile sizes; overlap forced to 0.1; log multi-tile bbox duplicates"
-    dataset: build
-    tiling:
-      mode: auto
-      overlap_override: 0.1
-      min_visible_ratio: 0.3
-      keep_negative_tiles: false
-    sampling:
-      strategy: full
-    metrics:
-      log_multi_tile_bboxes: true
-
-  variant_5_aug:
-    description: "Same tiles as baseline_1; mosaic_hsv instead of PoC aug (train time only)"
-    dataset: reuse
-    reuse_from: baseline_1
-    train_augmentation: mosaic_hsv
-    tiling:
-      mode: auto
-      min_visible_ratio: 0.3
-      keep_negative_tiles: false
-    sampling:
-      strategy: full
-
-  variant_6_strided:
+  strided:
     description: "AUTO tiling; keep every 5th frame_step frame per clip"
     dataset: build
     tiling:
@@ -106,8 +72,19 @@ variants:
       strategy: strided
       stride: 5
 
-  variant_7_negatives:
-    description: "AUTO tiling; keep empty tiles at 15% of positive count"
+  fullframe_strided:
+    description: "No tiling + every 5th frame — tiling × time factorial cell"
+    dataset: build
+    tiling:
+      mode: "off"
+      min_visible_ratio: 0.3
+      keep_negative_tiles: false
+    sampling:
+      strategy: strided
+      stride: 5
+
+  strided_negatives:
+    description: "Stride 5 + empty tiles at 15% of positives — FA lever on the find-the-car pack"
     dataset: build
     tiling:
       mode: auto
@@ -115,4 +92,16 @@ variants:
       keep_negative_tiles: true
       negative_ratio: 0.15
     sampling:
-      strategy: full
+      strategy: strided
+      stride: 5
+
+  strided_clip_balanced:
+    description: "Stride 5, then cap each clip to the median clip's frame count"
+    dataset: build
+    tiling:
+      mode: auto
+      min_visible_ratio: 0.3
+      keep_negative_tiles: false
+    sampling:
+      strategy: clip_balanced
+      stride: 5

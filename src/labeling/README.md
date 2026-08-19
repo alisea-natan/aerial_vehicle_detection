@@ -1,7 +1,5 @@
 # Labeling guide
 
-Vehicle definition (what is / is not a vehicle) → **[README.md](../../README.md)**.
-
 Pipeline GT is always **`labels/{train|eval}/{clip}/*.txt`** (YOLO txt, empty file = no vehicles). Frames must match stems in `data/frames/{clip}/`. Use preprocess `frame_step` as annotation density.
 
 ```
@@ -40,9 +38,23 @@ python src/labeling/roboflow/import_roboflow_dataset.py --export-dir path/to/yol
 
 Helpers: `prepare_roboflow_test.py`, `prepare_roboflow_ui_8457857.py`, `retry_roboflow_annotations.py`, `deploy_roboflow.py`.
 
+### RF-DETR Nano (trial)
+
+Trained on Roboflow: **RF-DETR Object Detection (Nano)**, imgsz **1280×1280**, **3.15 credits**.
+
+Split: **441** train / **22** valid / **153** test (eval). Train clips `8457857`, `5382494`. Test = both eval videos.
+
+Roboflow **Valid Set (External)**:
+
+| mAP@50 | Precision | Recall | F1 |
+| -----: | --------: | -----: | -: |
+| 97.7% | 98.4% | 95.6% | 97.0% |
+
+Precision by split: valid **98%**, test (eval) **81%**.
+
 ## Autolabel (PoC bootstrap only)
 
-Not training GT. Writes `outputs/autolabel/` only.
+Not training GT. Writes `outputs/autolabel/` only. YOLO-World **imgsz 1280**. Per-frame conf + dedupe on `frame_step` subsample — no tracking (see [PoC.md](../../PoC.md) §2).
 
 ```bash
 python src/labeling/autolabel.py

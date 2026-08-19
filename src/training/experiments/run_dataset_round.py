@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
-"""Round 1 — dataset ablation (CVAT labels, PoC YOLO11s schedule).
+"""Round 2 — dataset ablation (CVAT labels, PoC YOLO11s schedule).
 
 No flags: full round from scratch (all packs).
 ``--resume``: skip finished, continue incomplete.
 
-Eval is always the same two packs (eval clips only, CVAT):
+Eval is always the same pack (eval clips only, CVAT):
   data/datasets/eval_manual
-  data/datasets/eval_manual_adapted
 
   python src/training/experiments/run_dataset_round.py
   python src/training/experiments/run_dataset_round.py --resume
-  python src/training/experiments/run_dataset_round.py --variant baseline_1
+  python src/training/experiments/run_dataset_round.py --variant auto
 """
 from __future__ import annotations
 
@@ -37,7 +36,7 @@ import time
 import traceback
 from pathlib import Path
 
-from common.config import PROJECT_ROOT
+from common.config import PROJECT_ROOT, TRAIN_IMGSZ
 from training.datasets.specs import resolve_labels_root, resolve_variant
 from training.experiments.common import (
     abs_runs_dir,
@@ -82,7 +81,7 @@ def parse_args() -> argparse.Namespace:
         help="Skip finished variants; continue incomplete train/eval only.",
     )
     parser.add_argument("--model", default=str(d.get("model") or "yolo11s.pt"))
-    parser.add_argument("--imgsz", type=int, default=int(d.get("imgsz") or 1024))
+    parser.add_argument("--imgsz", type=int, default=int(d.get("imgsz") or TRAIN_IMGSZ))
     parser.add_argument("--epochs", type=int, default=int(d.get("epochs") or 5))
     parser.add_argument("--warmup-epochs", type=int, default=int(d.get("warmup_epochs") or 2))
     parser.add_argument("--freeze", type=int, default=int(d.get("freeze") or 11))
@@ -136,7 +135,7 @@ def main() -> None:
 
     if args.list:
         print(
-            f"Protocol: {args.model} imgsz={args.imgsz} "
+            f"Protocol: {args.model} imgsz=per-pack (CLI default {args.imgsz}) "
             f"warmup={args.warmup_epochs} epochs={args.epochs} freeze={args.freeze} "
             f"patience={args.patience}"
         )
@@ -153,7 +152,8 @@ def main() -> None:
                 skip_eval=args.skip_eval,
             )
             print(
-                f"{vid}: {spec.description} (train_aug={spec.train_augmentation}) [{status}]"
+                f"{vid}: {spec.description} (train_aug={spec.train_augmentation}, "
+                f"imgsz={spec.imgsz}) [{status}]"
             )
         return
 
@@ -287,6 +287,8 @@ def main() -> None:
             try:
                 variant_started = utcnow()
                 variant_t0 = time.perf_counter()
+                train_imgsz = int(defaults.get("imgsz") or args.imgsz)
+                predict_kw = {"imgsz": train_imgsz}
                 train_result: dict
                 if args.resume and status == "train_done":
                     print(f"Resume {vid}: weights exist, running remaining evals")
@@ -295,7 +297,7 @@ def main() -> None:
                     train_result = run_train_job(
                         yaml_path=yaml_path,
                         model=args.model,
-                        imgsz=args.imgsz,
+                        imgsz=train_imgsz,
                         epochs=args.epochs,
                         warmup_epochs=args.warmup_epochs,
                         freeze=args.freeze,
@@ -323,6 +325,7 @@ def main() -> None:
                         runs_dir=args.runs_dir,
                         variant_id=vid,
                         dry_run=False,
+                        predict_kw=predict_kw,
                     )
                     train_result["evals"] = evals
                 train_result = attach_variant_timing(
@@ -357,7 +360,8 @@ def main() -> None:
         release_torch_memory()
         raise
 
-    _flush_summary()
+    if not is_round_worker():
+        _flush_summary()
 
 
 if __name__ == "__main__":

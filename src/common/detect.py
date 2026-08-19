@@ -8,7 +8,15 @@ import re
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from common.config import PROJECT_ROOT, PROBE_CLASS_ALIASES, RAW_CONFIDENCE_THRESHOLD, overlap_for_tiles
+from common.config import (
+    PROJECT_ROOT,
+    PROBE_DROP_OVERLAP_IOU,
+    PROBE_DROP_PROMPTS,
+    PROBE_KEEP_PROMPTS,
+    RAW_CONFIDENCE_THRESHOLD,
+    ULTRALYTICS_DEFAULT_IMGSZ,
+    overlap_for_tiles,
+)
 from sahi.predict import get_sliced_prediction
 
 if TYPE_CHECKING:
@@ -71,7 +79,11 @@ def parse_sahi_result(result, *, default_subclass: str = "") -> list[dict]:
     return detections
 
 
-def build_yolo_world(classes: list[str]) -> tuple["AutoDetectionModel", str]:
+def build_yolo_world(
+    classes: list[str],
+    *,
+    image_size: int | None = None,
+) -> tuple["AutoDetectionModel", str]:
     from sahi import AutoDetectionModel
 
     dev = device()
@@ -80,46 +92,50 @@ def build_yolo_world(classes: list[str]) -> tuple["AutoDetectionModel", str]:
         model_path=MODEL_NAME,
         confidence_threshold=RAW_CONFIDENCE_THRESHOLD,
         device=dev,
+        image_size=image_size,
     )
     model.model.set_classes(classes)
+    # SAHI snapshots COCO names at load (0=person). Refresh after set_classes
+    # so cls 0 is "car", not leftover COCO "person".
+    model.category_mapping = {str(i): name for i, name in enumerate(classes)}
     return model, dev
 
 
-def filter_probe_detections(
-    detections: list[dict],
-    primary_class: str,
-    label_threshold: float,
-    aliases: dict[str, str] | None = None,
-) -> list[dict]:
-    """Keep primary class and aliases (e.g. person counted as car); normalize tag to primary."""
-    aliases = aliases if aliases is not None else PROBE_CLASS_ALIASES
-    primary = primary_class.lower()
-    accepted = {primary, *aliases.keys()}
-    kept: list[dict] = []
-    for det in detections:
-        name = det["subclass_name"].lower()
-        if name not in accepted or det["confidence"] < label_threshold:
-            continue
-        normalized = aliases.get(name, name)
-        if normalized != primary:
-            continue
-        out = dict(det)
-        out["subclass_name"] = primary
-        if name != primary:
-            out["probe_matched_as"] = name
-        kept.append(out)
-    return kept
+def _xyxy_iou(a, b) -> float:
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+    if inter <= 0:
+        return 0.0
+    area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+    area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+    union = area_a + area_b - inter
+    return inter / union if union > 0 else 0.0
 
 
-def filter_detections(
+def filter_probe_car_detections(
     detections: list[dict],
-    detection_class: str,
     label_threshold: float,
+    keep_class: str = "car",
 ) -> list[dict]:
-    target = detection_class.lower()
-    return [
+    """Keep car boxes; drop those that overlap a drop-class (truck/bus/bike/person)."""
+    keep_names = {keep_class.lower(), *(name.lower() for name in PROBE_KEEP_PROMPTS)}
+    drop_names = {name.lower() for name in PROBE_DROP_PROMPTS}
+    cars = [
         det for det in detections
-        if det["subclass_name"] == target and det["confidence"] >= label_threshold
+        if det["subclass_name"].lower() in keep_names and det["confidence"] >= label_threshold
+    ]
+    distractors = [
+        det for det in detections
+        if det["subclass_name"].lower() in drop_names and det["confidence"] >= label_threshold
+    ]
+    if not distractors:
+        return cars
+    return [
+        det for det in cars
+        if all(_xyxy_iou(det["xyxy"], other["xyxy"]) < PROBE_DROP_OVERLAP_IOU for other in distractors)
     ]
 
 
@@ -171,11 +187,12 @@ def detect_frame_probe(
         result = ultra_model.predict(
             source,
             conf=RAW_CONFIDENCE_THRESHOLD,
+            imgsz=ULTRALYTICS_DEFAULT_IMGSZ,
             verbose=False,
             device=device_name,
         )[0]
-        return filter_probe_detections(
-            parse_ultralytics_result(result), detection_class, label_threshold
+        return filter_probe_car_detections(
+            parse_ultralytics_result(result), label_threshold, detection_class
         )
 
     overlap = overlap_for_tiles(target_tiles)
@@ -192,8 +209,8 @@ def detect_frame_probe(
         force_postprocess_type=True,
         verbose=0,
     )
-    return filter_probe_detections(
-        parse_sahi_result(result), detection_class, label_threshold
+    return filter_probe_car_detections(
+        parse_sahi_result(result), label_threshold, detection_class
     )
 
 

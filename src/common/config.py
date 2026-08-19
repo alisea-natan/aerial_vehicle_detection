@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from pathlib import Path
 
 from common.env import load_project_env
@@ -19,14 +18,25 @@ LABELS_DIR = PROJECT_ROOT / "labels"
 AUTOLABEL_LABELS_DIR = PROJECT_ROOT / "outputs" / "autolabel" / "labels"
 DEBUG_DIR = PROJECT_ROOT / "debug"
 CLIP_TILING_CONFIG_PATH = PROJECT_ROOT / "config" / "clip_tiling.json"
+PROBE_FRAMES_DIR = PROJECT_ROOT / "outputs" / "probe_frames"
 
 SPLITS = ("train", "eval")
 
 DEFAULT_DETECTION_CLASS = "car"
-# Aerial YOLO-World often tags top-down cars as person; treat as car during tile probe.
-PROBE_CLASS_ALIASES: dict[str, str] = {"person": "car"}
+# Probe distance assumes a 4.5 m passenger car. Prompt drop-classes so they
+# are not scored as car; size/distance still use keep boxes only.
+PROBE_KEEP_PROMPTS = ["car"]
+PROBE_DROP_PROMPTS = [
+    "truck",
+    "bus",
+    "trailer",
+    "motorcycle",
+    "bicycle",
+    "person",
+]
+PROBE_DROP_OVERLAP_IOU = 0.5
 RAW_CONFIDENCE_THRESHOLD = 0.05
-PROBE_MAX_LABEL_THRESHOLD = 0.5
+PROBE_MAX_LABEL_THRESHOLD = 0.2
 DEFAULT_OVERLAP = 0.10
 FAR_OVERLAP = 0.05
 FALLBACK_TILES = 12
@@ -38,10 +48,27 @@ TILE_HEADROOM_STEPS = 1
 
 # Train/eval model input. Per-clip crop comes from train_groups in clip_tiling.json
 # (explicit tile_size from object-size bands).
-TRAIN_IMGSZ = 1024
+ULTRALYTICS_DEFAULT_IMGSZ = 640  # Ultralytics predict default when imgsz omitted
+TRAIN_IMGSZ = 640  # YOLO11s PoC train / eval predict (override with --imgsz)
 TRAIN_OVERLAP_RATIO = 0.2
 # Preprocess marks skip=true when median car long-side is below this (C_far band).
 MIN_USABLE_OBJECT_PX = 32.0
+AUTOLABEL_IMGSZ = 1280  # YOLO-World autolabel only
+
+CHECKPOINTS_DIR = PROJECT_ROOT / "checkpoints"
+POC_CHECKPOINT_NAME = "yolo11s_poc_best.pt"
+PROTOTYPE_CHECKPOINT_NAME = "yolo11s_prototype_best.pt"
+POC_CHECKPOINT = CHECKPOINTS_DIR / POC_CHECKPOINT_NAME
+PROTOTYPE_CHECKPOINT = CHECKPOINTS_DIR / PROTOTYPE_CHECKPOINT_NAME
+POC_DATASET_NAME = "baseline_v0"
+
+
+def checkpoint_name_for_dataset(dataset_dir: Path | str) -> str:
+    """PoC autolabel pack → poc checkpoint; CVAT / variant packs → prototype."""
+    name = Path(dataset_dir).name
+    if name == POC_DATASET_NAME:
+        return POC_CHECKPOINT_NAME
+    return PROTOTYPE_CHECKPOINT_NAME
 
 
 @dataclass(frozen=True)
@@ -186,12 +213,15 @@ def probe_detection_class(payload: dict | None = None) -> str:
 
 
 def probe_model_classes(primary_class: str | None = None) -> list[str]:
-    """YOLO-World class list for probe; includes aliases (e.g. person → car)."""
+    """YOLO-World prompts for probe: keep class plus drop-classes (not measured)."""
     primary = (primary_class or DEFAULT_DETECTION_CLASS).lower()
     classes = [primary]
-    for alias, target in PROBE_CLASS_ALIASES.items():
-        if target == primary and alias not in classes:
-            classes.append(alias)
+    for name in PROBE_KEEP_PROMPTS:
+        if name.lower() not in classes:
+            classes.append(name.lower())
+    for name in PROBE_DROP_PROMPTS:
+        if name.lower() not in classes:
+            classes.append(name.lower())
     return classes
 
 
@@ -316,7 +346,6 @@ def save_clip_tile_config(
     existing = load_tiling_payload(config_path) if config_path.exists() else {}
     payload = {
         "source": source,
-        "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "clips": clips,
     }
     for key in (
@@ -329,8 +358,9 @@ def save_clip_tile_config(
         "fallback_label_threshold",
         "adaptive_label_threshold",
         "detection_class",
-        "probe_class_aliases",
         "probe_model_classes",
+        "probe_keep_prompts",
+        "probe_drop_prompts",
         "tile_candidates",
         "tile_headroom_steps",
         "frames_per_clip",

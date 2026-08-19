@@ -23,7 +23,6 @@ import json
 import math
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from pathlib import Path
 
 import cv2
@@ -38,7 +37,9 @@ from common.config import (
     CLIP_TILING_CONFIG_PATH,
     FRAMES_DIR,
     LABELS_DIR,
+    POC_CHECKPOINT,
     PROJECT_ROOT,
+    PROTOTYPE_CHECKPOINT,
     TRAIN_IMGSZ,
     TRAIN_OVERLAP_RATIO,
     build_split_map,
@@ -60,16 +61,23 @@ DATASETS_ROOT = PROJECT_ROOT / "data" / "datasets"
 EVAL_PACKS = {
     "autolabel": DATASETS_ROOT / "eval_autolabel",
     "manual": DATASETS_ROOT / "eval_manual",
-    "autolabel_adapted": DATASETS_ROOT / "eval_autolabel_adapted",
-    "manual_adapted": DATASETS_ROOT / "eval_manual_adapted",
 }
-DEFAULT_WEIGHTS = PROJECT_ROOT / "outputs" / "runs" / "yolo11s_vehicle" / "weights" / "best.pt"
+
+DEFAULT_WEIGHTS = PROTOTYPE_CHECKPOINT
+POC_WEIGHTS = POC_CHECKPOINT
 VEHICLE_CLASS = "vehicle"
-PRED_COLOR = (0, 200, 0)  # BGR green
+PRED_CONF_HIGH = 0.5
+PRED_COLOR_HIGH = (0, 200, 0)  # BGR green — conf > PRED_CONF_HIGH
+PRED_COLOR_LOW = (0, 140, 255)  # BGR orange — conf <= PRED_CONF_HIGH
+# Ultralytics YOLO predict default; same for all clips (not autolabel per-tile conf).
+EVAL_CONF_THRESHOLD = 0.25
+EVAL_VIDEOS_DIR = OUTPUTS_DIR / "eval_videos"
 
 TILE_NMS_IOU = 0.5
 PRED_NMS_IOU = 0.7
 SOFT_NMS_SIGMA = 0.5
+# Inner box almost fully inside a larger one: IoU is low, so NMS keeps both.
+NESTED_COVER = 0.8
 PREDICT_BATCH_SIZE = 8
 
 # One eval clip per band; whole clip inherits probe distance band (no per-frame distance).
@@ -105,11 +113,22 @@ class TrainSliceConfig:
     clip_group: dict[str, str]
     source: str
 
-    def tiling_for(self, clip_name: str, frame_w: int, frame_h: int) -> tuple[int, float, int, bool]:
-        """Return (slice_size, overlap, predict_imgsz, uses_tiling) from train_groups."""
+    def tiling_for(
+        self,
+        clip_name: str,
+        frame_w: int,
+        frame_h: int,
+        *,
+        predict_imgsz: int | None = None,
+    ) -> tuple[int, float, int, bool]:
+        """Return (slice_size, overlap, predict_imgsz, uses_tiling).
+
+        Crop comes from train_groups; YOLO11s letterbox is TRAIN_IMGSZ unless overridden.
+        """
         group = resolve_train_group_tiling(clip_name)
         slice_size = effective_slice_size(group, frame_w, frame_h)
-        return slice_size, group.overlap, group.train_imgsz, group.uses_tiling
+        imgsz = TRAIN_IMGSZ if predict_imgsz is None else int(predict_imgsz)
+        return slice_size, group.overlap, imgsz, group.uses_tiling
 
 
 def load_train_slice_config() -> TrainSliceConfig:
@@ -321,13 +340,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weights", default=str(DEFAULT_WEIGHTS), help="Fine-tuned YOLO weights (.pt).")
     parser.add_argument(
         "--gt",
-        choices=("autolabel", "manual", "autolabel_adapted", "manual_adapted", "both"),
+        choices=("autolabel", "manual", "both"),
         default="autolabel",
-        help=(
-            "Prepared pack: autolabel|manual (native scale), "
-            "*_adapted (scale-matched to train band medians), "
-            "both → autolabel + manual (not adapted)."
-        ),
+        help="Prepared pack: autolabel, manual, or both.",
     )
     parser.add_argument(
         "--dataset",
@@ -345,7 +360,19 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Eval clip names (default: band clips / pack clips).",
     )
-    parser.add_argument("--conf", type=float, default=None, help="Override confidence threshold.")
+    parser.add_argument(
+        "--conf",
+        type=float,
+        default=None,
+        help=f"Override infer confidence (default {EVAL_CONF_THRESHOLD}, Ultralytics YOLO default).",
+    )
+    parser.add_argument(
+        "--imgsz",
+        type=int,
+        default=TRAIN_IMGSZ,
+        help=f"YOLO11s predict imgsz (default {TRAIN_IMGSZ}; same as train). "
+        "Ignores leftover pack metadata.",
+    )
     parser.add_argument("--iou", type=float, default=IOU_MATCH, help="IoU threshold for TP match.")
     parser.add_argument(
         "--output-dir",
@@ -358,7 +385,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--video-dir",
         default=None,
-        help="Directory for overlay videos (--live only unless set).",
+        help=(
+            "Directory for overlay videos "
+            f"(default: {EVAL_VIDEOS_DIR.relative_to(PROJECT_ROOT)}; "
+            "one mp4 per eval clip). Ignored with --no-video."
+        ),
     )
     parser.add_argument(
         "--no-video",
@@ -405,6 +436,43 @@ def box_iou(a: list[float], b: list[float]) -> float:
     area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
     union = area_a + area_b - inter
     return inter / union if union > 0 else 0.0
+
+
+def _box_area(xyxy: list[float]) -> float:
+    return max(0.0, xyxy[2] - xyxy[0]) * max(0.0, xyxy[3] - xyxy[1])
+
+
+def _box_intersection(a: list[float], b: list[float]) -> float:
+    ix1, iy1 = max(a[0], b[0]), max(a[1], b[1])
+    ix2, iy2 = min(a[2], b[2]), min(a[3], b[3])
+    return max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+
+
+def suppress_nested_boxes(boxes: list[Box], cover: float = NESTED_COVER) -> list[Box]:
+    """Drop a smaller box that mostly sits inside a larger one (same car, part vs whole).
+
+    Standard IoU NMS does not: inner/outer IoU ≈ area_inner / area_outer, often 0.1–0.3.
+    """
+    if len(boxes) < 2:
+        return boxes
+    kept: list[Box] = []
+    for i, inner in enumerate(boxes):
+        area_i = _box_area(inner.xyxy)
+        if area_i <= 0:
+            continue
+        nested = False
+        for j, outer in enumerate(boxes):
+            if i == j:
+                continue
+            area_o = _box_area(outer.xyxy)
+            if area_o <= area_i:
+                continue
+            if _box_intersection(inner.xyxy, outer.xyxy) / area_i >= cover:
+                nested = True
+                break
+        if not nested:
+            kept.append(inner)
+    return kept
 
 
 def resolve_clip_eval_band(clip_name: str, tile_cfg: dict) -> str | None:
@@ -543,10 +611,11 @@ def predict_frame_tiled(
     img_h: int,
     conf: float,
     dev: str,
+    predict_imgsz: int | None = None,
 ) -> list[Box]:
     """Infer with train_groups tiling (or full-frame); map boxes to full frame."""
     slice_size, overlap, predict_imgsz, uses_tiling = slice_cfg.tiling_for(
-        clip_name, img_w, img_h
+        clip_name, img_w, img_h, predict_imgsz=predict_imgsz
     )
 
     if not uses_tiling:
@@ -570,7 +639,7 @@ def predict_frame_tiled(
                 y2 = float(max(0, min(img_h, y2)))
                 if x2 - x1 > 1 and y2 - y1 > 1:
                     merged.append(Box(xyxy=[x1, y1, x2, y2], confidence=score))
-        return nms_boxes(merged, TILE_NMS_IOU)
+        return suppress_nested_boxes(nms_boxes(merged, TILE_NMS_IOU))
 
     slice_result = slice_image(
         str(image_path),
@@ -605,7 +674,7 @@ def predict_frame_tiled(
                 if full_xyxy[2] - full_xyxy[0] > 1 and full_xyxy[3] - full_xyxy[1] > 1:
                     merged.append(Box(xyxy=full_xyxy, confidence=score))
 
-    return nms_boxes(merged, TILE_NMS_IOU)
+    return suppress_nested_boxes(nms_boxes(merged, TILE_NMS_IOU))
 
 
 def match_frame(
@@ -689,6 +758,14 @@ def labeled_frame_paths(clip_name: str) -> dict[str, Path]:
     return mapping
 
 
+def pred_box_color(confidence: float) -> tuple[int, int, int]:
+    return PRED_COLOR_HIGH if confidence > PRED_CONF_HIGH else PRED_COLOR_LOW
+
+
+def resolve_eval_conf(conf_override: float | None) -> float:
+    return float(conf_override) if conf_override is not None else EVAL_CONF_THRESHOLD
+
+
 def draw_vehicle_predictions(
     image: np.ndarray,
     boxes: list[Box],
@@ -697,29 +774,34 @@ def draw_vehicle_predictions(
     probe_distance_m: float | None,
 ) -> np.ndarray:
     canvas = image.copy()
+    h, w = canvas.shape[:2]
+    box_t = 3 if min(w, h) >= 1080 else 2
+    font = 0.8 if min(w, h) >= 1080 else 0.6
     for box in boxes:
         x1, y1, x2, y2 = map(int, box.xyxy)
-        cv2.rectangle(canvas, (x1, y1), (x2, y2), PRED_COLOR, 2)
+        color = pred_box_color(box.confidence)
+        cv2.rectangle(canvas, (x1, y1), (x2, y2), color, box_t)
         label = f"{VEHICLE_CLASS} {box.confidence:.2f}"
         cv2.putText(
             canvas,
             label,
             (x1, max(y1 - 8, 16)),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            PRED_COLOR,
-            2,
+            font,
+            color,
+            box_t,
         )
-    if boxes and probe_distance_m is not None:
-        cv2.putText(
-            canvas,
-            f"clip {clip_band} (~{probe_distance_m:.0f}m probe)",
-            (12, 28),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            PRED_COLOR,
-            2,
-        )
+    band = BAND_LABELS.get(clip_band, clip_band)
+    dist = f" (~{probe_distance_m:.0f}m probe)" if probe_distance_m is not None else ""
+    cv2.putText(
+        canvas,
+        f"{band}{dist}",
+        (12, 36),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        font,
+        (255, 255, 255),
+        box_t,
+    )
     return canvas
 
 
@@ -766,6 +848,7 @@ def evaluate_clip(
     iou_thresh: float,
     band_stats: dict[str, BandStats],
     video_dir: Path | None = None,
+    predict_imgsz: int | None = None,
 ) -> dict:
     tile_cfg = resolve_clip_tile_config(clip_name, tile_config)
     clip_band = resolve_clip_eval_band(clip_name, tile_cfg)
@@ -775,7 +858,7 @@ def evaluate_clip(
             f"Probe band={tile_cfg.get('distance_band')!r}, distance_m={tile_cfg.get('distance_m')}."
         )
 
-    conf = conf_override if conf_override is not None else tile_cfg["label_confidence_threshold"]
+    conf = resolve_eval_conf(conf_override)
     ckpt_hint = str(getattr(yolo_model, "ckpt_path", "") or "")
     dev = predict_device(ckpt_hint) if ckpt_hint else device()
 
@@ -787,7 +870,7 @@ def evaluate_clip(
         probe_distance_m = float(probe_distance_m)
 
     slice_size, overlap, predict_imgsz, uses_tiling = slice_cfg.tiling_for(
-        clip_name, img_w, img_h
+        clip_name, img_w, img_h, predict_imgsz=predict_imgsz
     )
     group = slice_cfg.clip_group.get(clip_name) or resolve_train_group_tiling(clip_name).group
     tile_desc = "full-frame" if not uses_tiling else f"tile={slice_size}"
@@ -818,6 +901,7 @@ def evaluate_clip(
             img_h=img_h,
             conf=conf,
             dev=dev,
+            predict_imgsz=predict_imgsz,
         )
         preds_by_frame[image_path.stem] = preds
 
@@ -930,7 +1014,6 @@ def build_markdown_table(band_stats: dict[str, BandStats], meta: dict) -> str:
     lines = [
         "# Eval metrics by distance band",
         "",
-        f"Generated: {meta['generated_at']}",
         f"Model: `{meta['weights']}`",
         "",
         "## Assumptions",
@@ -1033,11 +1116,12 @@ def predict_prepared_image(
 ) -> list[Box]:
     """Predict on an already-cropped pack image (tile or full-frame sample)."""
     extra, nms_mode, nms_opts = split_predict_kw(predict_kw)
+    imgsz = int(extra.pop("imgsz", predict_imgsz))
     results = yolo_model.predict(
         str(image_path),
         conf=conf,
         device=dev,
-        imgsz=predict_imgsz,
+        imgsz=imgsz,
         verbose=False,
         **extra,
     )
@@ -1053,7 +1137,7 @@ def predict_prepared_image(
             y2 = float(max(0, min(img_h, xyxy[3])))
             if x2 - x1 > 1 and y2 - y1 > 1:
                 merged.append(Box(xyxy=[x1, y1, x2, y2], confidence=score))
-    return apply_pred_nms(
+    boxes = apply_pred_nms(
         merged,
         nms_mode,
         iou=float(nms_opts["iou"]),
@@ -1061,6 +1145,9 @@ def predict_prepared_image(
         sigma=float(nms_opts["sigma"]),
         method=str(nms_opts["method"]),
     )
+    if nms_mode not in ("off", "none"):
+        boxes = suppress_nested_boxes(boxes)
+    return boxes
 
 
 def _clip_fps(clip_name: str) -> float:
@@ -1139,6 +1226,7 @@ def evaluate_prepared_pack(
     output_dir: Path,
     tile_config: dict[str, dict],
     predict_kw: dict | None = None,
+    video_dir: Path | None = None,
 ) -> None:
     """Score a frozen eval pack (images already tiled / cropped)."""
     yaml_path = dataset_dir / "data.yaml"
@@ -1149,17 +1237,15 @@ def evaluate_prepared_pack(
             f"Prepared pack incomplete: {dataset_dir}\n"
             "Build with: python src/training/prepare_eval.py"
             + (" --from-autolabel" if "autolabel" in gt_name else "")
-            + (" --scale-adapt" if "adapted" in gt_name else "")
         )
 
     payload_yaml = yaml.safe_load(yaml_path.read_text(encoding="utf-8")) or {}
     bands_map: dict[str, str] = {
         str(k): str(v) for k, v in (payload_yaml.get("bands") or {}).items()
     }
-    clip_train_imgsz: dict[str, int] = {
-        str(k): int(v) for k, v in (payload_yaml.get("clip_train_imgsz") or {}).items()
-    }
-    default_imgsz = int(payload_yaml.get("imgsz", TRAIN_IMGSZ))
+    default_imgsz = TRAIN_IMGSZ
+    if predict_kw and predict_kw.get("imgsz") is not None:
+        default_imgsz = int(predict_kw["imgsz"])
     pack_clips = [str(c) for c in (payload_yaml.get("clips") or [])]
     if clip_filter:
         clip_names = clip_filter
@@ -1185,7 +1271,7 @@ def evaluate_prepared_pack(
 
     print(
         f"Eval pack [{gt_name}]: {dataset_dir} "
-        f"({len(image_paths)} images, clips={clip_names})"
+        f"({len(image_paths)} images, clips={clip_names}, predict_imgsz={default_imgsz})"
     )
     yolo_model = load_ultralytics_model(weights)
     dev = predict_device(str(weights))
@@ -1203,12 +1289,8 @@ def evaluate_prepared_pack(
             raise SystemExit(
                 f"Clip {clip_name!r} band {clip_band!r} not in {list(band_stats)}"
             )
-        conf = (
-            conf_override
-            if conf_override is not None
-            else float(tile_cfg.get("label_confidence_threshold", 0.25))
-        )
-        predict_imgsz = clip_train_imgsz.get(clip_name, default_imgsz)
+        conf = resolve_eval_conf(conf_override)
+        predict_imgsz = default_imgsz
         fps = _clip_fps(clip_name)
         stats = band_stats[clip_band]
         clip_tp = clip_fp = clip_fn = 0
@@ -1277,11 +1359,37 @@ def evaluate_prepared_pack(
             }
         )
 
+    if video_dir is not None:
+        print(f"Overlay videos → {video_dir} ({len(clip_names)} clips)")
+        slice_cfg = load_train_slice_config()
+        dummy_stats = {band: BandStats() for band in DEFAULT_BAND_CLIPS}
+        by_id = {r["clip"]: r for r in clip_results}
+        for clip_name in clip_names:
+            if is_clip_skipped(clip_name, tile_config):
+                print(f"  skip overlay {clip_name}: {clip_skip_reason(clip_name, tile_config)}")
+                continue
+            row = evaluate_clip(
+                clip_name,
+                tile_config,
+                slice_cfg,
+                yolo_model=yolo_model,
+                conf_override=conf_override,
+                iou_thresh=iou_thresh,
+                band_stats=dummy_stats,
+                video_dir=video_dir,
+                predict_imgsz=default_imgsz,
+            )
+            target = by_id.get(clip_name)
+            if target is None:
+                continue
+            target["prediction_video"] = row.get("prediction_video")
+            timing = target.setdefault("timing", {})
+            timing["video_sec"] = (row.get("timing") or {}).get("video_sec") or 0.0
+
     run_elapsed_sec = round(time.perf_counter() - run_t0, 2)
     source = payload_yaml.get("source") or gt_name
     labels_root = payload_yaml.get("labels_root") or ""
     payload = {
-        "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "weights": str(weights),
         "iou": iou_thresh,
         "clips": clip_names,
@@ -1301,7 +1409,6 @@ def evaluate_prepared_pack(
         "eval_mode": {
             "mode": "prepared_pack",
             "imgsz": default_imgsz,
-            "clip_train_imgsz": clip_train_imgsz,
             "clip_uses_tiling": payload_yaml.get("clip_uses_tiling") or {},
             "clip_group": payload_yaml.get("clip_group") or {},
             "train_metadata": str(yaml_path),
@@ -1320,7 +1427,7 @@ def evaluate_prepared_pack(
             "false_alarms_formula": "FP / (N_pack_samples / fps / 60)",
             "inference": (
                 "direct YOLO predict on pack images (already tiled/cropped); "
-                f"predict_imgsz from pack clip_train_imgsz (default {default_imgsz})"
+                f"YOLO11s predict_imgsz={default_imgsz} (train default {TRAIN_IMGSZ})"
             ),
         },
         "bands": {
@@ -1358,6 +1465,7 @@ def evaluate_live(
     clip_names: list[str],
     output_dir: Path,
     video_dir: Path | None,
+    predict_imgsz: int = TRAIN_IMGSZ,
 ) -> None:
     """Legacy: full-frame video eval from data/frames + labels/eval."""
     split_map = build_split_map()
@@ -1365,7 +1473,7 @@ def evaluate_live(
     slice_cfg = load_train_slice_config()
     verify_materialized_tile_size(slice_cfg)
     print(
-        f"Eval (live): default_imgsz={slice_cfg.imgsz}, "
+        f"Eval (live): predict_imgsz={predict_imgsz}, "
         f"per-clip train_groups tiling (from {slice_cfg.source})"
     )
     if slice_cfg.clip_group:
@@ -1374,9 +1482,8 @@ def evaluate_live(
             uses = slice_cfg.clip_uses_tiling.get(name, True)
             size = slice_cfg.clip_slice_size.get(name, "?")
             ov = slice_cfg.clip_overlap.get(name, "?")
-            p_imgsz = slice_cfg.clip_train_imgsz.get(name, slice_cfg.imgsz)
             tile_desc = "full-frame" if not uses else f"tile={size}"
-            print(f"  {name}: group={group}, {tile_desc}, overlap={ov}, predict_imgsz={p_imgsz}")
+            print(f"  {name}: group={group}, {tile_desc}, overlap={ov}, predict_imgsz={predict_imgsz}")
 
     for clip in clip_names:
         if split_map.get(clip) != "eval":
@@ -1406,11 +1513,11 @@ def evaluate_live(
                 iou_thresh=iou_thresh,
                 band_stats=band_stats,
                 video_dir=video_dir,
+                predict_imgsz=predict_imgsz,
             )
         )
     run_elapsed_sec = round(time.perf_counter() - run_t0, 2)
     payload = {
-        "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "weights": str(weights),
         "iou": iou_thresh,
         "clips": clip_names,
@@ -1427,11 +1534,10 @@ def evaluate_live(
         },
         "eval_mode": {
             "mode": "live",
-            "imgsz": slice_cfg.imgsz,
+            "imgsz": predict_imgsz,
             "overlap_ratio": slice_cfg.overlap_ratio,
             "clip_slice_size": slice_cfg.clip_slice_size,
             "clip_overlap": slice_cfg.clip_overlap,
-            "clip_train_imgsz": slice_cfg.clip_train_imgsz,
             "clip_uses_tiling": slice_cfg.clip_uses_tiling,
             "clip_group": slice_cfg.clip_group,
             "tile_nms_iou": TILE_NMS_IOU,
@@ -1448,7 +1554,7 @@ def evaluate_live(
             "false_alarms_formula": "FP / (N_frames / fps / 60)",
             "inference": (
                 f"per-clip train_groups tile_size (or full-frame), "
-                f"YOLO predict_imgsz from group (default {slice_cfg.imgsz}), "
+                f"YOLO11s predict_imgsz={predict_imgsz}, "
                 "merged to full frame"
             ),
         },
@@ -1490,9 +1596,7 @@ def main() -> None:
     if args.live:
         clip_names = args.clips or list(DEFAULT_BAND_CLIPS.values())
         out_dir = Path(args.output_dir) if args.output_dir else OUTPUTS_DIR / "eval_live"
-        video_dir = None
-        if not args.no_video:
-            video_dir = Path(args.video_dir) if args.video_dir else out_dir / "videos"
+        video_dir = None if args.no_video else Path(args.video_dir) if args.video_dir else EVAL_VIDEOS_DIR
         evaluate_live(
             weights=weights,
             conf_override=args.conf,
@@ -1500,10 +1604,12 @@ def main() -> None:
             clip_names=clip_names,
             output_dir=out_dir,
             video_dir=video_dir,
+            predict_imgsz=args.imgsz,
         )
         return
 
     tile_config = load_clip_tile_config()
+    video_dir = None if args.no_video else Path(args.video_dir) if args.video_dir else EVAL_VIDEOS_DIR
     if args.dataset:
         gt_name = args.gt if args.gt != "both" else "custom"
         out_dir = (
@@ -1520,6 +1626,8 @@ def main() -> None:
             clip_filter=args.clips,
             output_dir=out_dir,
             tile_config=tile_config,
+            predict_kw={"imgsz": args.imgsz},
+            video_dir=video_dir,
         )
         return
 
@@ -1539,6 +1647,8 @@ def main() -> None:
             clip_filter=args.clips,
             output_dir=out_dir,
             tile_config=tile_config,
+            predict_kw={"imgsz": args.imgsz},
+            video_dir=video_dir,
         )
 
 

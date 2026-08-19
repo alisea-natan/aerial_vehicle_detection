@@ -1,6 +1,3 @@
-# --- Guides (local docs / PDF export) ---
-guides/
-
 # --- Legacy: local guide PDF tooling (no package.json in repo anymore) ---
 node_modules/
 
@@ -10,6 +7,7 @@ __pycache__/
 .idea/
 *.swp
 *.swo
+.cursor/
 
 # --- Secrets / local env ---
 .env
@@ -23,7 +21,7 @@ env/
 /*.pdf
 
 # --- macOS ---
-.DS_Store
+**/.DS_Store
 
 # --- Extracted frames only (large; run extract_frames.py) ---
 data/frames/**
@@ -48,6 +46,9 @@ outputs/*
 !outputs/eval_videos/
 outputs/eval_videos/*
 !outputs/eval_videos/*_predictions.mp4
+!outputs/probe_frames/
+!outputs/probe_frames/**
+outputs/probe_frames/**/.DS_Store
 
 # --- Model weights ---
 weights/                          # CLIP etc. (large, download locally)
@@ -57,11 +58,8 @@ yolo11s.pt                        # pretrained base (download via Ultralytics)
 *.pth
 *.onnx
 *.engine
-# Fine-tuned deliverable — copy after train:
-#   cp outputs/runs/yolo11s_vehicle/weights/best.pt checkpoints/yolo11s_vehicle_best.pt
-!checkpoints/
-checkpoints/*
-!checkpoints/yolo11s_vehicle_best.pt
+# Fine-tuned deliverables (local only — never commit)
+checkpoints/
 
 # Ultralytics run folders (if created outside outputs/)
 runs/
@@ -79,8 +77,6 @@ mlflow_server/
 
 # --- Dataset packs: local only (never commit blobs) ---
 data/datasets/**
-!data/datasets/README.md
-!data/datasets/.gitignore
 data/dataset/
 
 data/raw_export/

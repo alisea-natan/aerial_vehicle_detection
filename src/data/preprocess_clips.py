@@ -2,7 +2,8 @@
 """Preprocess clips: tiles, car size, distance drift, frame_step → clip_tiling.json.
 
 Samples 3 frames from start / middle / end (9 total). Uses YOLO-World **car**
-detections only (person→car alias; ignores truck/bus/bike) to estimate:
+boxes only for tiles/size/distance. Drop-classes (truck/bus/trailer/motorcycle/
+bicycle/person) are prompted so they are not scored as 4.5 m cars.
 
   - min SAHI tiles (+1 headroom → target_tiles)
   - object size in full-frame pixels (median/mean car long-side)
@@ -11,9 +12,8 @@ detections only (person→car alias; ignores truck/bus/bike) to estimate:
   - suggested train_groups band from car size
   - skip=true when median size < MIN_USABLE_OBJECT_PX (consumed by autolabel/train/eval)
 
-Replaces the old middle-only probe_clips.py flow. Backward-compatible CLI:
+Replaces the old middle-only probe_clips.py flow. CLI:
   python src/data/preprocess_clips.py
-  python src/probe_clips.py          # thin wrapper → this script
 """
 from __future__ import annotations
 
@@ -45,11 +45,14 @@ from common.config import (
     FALLBACK_LABEL_THRESHOLD,
     FALLBACK_TILES,
     MIN_USABLE_OBJECT_PX,
-    PROBE_CLASS_ALIASES,
+    PROBE_DROP_PROMPTS,
+    PROBE_FRAMES_DIR,
+    PROBE_KEEP_PROMPTS,
     PROBE_MAX_LABEL_THRESHOLD,
     RAW_CONFIDENCE_THRESHOLD,
     TILE_CANDIDATES,
     TILE_HEADROOM_STEPS,
+    ULTRALYTICS_DEFAULT_IMGSZ,
     build_split_map,
     iter_frame_clip_dirs,
     label_threshold_for_tiles,
@@ -112,13 +115,25 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--report",
-        default=str(DEBUG_DIR / "preprocess_probe.json"),
-        help="Detailed preprocess report JSON.",
+        nargs="?",
+        const=str(DEBUG_DIR / "preprocess_probe.json"),
+        default=None,
+        help="Optional probe dump JSON. Pass --report with no path to write "
+        f"{DEBUG_DIR / 'preprocess_probe.json'}. Nothing in the pipeline reads this file.",
     )
     parser.add_argument(
         "--config",
         default=str(CLIP_TILING_CONFIG_PATH),
         help="Clip tiling config used by autolabel.",
+    )
+    parser.add_argument(
+        "--save-probe-frames",
+        action="store_true",
+        default=False,
+        help=(
+            "Write the 9 probe frames with car boxes used for size/distance to "
+            f"{PROBE_FRAMES_DIR}/ (git-tracked). Off by default."
+        ),
     )
     return parser.parse_args()
 
@@ -196,6 +211,71 @@ def summarize_cars(cars: list[dict], focal_px: float) -> dict:
             records.append(record)
     primary = pick_largest_car(records)
     return {"car_count": len(records), "cars": records, "primary_car": primary}
+
+
+def draw_probe_cars(image, cars: list[dict], clip_distance_m: float | None):
+    import cv2
+
+    canvas = image.copy()
+    h, w = canvas.shape[:2]
+    scale = min(w, h) / 1080.0
+    box_t = max(2, int(round(2 * scale)))
+    font = max(0.5, 0.6 * scale)
+    font_t = max(1, int(round(2 * scale)))
+    color = (0, 200, 0)
+    for car in cars:
+        x1, y1, x2, y2 = map(int, car["bbox"])
+        cv2.rectangle(canvas, (x1, y1), (x2, y2), color, box_t)
+        cv2.putText(
+            canvas,
+            f"car {car['confidence']:.2f} {car['distance_m']:.0f}m",
+            (x1, max(y1 - 8, 20)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            font,
+            color,
+            font_t,
+        )
+    banner = f"car n={len(cars)}"
+    if clip_distance_m is not None:
+        banner += f"  clip {clip_distance_m:.0f}m"
+    cv2.putText(
+        canvas,
+        banner,
+        (12, 36 if scale < 1.5 else 56),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        font,
+        (255, 255, 255),
+        font_t,
+    )
+    return canvas
+
+
+def save_probe_overlay_frames(
+    clip_name: str,
+    segment_frames: list[tuple[str, Path]],
+    detail_hits: list[dict],
+    out_root: Path,
+    clip_distance_m: float | None,
+) -> int:
+    import cv2
+
+    by_stem = {hit["frame"]: hit for hit in detail_hits}
+    clip_out = out_root / clip_name
+    clip_out.mkdir(parents=True, exist_ok=True)
+    n_written = 0
+    for segment, frame_path in segment_frames:
+        image = cv2.imread(str(frame_path))
+        if image is None:
+            continue
+        cars = by_stem.get(frame_path.stem, {}).get("cars") or []
+        out_path = clip_out / f"{segment}_{frame_path.stem}.jpg"
+        cv2.imwrite(
+            str(out_path),
+            draw_probe_cars(image, cars, clip_distance_m),
+            [cv2.IMWRITE_JPEG_QUALITY, 85],
+        )
+        n_written += 1
+    return n_written
 
 
 def detect_cars_on_frame(
@@ -284,6 +364,7 @@ def preprocess_clip(
     device: str,
     *,
     enhance: bool = False,
+    probe_frames_dir: Path | None = None,
 ) -> dict:
     clip_name = clip_dir.name
     metadata = json.loads((clip_dir / "metadata.json").read_text(encoding="utf-8"))
@@ -307,14 +388,9 @@ def preprocess_clip(
     for target_tiles in TILE_CANDIDATES:
         label_threshold = label_threshold_for_tiles(target_tiles)
         if target_tiles == TILE_CANDIDATES[0]:
-            alias_note = ", ".join(
-                f"{alias}→{target}"
-                for alias, target in sorted(PROBE_CLASS_ALIASES.items())
-                if target == detection_class
-            ) or "none"
             print(
-                f"  probe classes: {detection_class!r} (aliases: {alias_note}); "
-                f"frames: {[p.stem for p in frame_paths]}"
+                f"  probe keep={PROBE_KEEP_PROMPTS} drop={PROBE_DROP_PROMPTS}; "
+                f"measure={detection_class!r}; frames: {[p.stem for p in frame_paths]}"
             )
         print(f"  trying tiles={target_tiles}, label_threshold>={label_threshold}")
 
@@ -498,7 +574,7 @@ def preprocess_clip(
     train_group = suggested_train_group(size_med)
 
     total_elapsed = round(sum(item["elapsed_sec"] for item in attempts), 2)
-    return {
+    result = {
         "clip": clip_name,
         "split": split,
         "detection_class": detection_class,
@@ -533,6 +609,16 @@ def preprocess_clip(
         "attempts": attempts,
         "total_probe_sec": total_elapsed,
     }
+    if probe_frames_dir is not None:
+        n_saved = save_probe_overlay_frames(
+            clip_name,
+            segment_frames,
+            detail_hits,
+            probe_frames_dir,
+            distance_m,
+        )
+        print(f"  probe frames: {n_saved} → {probe_frames_dir / clip_name}")
+    return result
 
 
 def main() -> None:
@@ -554,7 +640,7 @@ def main() -> None:
     detection_class = probe_detection_class(tiling_payload)
     probe_classes = probe_model_classes(detection_class)
     print(f"Loading {MODEL_NAME} on probe classes {probe_classes}")
-    model, device = build_yolo_world(probe_classes)
+    model, device = build_yolo_world(probe_classes, image_size=ULTRALYTICS_DEFAULT_IMGSZ)
 
     results: list[dict] = []
     run_t0 = time.perf_counter()
@@ -576,6 +662,7 @@ def main() -> None:
                 detection_class,
                 device,
                 enhance=args.enhance,
+                probe_frames_dir=PROBE_FRAMES_DIR if args.save_probe_frames else None,
             )
         )
 
@@ -593,8 +680,9 @@ def main() -> None:
             "fallback_label_threshold": FALLBACK_LABEL_THRESHOLD,
             "adaptive_label_threshold": "probe_max / target_tiles, floor=raw_confidence",
             "detection_class": detection_class,
-            "probe_class_aliases": PROBE_CLASS_ALIASES,
             "probe_model_classes": probe_classes,
+            "probe_keep_prompts": list(PROBE_KEEP_PROMPTS),
+            "probe_drop_prompts": list(PROBE_DROP_PROMPTS),
             "tile_candidates": list(TILE_CANDIDATES),
             "tile_headroom_steps": TILE_HEADROOM_STEPS,
             "frames_per_segment": args.per_segment,
@@ -602,32 +690,34 @@ def main() -> None:
             "frame_step_fraction": args.step_fraction,
             "last_probe_elapsed_sec": run_elapsed,
             "preprocess_note": (
-                "car-only size/distance from start/middle/end samples; "
+                "car-only size/distance; drop-classes prompted but not measured; "
                 "frame_step=floor(size x fraction/speed)"
             ),
         },
     )
 
-    report_path = Path(args.report)
-    report_path.parent.mkdir(parents=True, exist_ok=True)
-    report_path.write_text(
-        json.dumps(
-            {
-                "model_name": MODEL_NAME,
-                "detection_class": detection_class,
-                "probe_class_aliases": PROBE_CLASS_ALIASES,
-                "probe_model_classes": probe_classes,
-                "frames_per_segment": args.per_segment,
-                "frame_step_fraction": args.step_fraction,
-                "run_elapsed_sec": run_elapsed,
-                "enhance_clahe": bool(args.enhance),
-                "clips": results,
-            },
-            indent=2,
+    if args.report:
+        report_path = Path(args.report)
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text(
+            json.dumps(
+                {
+                    "model_name": MODEL_NAME,
+                    "detection_class": detection_class,
+                    "probe_model_classes": probe_classes,
+                    "probe_keep_prompts": list(PROBE_KEEP_PROMPTS),
+                    "probe_drop_prompts": list(PROBE_DROP_PROMPTS),
+                    "frames_per_segment": args.per_segment,
+                    "frame_step_fraction": args.step_fraction,
+                    "run_elapsed_sec": run_elapsed,
+                    "enhance_clahe": bool(args.enhance),
+                    "clips": results,
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
         )
-        + "\n",
-        encoding="utf-8",
-    )
 
     print(
         f"\n{'clip':<36} {'tiles':>5} {'size':>6} {'dist':>6} {'vary':>4} "
@@ -655,7 +745,12 @@ def main() -> None:
             print(f"  → mark skip: {entry.get('skip_reason')}")
 
     print(f"\nConfig: {config_path}")
-    print(f"Report: {report_path} (total {run_elapsed}s)")
+    if args.save_probe_frames:
+        print(f"Probe frames: {PROBE_FRAMES_DIR}")
+    if args.report:
+        print(f"Report: {args.report} (total {run_elapsed}s)")
+    else:
+        print(f"Total {run_elapsed}s")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,10 @@
+# Defaults for src/training/prepare_baseline.py (PoC one-shot pack builder).
+# Prototype experiment packs use config/datasets/variants.yaml instead.
+#
+#   python src/training/prepare_baseline.py              → baseline_v1 (CVAT labels/)
+#   python src/training/prepare_baseline.py --from-autolabel  → baseline_v0
+
+name: baseline_v1
+out_dir: data/datasets/baseline_v1
+imgsz: 640
+val_fraction: 0.15

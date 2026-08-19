@@ -29,6 +29,7 @@ import argparse
 import json
 import random
 import shutil
+import time
 from pathlib import Path
 
 import cv2
@@ -46,6 +47,7 @@ from common.config import (
     PROJECT_ROOT,
     TRAIN_IMGSZ,
     build_split_map,
+    checkpoint_name_for_dataset,
     clip_skip_reason,
     effective_slice_size,
     is_clip_skipped,
@@ -101,6 +103,18 @@ VAL_SPLIT_SEED = 42
 # Batch is chosen from unified memory when --batch is omitted.
 DEFAULT_WORKERS_MPS = 2
 DEFAULT_WORKERS_CPU = 4
+
+
+def format_duration(seconds: float) -> str:
+    sec = max(0.0, float(seconds))
+    if sec < 60:
+        return f"{sec:.1f}s"
+    total = int(round(sec))
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours}h {minutes}m {secs}s"
+    return f"{minutes}m {secs}s"
 
 
 def system_ram_gb() -> float:
@@ -218,7 +232,7 @@ def patch_ultralytics_mps_unique() -> None:
 def patch_ultralytics_honor_val_false() -> None:
     """Ultralytics still calls validate() on the last epoch when val=False.
 
-    YOLO26 end2end and P2 heads at imgsz=1024 hit MPS limits on val/predict
+    YOLO26 end2end heads at imgsz=1024 hit MPS limits on val/predict
     (GatherND abort; DFL conv with >65536 output channels). When we pass
     val=False, skip that path entirely (including final_eval).
     """
@@ -247,7 +261,7 @@ def patch_ultralytics_honor_val_false() -> None:
     validate._vd_honor_val_false = True  # type: ignore[attr-defined]
     BaseTrainer.validate = validate
     BaseTrainer.final_eval = final_eval
-    print("Ultralytics: val=False now skips last-epoch and final val (needed on Apple MPS / YOLO26 / P2)")
+    print("Ultralytics: val=False now skips last-epoch and final val (needed on Apple MPS / YOLO26)")
 
 
 def parse_args() -> argparse.Namespace:
@@ -569,7 +583,7 @@ def slice_frames_to_dataset(
         tiling = resolve_train_group_tiling(clip_name, payload=tiling_payload)
         group_name = tiling.group
         clip_group[clip_name] = group_name
-        clip_train_imgsz[clip_name] = tiling.train_imgsz
+        clip_train_imgsz[clip_name] = imgsz
         clip_uses_tiling[clip_name] = tiling.uses_tiling
         clip_overlap[clip_name] = tiling.overlap
 
@@ -1622,10 +1636,10 @@ def train_one_stage(
     aug: dict[str, float] | None = None,
     pretrained: bool = True,
     model_hint: str | None = None,
-) -> tuple[Path, int]:
+) -> tuple[Path, int, float]:
     """Run one Ultralytics train() stage with MPS OOM batch backoff.
 
-    Returns (best_or_last_weights, final_batch_size).
+    Returns (best_or_last_weights, final_batch_size, elapsed_sec).
     Loads `weights` then starts a fresh optimizer schedule (not resume=True), so
     Stage 2 can change freeze/LR without restoring Stage 1 training state.
     """
@@ -1636,6 +1650,7 @@ def train_one_stage(
     batch_try = max(1, int(batch))
     last_error: Exception | None = None
     run_dir = RUNS_DIR / run_name
+    t0 = time.perf_counter()
 
     for attempt in range(4):
         release_torch_memory()
@@ -1717,7 +1732,12 @@ def train_one_stage(
         raise last_error
 
     summarize_results_csv(run_dir, run_name)
-    return resolve_best_weights(run_dir), batch_try
+    elapsed = time.perf_counter() - t0
+    print(
+        f"[{run_name}] {epochs} epochs completed in {format_duration(elapsed)} "
+        f"({elapsed:.1f}s / {elapsed / 3600:.3f}h)"
+    )
+    return resolve_best_weights(run_dir), batch_try, elapsed
 
 
 def train_model(
@@ -1735,7 +1755,7 @@ def train_model(
     aug: dict[str, float] | None = None,
     stage1_run_name: str | None = None,
     stage2_run_name: str | None = None,
-    deliverable_name: str = "yolo11s_vehicle_best.pt",
+    deliverable_name: str = "yolo11s_prototype_best.pt",
     write_checkpoint: bool = True,
     pretrained: bool = True,
     staged: bool = True,
@@ -1777,8 +1797,10 @@ def train_model(
         )
 
     best_weights: Path
+    timings: list[tuple[str, float]] = []
+    t_all = time.perf_counter()
     if do_stage1:
-        stage1_weights, batch = train_one_stage(
+        stage1_weights, batch, sec = train_one_stage(
             weights=MODEL_NAME,
             yaml_path=yaml_path,
             run_name=s1_name,
@@ -1795,13 +1817,14 @@ def train_model(
             pretrained=pretrained,
             model_hint=MODEL_NAME,
         )
+        timings.append((f"Stage1 {s1_name} ({warmup_epochs} ep)", sec))
         if not do_stage2:
             best_weights = stage1_weights
         else:
             stage1_last = RUNS_DIR / s1_name / "weights" / "last.pt"
             stage2_init = stage1_last if stage1_last.exists() else stage1_weights
             print(f"Stage 1 done. Continuing from {stage2_init} (backbone unfrozen)")
-            best_weights, _ = train_one_stage(
+            best_weights, _, sec = train_one_stage(
                 weights=stage2_init,
                 yaml_path=yaml_path,
                 run_name=s2_name,
@@ -1818,8 +1841,9 @@ def train_model(
                 pretrained=pretrained,
                 model_hint=MODEL_NAME,
             )
+            timings.append((f"Stage2 {s2_name} ({epochs} ep)", sec))
     else:
-        best_weights, _ = train_one_stage(
+        best_weights, _, sec = train_one_stage(
             weights=MODEL_NAME,
             yaml_path=yaml_path,
             run_name=s2_name,
@@ -1836,12 +1860,19 @@ def train_model(
             pretrained=pretrained,
             model_hint=MODEL_NAME,
         )
+        timings.append((f"Train {s2_name}", sec))
+
+    total = time.perf_counter() - t_all
+    print("\nTrain wall time:")
+    for label, sec in timings:
+        print(f"  {label}: {format_duration(sec)} ({sec:.1f}s / {sec / 3600:.3f}h)")
+    print(f"  Total: {format_duration(total)} ({total:.1f}s / {total / 3600:.3f}h)")
 
     if write_checkpoint:
         deliverable = PROJECT_ROOT / "checkpoints" / deliverable_name
         deliverable.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(best_weights, deliverable)
-        print(f"Git-tracked copy: {deliverable}")
+        print(f"Local checkpoint: {deliverable}")
     return best_weights
 
 
@@ -1961,6 +1992,7 @@ def main() -> None:
         freeze=args.freeze,
         lr0=args.lr0,
         patience=patience,
+        deliverable_name=checkpoint_name_for_dataset(dataset_dir),
     )
     print(f"Done. Best weights: {weights}")
 

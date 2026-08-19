@@ -22,7 +22,7 @@ def _ensure_src_on_path() -> None:
 
 _ensure_src_on_path()
 
-from common.config import PROJECT_ROOT
+from common.config import POC_CHECKPOINT, PROTOTYPE_CHECKPOINT, PROJECT_ROOT
 
 import os
 
@@ -33,7 +33,8 @@ PROJECT = "vehicle-cige6"
 MODEL_NAME = "yolo11s-vehicle"
 MODEL_DIR = PROJECT_ROOT / "outputs" / "runs" / "yolo11s_vehicle"
 WEIGHTS_REL = "weights/best.pt"
-CKPT = PROJECT_ROOT / "checkpoints" / "yolo11s_vehicle_best.pt"
+CKPT = PROTOTYPE_CHECKPOINT
+POC_CKPT = POC_CHECKPOINT
 
 
 def main() -> None:
@@ -42,14 +43,17 @@ def main() -> None:
         raise SystemExit("Set ROBOFLOW_API_KEY in .env (see .env.example)")
 
     weights = MODEL_DIR / WEIGHTS_REL
-    if weights.is_file():
-        model_dir = MODEL_DIR
-        filename = WEIGHTS_REL
-    elif CKPT.is_file():
+    if CKPT.is_file():
         model_dir = CKPT.parent
         filename = CKPT.name
+    elif weights.is_file():
+        model_dir = MODEL_DIR
+        filename = WEIGHTS_REL
+    elif POC_CKPT.is_file():
+        model_dir = POC_CKPT.parent
+        filename = POC_CKPT.name
     else:
-        raise SystemExit(f"Missing weights: {weights} and {CKPT}")
+        raise SystemExit(f"Missing weights: {CKPT}, {weights}, or {POC_CKPT}")
 
     print(f"roboflow {roboflow.__version__}")
     print(f"versionless deploy → project={PROJECT} name={MODEL_NAME}")
