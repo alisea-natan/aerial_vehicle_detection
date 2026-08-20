@@ -8,6 +8,7 @@ __pycache__/
 *.swp
 *.swo
 .cursor/
+.ipynb_checkpoints/
 
 # --- Secrets / local env ---
 .env
