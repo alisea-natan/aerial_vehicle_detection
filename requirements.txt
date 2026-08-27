@@ -5,7 +5,7 @@ opencv-python==4.13.0.92
 ultralytics==8.4.62
 sahi==0.12.5
 matplotlib==3.10.7
-numpy==2.2.6
+numpy==2.1.3
 lap==0.5.13
 PyYAML==6.0.3
 torch==2.12.0
@@ -22,3 +22,25 @@ python-dotenv==1.1.1
 
 # Optional: CVAT export (src/labeling/cvat/cvat_pull.py). Pin near your server (2.70.x).
 cvat-sdk==2.70.0
+
+# Optimisation (src/optimisation/ — OpenVINO/ONNX export, INT8, prune).
+# onnxslim: Ultralytics export AutoUpdates it if missing — pin so the run does not pip mid-job.
+onnx==1.22.0
+onnxruntime==1.29.0
+openvino==2026.3.0
+openvino-telemetry==2025.2.0
+onnxslim==0.1.96
+# protobuf <6 for tensorflow; >=4.25.8 for onnxruntime.
+protobuf==5.29.5
+ml_dtypes==0.6.0
+flatbuffers==25.12.19
+torch-pruning==1.6.1
+# INT8 OpenVINO export (Ultralytics AutoUpdates nncf if missing — pin so step 2 does not pip mid-job).
+nncf==3.3.0
+# TFLite export in run_export.py (A1). Ultralytics AutoUpdates these if missing — pin so export does not pip mid-job.
+tensorflow==2.19.0
+onnx2tf==1.28.8
+tf-keras==2.19.0
+sng4onnx==1.0.5
+onnx-graphsurgeon==0.5.8
+ai-edge-litert==1.3.0

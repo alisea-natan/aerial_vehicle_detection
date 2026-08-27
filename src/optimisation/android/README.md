@@ -1,0 +1,56 @@
+# Android — Track A4
+
+Track A for TFLite: **[OPTIMISATION.md](../../../OPTIMISATION.md)**.
+
+**Ship model:** A1 TFLite FP32 @ **1280** — `python src/optimisation/run_export.py --platform android` → `checkpoints/opt/export/prototype/tflite/*.tflite`
+
+**Repo ships:** `vehicle-bench.apk`. You copy the `.tflite` + a **tile video** (pack clip, same idea as Pi `tile_clip.mp4`) to the phone.
+
+---
+
+## Run and collect stats
+
+1. Install APK; pick **1280** `.tflite` and video in the app (`pack_tile` mode for tile clips).
+2. **Run** — optional **NNAPI** off by default if load fails; **Stop** when done (≥100 post-warmup tiles for A4, per OPTIMISATION.md).
+3. **Share JSON** or copy summary → paste p50 / tile_fps into **OPTIMISATION.md § A4**.
+
+Warmup (default 20) excludes first N tile inferences from p50, not a sample cap.
+
+---
+
+
+
+## Compare bench JSON to labels (Mac)
+
+After **Share JSON** from the app (needs `detections[]` per `tile_log` entry — rebuild APK if your export only has det counts).
+
+```bash
+# from repo root; use eval clip video on device (e.g. data/eval/266987.mp4)
+python src/optimisation/android/compare_bench_to_labels.py \
+  --bench src/optimisation/android/logs/vehicle_bench_2026-08-27T11-24-07.091209Z.json
+```
+
+**Prerequisites:** `labels/eval/{clip}/` and `data/frames/{clip}/` present (same as Mac holdout eval).
+
+**Clip:** inferred from bench `video` (`266987.mp4` → band B). Override with `--clip 13722965_2160_3840_30fps`.
+
+**Scoring:** `labels/eval/{clip}/` with each clip’s `frame_step` from `clip_tiling.json` (same subsample as `eval_manual`). Only frames the bench ran (non-warmup) and that have labels. Match IoU **0.5** (evaluate.py default); tile merge NMS uses bench JSON `iou` (default 0.45).
+
+**Output:** Det, P, FA/min, [mAP@0.5](mailto:mAP@0.5) / @0.5:0.95 for the clip’s distance band (A or B).
+
+```bash
+# save metrics JSON
+python src/optimisation/android/compare_bench_to_labels.py \
+  --bench vehicle_bench_*.json \
+  --json-out outputs/android_bench_eval.json
+
+# every labeled frame (skip frame_step filter)
+python src/optimisation/android/compare_bench_to_labels.py \
+  --bench vehicle_bench_*.json --no-frame-step
+```
+
+Old bench exports without `detections[]` will fail with a clear message — re-run bench and Share JSON again.
+
+---
+
+The bench app is a **homemade smoke tool** — CPU / optional NNAPI only, **no GPU delegate**. For real mobile deployment, a **640 imgsz** model and a **per-chip GPU/NPU stack** (separate from this repo) would be the path to pursue; this project’s artifact stays **1280 FP32** for quality parity with Pi/Jetson.

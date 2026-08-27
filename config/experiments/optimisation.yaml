@@ -1,0 +1,79 @@
+# Optimisation curriculum + production path.
+#   Phase 0: EVALUATION.md §6 (baseline — not re-run here)
+#   Track A (production): run_export → run_quantize → device READMEs
+#   Track B (lab): run_prune → run_finetune → export/quantize if gates pass
+#
+#   python src/optimisation/run_export.py
+#   python src/optimisation/run_quantize.py
+#   python src/optimisation/run_qat.py
+#   python src/optimisation/run_prune.py --ratio 0.20
+#   python src/optimisation/run_finetune.py --method structured
+
+defaults:
+  weights: checkpoints/yolo11s_prototype_best.pt
+  imgsz: 1280
+  conf: 0.25
+  iou: 0.5
+  seed: 42
+  eval_pack: data/datasets/eval_manual
+  train_pack: data/datasets/strided_clip_balanced
+  datasets_root: data/datasets
+  artifacts_dir: checkpoints/opt
+  runs_dir: outputs/experiments/optimisation
+  winner_delta: 0.015
+  min_det_b: 0.70
+  bench_warmup: 20
+  bench_n: 100
+  parity_n: 32
+  prune_ratio: 0.40
+  finetune_epochs: 5
+  qat_epochs: 3
+  qat_lr0: 0.001
+  qat_calib_split: train
+  prune_recover_epochs: 5
+  train_augmentation: poc
+  lr0: 0.01
+  patience: 3
+
+# Curriculum structure (OPTIMISATION.md)
+curriculum:
+  baseline: EVALUATION.md#6-lock-in
+  track_a:
+    - export
+    - quantize_ptq
+    - quantize_qat  # run_qat.py when A2 PTQ fails gates
+    - device
+  track_b:
+    - prune
+    - finetune
+    - export  # only if gates pass
+    - quantize
+  prune_ratios_lab: [0.20, 0.40]
+  prune_methods: [structured, unstructured]
+
+device:
+  raspberry: src/optimisation/raspberry/README.md
+  android: src/optimisation/android/README.md
+  jetson: src/optimisation/jetson/README.md
+
+raspberry:
+  artifact: checkpoints/opt/quantize/prototype/ov_int8
+  legacy_artifact: checkpoints/opt/precision/ov_int8
+
+jetson:
+  artifact: checkpoints/opt/export/prototype/onnx
+
+android:
+  artifact: src/optimisation/android/vehicle-bench.apk
+
+# Gates + pasted .pt row (EVALUATION.md §6)
+locked:
+  map50_a: 0.856
+  map50_b: 0.897
+  map50_mean: 0.877
+  det_a: 0.980
+  det_b: 0.929
+  precision_a: 0.649
+  precision_b: 0.981
+  fa_per_min_a: 2340
+  fa_per_min_b: 42

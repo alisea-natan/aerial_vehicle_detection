@@ -679,6 +679,7 @@ def run_train_job(
     pretrained: bool = True,
     staged: bool = True,
     train_backbone: bool = True,
+    write_checkpoint: bool = False,
 ) -> dict[str, Any]:
     runs_dir = runs_dir if runs_dir.is_absolute() else PROJECT_ROOT / runs_dir
     batch_n = batch if batch is not None else default_batch_size(imgsz)
@@ -747,7 +748,7 @@ def run_train_job(
             stage1_run_name=f"{run_name}_stage1",
             stage2_run_name=run_name,
             deliverable_name=deliverable_name,
-            write_checkpoint=False,
+            write_checkpoint=write_checkpoint,
             aug=aug,
             pretrained=pretrained,
             staged=staged,
