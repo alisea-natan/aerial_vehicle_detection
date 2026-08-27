@@ -4,7 +4,7 @@ Track A for TFLite: **[OPTIMISATION.md](../../../OPTIMISATION.md)**.
 
 **Ship model:** A1 TFLite FP32 @ **1280** — `python src/optimisation/run_export.py --platform android` → `checkpoints/opt/export/prototype/tflite/*.tflite`
 
-**Repo ships:** `vehicle-bench.apk`. You copy the `.tflite` + a **tile video** (pack clip, same idea as Pi `tile_clip.mp4`) to the phone.
+**On-phone test:** [android_tflite_benchmark](https://github.com/alisea-natan/android_tflite_benchmark) (`vehicle-bench.apk`). Copy the `.tflite` + any eval video to the phone.
 
 ---
 
