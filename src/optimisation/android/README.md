@@ -11,8 +11,8 @@ Track A for TFLite: **[OPTIMISATION.md](../../../OPTIMISATION.md)**.
 ## Run and collect stats
 
 1. Install APK; pick **1280** `.tflite` and video in the app (`pack_tile` mode for tile clips).
-2. **Run** — optional **NNAPI** off by default if load fails; **Stop** when done (≥100 post-warmup tiles for A4, per OPTIMISATION.md).
-3. **Share JSON** or copy summary → paste p50 / tile_fps into **OPTIMISATION.md § A4**.
+2. Pick delegate (**CPU** or **GPU**; optional **NNAPI** if load works). **Run** — **Stop** when done (≥100 post-warmup tiles for A4, per OPTIMISATION.md).
+3. **Share JSON** or copy summary → paste p50 / tile_fps into **OPTIMISATION.md § A4** (cite CPU and GPU as separate rows).
 
 Warmup (default 20) excludes first N tile inferences from p50, not a sample cap.
 
@@ -25,9 +25,9 @@ Warmup (default 20) excludes first N tile inferences from p50, not a sample cap.
 After **Share JSON** from the app (needs `detections[]` per `tile_log` entry — rebuild APK if your export only has det counts).
 
 ```bash
-# from repo root; use eval clip video on device (e.g. data/eval/266987.mp4)
+# from repo root; video on device should be an eval clip (e.g. data/eval/266987.mp4)
 python src/optimisation/android/compare_bench_to_labels.py \
-  --bench src/optimisation/android/logs/vehicle_bench_2026-08-27T11-24-07.091209Z.json
+  --bench vehicle_bench.json
 ```
 
 **Prerequisites:** `labels/eval/{clip}/` and `data/frames/{clip}/` present (same as Mac holdout eval).
@@ -53,4 +53,4 @@ Old bench exports without `detections[]` will fail with a clear message — re-r
 
 ---
 
-The bench app is a **homemade smoke tool** — CPU / optional NNAPI only, **no GPU delegate**. For real mobile deployment, a **640 imgsz** model and a **per-chip GPU/NPU stack** (separate from this repo) would be the path to pursue; this project’s artifact stays **1280 FP32** for quality parity with Pi/Jetson.
+The bench app is a **homemade smoke tool** — **CPU / GPU** (TFLite GpuDelegate) and optional NNAPI. On this mt6886, NNAPI ≈ CPU; GPU is the speed path (~10×). For a production mobile stack, a **640 imgsz** model and a **per-chip NPU runtime** (separate from this repo) would still be the next step; this project’s artifact stays **1280 FP32** for quality parity with Pi/Jetson.
