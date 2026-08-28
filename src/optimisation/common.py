@@ -73,10 +73,10 @@ def weights_variant(weights: Path, cfg: dict[str, Any] | None = None) -> str:
     if w == locked:
         return "prototype"
     name = w.name.lower()
-    if "structured" in name:
-        return "pruned_structured"
     if "unstructured" in name:
         return "pruned_unstructured"
+    if "structured" in name:
+        return "pruned_structured"
     if "pruned" in name:
         return "pruned"
     return w.stem.replace(".", "_")
