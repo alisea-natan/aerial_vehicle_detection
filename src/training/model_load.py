@@ -5,17 +5,19 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+DETECTION_TASK = "detect"
 
-def load_ultralytics_model(weights: str | Path):
+
+def load_ultralytics_model(weights: str | Path, *, task: str = DETECTION_TASK):
     """YOLO() for YOLO*; RTDETR() when the stem looks like RT-DETR."""
     name = Path(str(weights)).name.lower()
     if "rtdetr" in name:
         from ultralytics import RTDETR
 
-        return RTDETR(str(weights))
+        return RTDETR(str(weights), task=task)
     from ultralytics import YOLO
 
-    return YOLO(str(weights))
+    return YOLO(str(weights), task=task)
 
 
 # YOLO26 / RT-DETR: GatherND abort on MPS val+predict.
@@ -49,8 +51,21 @@ def skip_in_train_val(model: str, device: str) -> bool:
     return model_family(model) in MPS_FRAGILE_FAMILIES
 
 
+def _exported_runtime(model_or_weights: str) -> bool:
+    """ONNX / OpenVINO / TensorRT / TFLite — Ultralytics runs these off torch MPS."""
+    path = Path(str(model_or_weights))
+    blob = str(model_or_weights).lower()
+    if path.suffix.lower() in {".onnx", ".engine", ".tflite"}:
+        return True
+    if "openvino" in blob:
+        return True
+    return path.is_dir() and any(path.glob("*.xml"))
+
+
 def predict_device(model_or_weights: str, train_device: str | None = None) -> str:
     """Device for predict/eval. Fragile families leave MPS to avoid a Metal abort."""
+    if _exported_runtime(model_or_weights):
+        return "cpu"
     dev = train_device
     if dev is None:
         dev = "mps" if mps_available() else "cpu"

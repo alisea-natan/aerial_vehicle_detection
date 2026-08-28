@@ -8,6 +8,7 @@ __pycache__/
 *.swp
 *.swo
 .cursor/
+.ipynb_checkpoints/
 
 # --- Secrets / local env ---
 .env
@@ -91,3 +92,9 @@ outputs/autolabel/
 # --- Matplotlib / cache dirs ---
 .matplotlib/
 **/.matplotlib_cache/
+
+# --- Android bench app build ---
+# Android bench — Gradle project (local only, not in git). Ship ../vehicle-bench.apk
+src/optimisation/android/app/
+src/optimisation/android/logs/
+!src/optimisation/android/vehicle-bench.apk

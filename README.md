@@ -39,6 +39,7 @@ Frames live under `data/frames/{clip}/`. Manual GT: `labels/{train|eval}/{clip}/
 | --- | ---- |
 | **[PoC.md](PoC.md)** | Bootstrap: preprocess, YOLO-World autolabel, first YOLO11s train/eval (autolabel GT, imgsz 640) |
 | **[EVALUATION.md](EVALUATION.md)** | CVAT GT, pack / imgsz / model rounds, locked recipe |
+| **[OPTIMISATION.md](OPTIMISATION.md)** | Export locked model (OpenVINO / ONNX, then FP16/INT8) on this Mac |
 
 ```mermaid
 flowchart LR
