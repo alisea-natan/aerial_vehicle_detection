@@ -90,7 +90,7 @@ python src/optimisation/run_qat.py --platform raspberry --force --skip-finetune 
 
 ### A4 Device validation
 
-Quality from holdout eval (Track A1/A2/A3 on Mac). **Deploy FPS and latency from target hardware only** — Mac bench is smoke, not cited for ship decisions. Phone CPU @ **1280 FP32** is expected to be slow (~seconds/tile); that is imgsz vs hardware, not a labelling fail. GPU/TRT is the path that is actually fast.
+Quality from holdout eval (Track A1/A2/A3 on Mac). **Deploy FPS and latency from target hardware only** — Mac bench is smoke, not cited for ship decisions. Phone CPU @ **1280 FP32** is expected to be slow (~seconds/tile); that is imgsz vs hardware, not a labelling fail. TFLite **GPU** on the same phone is the deploy-speed row; Jetson TRT is faster still cause of T4, not Jetson imitation.
 
 **Mac artifacts to copy** (after Track A on Mac — see A1–A3 above):
 
@@ -362,7 +362,7 @@ Recover FT hurt band B on both runtimes (OpenVINO 90.9% → 58.3%; TFLite 80.9% 
 
 ### Track A4 — Device validation
 
-Source: device bench JSON / Colab notebook · quality from Track A1 holdout (not re-measured on device). Android **0.30 tile FPS** is expected: YOLO11s @ **1280 FP32 on CPU**, no GPU. Quality matched Mac. Jetson mock is fast because TRT FP16 on GPU. Pi pending.
+Source: device bench JSON / Colab notebook · quality from Track A1 holdout (not re-measured as full eval on device). Android **CPU 0.30 tile FPS** vs **GPU 2.97 tile FPS** (~10×) on the same Xiaomi mt6886, A1 FP32 TFLite @ 1280. Quality matched Mac on band B. Jetson mock is fast because TRT FP16 on GPU. Pi pending.
 
 #### Cross-target comparison
 
@@ -372,29 +372,35 @@ Source: device bench JSON / Colab notebook · quality from Track A1 holdout (not
 | Mac smoke `ov_int8` | OpenVINO CPU | — | 161 | — | 6.2 | 10.1 | Track A2 (not deploy) |
 | Mac smoke TFLite INT8 | TFLite CPU | — | 507 | — | 2.0 | 10.0 | Track A2 (not deploy) |
 | **Raspberry Pi 5** | OpenVINO CPU | _pending_ | _pending_ | _pending_ | _pending_ | ~10.1 | A4 bench |
-| **Android** | TFLite CPU | 3393 | 3332 | 3378 | 0.30 | 36.8 | A4 bench, Xiaomi mt6886, 113 tiles |
+| **Android CPU** | TFLite CPU | 3393 | 3332 | 3378 | 0.30 | 36.8 | A4 bench, Xiaomi mt6886, 113 tiles |
+| **Android GPU** | TFLite GPU | 356 | 337 | 383 | 2.97 | 36.8 | A4 bench, Xiaomi mt6886, 93 tiles |
 | **Jetson (Colab mock)** | TensorRT FP16 | 26.2 | 22.0 | 24.8 | 45.5 | 36.7 ONNX | Colab T4, 83 eval_manual tiles |
 
 
 #### Android
 
-A1 FP32 TFLite @ 1280 · `vehicle-bench.apk` · `266987.mp4` pack tile · `pack_tile` · conf **0.25** · warmup 20 · **113** post-warmup tiles (2026-08-27, decode fix).
+A1 FP32 TFLite @ 1280 · `vehicle-bench.apk` · `266987.mp4` pack tile · `pack_tile` · conf **0.25** · warmup 20. Device: Xiaomi 23090RA98G (mt6886, Android 16).
 
-Device: Xiaomi 23090RA98G (mt6886, Android 16) · delegate **CPU** · log: `src/optimisation/android/logs/vehicle_bench_2026-08-27T11-24-07.091209Z.json`
+| | CPU | GPU |
+| -- | --- | --- |
+| log | `src/optimisation/android/logs/vehicle_bench_2026-08-27T11-24-07.091209Z.json` | `src/optimisation/android/logs/vehicle_bench_2026-08-28T09-07-23.637225Z.json` |
+| post-warmup tiles | 113 | 93 |
+| cold / p50 / p95 ms | 3393 / 3332 / 3378 | 356 / 337 / 383 |
+| tile FPS | 0.30 | **2.97** (~10× CPU) |
 
-Earlier CPU run (`vehicle_bench_2026-08-27T10-27-39.423013Z.json`): p50 **3311 ms** — within noise. NNAPI same video (`vehicle_bench_with_npu.json`): p50 **3297 ms** — not cited.
+Earlier CPU run (`vehicle_bench_2026-08-27T10-27-39.423013Z.json`): p50 **3311 ms** — within noise. NNAPI same video (`vehicle_bench_with_npu.json`): p50 **3297 ms** — not cited (≈ CPU on this SoC).
 
-**Quality vs labels** (`compare_bench_to_labels.py` · band B clip `266987` · frame_step subsample · **29** scored frames where bench overlapped labeled frames — partial video, not full 64-frame eval pack):
+**Quality vs labels** (`compare_bench_to_labels.py` · band B clip `266987` · frame_step subsample · scored frames where bench overlapped labeled frames — partial video, not full 64-frame eval pack):
 
-| | A1 TFLite holdout @ 0.25 (Mac) | Android A4 @ 0.25 (label compare) |
-| -- | ------------------------------ | --------------------------------- |
-| Band B Det | 91.1% | **93.1%** |
-| Band B P | 98.1% | **100.0%** |
-| Band B FA/min | 42 | **0.0** |
-| Band B mAP@0.5 | 89.7% | **90.9%** |
-| TP / FP / FN (B) | 51 / 1 / 5 | **54 / 0 / 4** |
+| | A1 TFLite holdout @ 0.25 (Mac) | Android CPU @ 0.25 | Android GPU @ 0.25 |
+| -- | ------------------------------ | ------------------ | ------------------ |
+| Band B Det | 91.1% | **93.1%** | **95.8%** |
+| Band B P | 98.1% | **100.0%** | **100.0%** |
+| Band B FA/min | 42 | **0.0** | **0.0** |
+| Band B mAP@0.5 | 89.7% | **90.9%** | **90.9%** |
+| TP / FP / FN (B) | 51 / 1 / 5 | **54 / 0 / 4** (29 frames) | **46 / 0 / 2** (24 frames) |
 
-NMS IoU **0.45** in-app (same as Mac tile NMS). Overlay may show **double boxes**: green ≥ conf plus orange [0.05, conf), or nested part/whole pairs NMS does not merge (Mac holdout uses nested suppression; bench app does not). Label compare had **0 FP** — extras are visual-only on this run.
+NMS IoU **0.45** in-app (same as Mac tile NMS). Overlay may show **double boxes**: green ≥ conf plus orange [0.05, conf), or nested part/whole pairs NMS does not merge (Mac holdout uses nested suppression; bench app does not). Label compare had **0 FP** on both delegates — extras are visual-only on these runs.
 
 #### Jetson (Colab mock)
 
@@ -530,7 +536,7 @@ Older structured B3 reruns (~62–66% mean) live in `export/pruned/`, `precision
 | Device | Best artifact | Why |
 | ------ | ------------- | --- |
 | **Raspberry Pi 5** | A2 OpenVINO **INT8 PTQ** (`ov_int8`, 10.1 MB) | Gates pass (87.7% mean mAP@0.5). A3 `ov_int8_qat` failed (76.3%, B 58.3%). Device FPS pending. |
-| **Android** | A1 TFLite **FP32** @ 1280 (36.8 MB) | INT8 PTQ and QAT fail gates (band B). A4: **3332 ms p50 / 0.30 tile FPS** (CPU). |
+| **Android** | A1 TFLite **FP32** @ 1280 (36.8 MB) | INT8 PTQ and QAT fail gates (band B). A4 Xiaomi mt6886: **CPU 3332 ms p50 / 0.30 tile FPS** · **GPU 337 ms p50 / 2.97 tile FPS**. |
 | **Jetson** | A1 ONNX → TensorRT **FP16** | Colab T4 mock: **22 ms p50 / 45 tile FPS**. Rebuild `.engine` on the board. |
 
 
