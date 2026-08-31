@@ -1,3 +1,5 @@
+*.ipynb linguist-detectable=false
+
 # Source videos (~395 MB total). Required for GitHub: 266987.mp4 is 135 MB (>100 MB limit).
 data/train/*.mp4 filter=lfs diff=lfs merge=lfs -text
 data/eval/*.mp4 filter=lfs diff=lfs merge=lfs -text
